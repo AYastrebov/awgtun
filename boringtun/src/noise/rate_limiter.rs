@@ -1,5 +1,6 @@
 use super::handshake::{b2s_hash, b2s_keyed_mac_16, b2s_keyed_mac_16_2, b2s_mac_24};
 use crate::noise::handshake::{LABEL_COOKIE, LABEL_MAC1};
+use crate::amnezia::{HeaderConfig, OsRandom, RandomSource};
 use crate::noise::{HandshakeInit, HandshakeResponse, Packet, Tunn, TunnResult, WireGuardError};
 
 #[cfg(feature = "mock-instant")]
@@ -118,6 +119,7 @@ impl RateLimiter {
         cookie: Cookie,
         mac1: &[u8],
         dst: &'a mut [u8],
+        msg_type: u32,
     ) -> Result<&'a mut [u8], WireGuardError> {
         if dst.len() < super::COOKIE_REPLY_SZ {
             return Err(WireGuardError::DestinationBufferTooSmall);
@@ -128,9 +130,8 @@ impl RateLimiter {
         let (nonce, rest) = rest.split_at_mut(24);
         let (encrypted_cookie, _) = rest.split_at_mut(16 + 16);
 
-        // msg.message_type = 3
-        // msg.reserved_zero = { 0, 0, 0 }
-        message_type.copy_from_slice(&super::COOKIE_REPLY.to_le_bytes());
+        // msg.message_type = dynamic AmneziaWG header (or standard WG type 3)
+        message_type.copy_from_slice(&msg_type.to_le_bytes());
         // msg.receiver_index = little_endian(initiator.sender_index)
         receiver_index.copy_from_slice(&idx.to_le_bytes());
         nonce.copy_from_slice(&self.nonce()[..]);
@@ -155,8 +156,9 @@ impl RateLimiter {
         src_addr: Option<IpAddr>,
         src: &'a [u8],
         dst: &'b mut [u8],
+        header_config: &HeaderConfig,
     ) -> Result<Packet<'a>, TunnResult<'b>> {
-        let packet = Tunn::parse_incoming_packet(src)?;
+        let packet = Tunn::parse_incoming_packet_config(src, header_config)?;
 
         // Verify and rate limit handshake messages only
         if let Packet::HandshakeInit(HandshakeInit { sender_idx, .. })
@@ -180,8 +182,9 @@ impl RateLimiter {
                 let computed_mac2 = b2s_keyed_mac_16_2(&cookie, msg, mac1);
 
                 if verify_slices_are_equal(&computed_mac2[..16], mac2).is_err() {
+                    let cookie_msg_type = header_config.cookie.generate(&mut OsRandom);
                     let cookie_packet = self
-                        .format_cookie_reply(sender_idx, cookie, mac1, dst)
+                        .format_cookie_reply(sender_idx, cookie, mac1, dst, cookie_msg_type)
                         .map_err(TunnResult::Err)?;
                     return Err(TunnResult::WriteToNetwork(cookie_packet));
                 }

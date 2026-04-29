@@ -193,7 +193,12 @@ impl Session {
     /// src - an IP packet from the interface
     /// dst - pre-allocated space to hold the encapsulating UDP packet to send over the network
     /// returns the size of the formatted packet
-    pub(super) fn format_packet_data<'a>(&self, src: &[u8], dst: &'a mut [u8]) -> &'a mut [u8] {
+    pub(super) fn format_packet_data<'a>(
+        &self,
+        src: &[u8],
+        dst: &'a mut [u8],
+        msg_type: u32,
+    ) -> &'a mut [u8] {
         if dst.len() < src.len() + super::DATA_OVERHEAD_SZ {
             panic!("The destination buffer is too small");
         }
@@ -204,7 +209,7 @@ impl Session {
         let (receiver_index, rest) = rest.split_at_mut(4);
         let (counter, data) = rest.split_at_mut(8);
 
-        message_type.copy_from_slice(&super::DATA.to_le_bytes());
+        message_type.copy_from_slice(&msg_type.to_le_bytes());
         receiver_index.copy_from_slice(&self.sending_index.to_le_bytes());
         counter.copy_from_slice(&sending_key_counter.to_le_bytes());
 

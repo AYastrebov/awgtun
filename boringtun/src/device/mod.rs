@@ -613,6 +613,7 @@ impl Device {
                         Some(addr.as_socket().unwrap().ip()),
                         packet,
                         &mut t.dst_buf,
+                        &crate::amnezia::HeaderConfig::default(),
                     ) {
                         Ok(packet) => packet,
                         Err(TunnResult::WriteToNetwork(cookie)) => {

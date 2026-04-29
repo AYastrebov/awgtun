@@ -8,6 +8,7 @@ pub mod rate_limiter;
 mod session;
 mod timers;
 
+use crate::amnezia::{HeaderConfig, OsRandom, RandomSource};
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::Handshake;
 use crate::noise::rate_limiter::RateLimiter;
@@ -71,6 +72,8 @@ pub struct Tunn {
     tx_bytes: usize,
     rx_bytes: usize,
     rate_limiter: Arc<RateLimiter>,
+    /// AmneziaWG dynamic header configuration
+    header_config: HeaderConfig,
 }
 
 type MessageType = u32;
@@ -126,40 +129,53 @@ pub enum Packet<'a> {
 impl Tunn {
     #[inline(always)]
     pub fn parse_incoming_packet(src: &[u8]) -> Result<Packet, WireGuardError> {
+        Self::parse_incoming_packet_config(src, &HeaderConfig::default())
+    }
+
+    #[inline(always)]
+    pub fn parse_incoming_packet_config<'a>(
+        src: &'a [u8],
+        header_config: &HeaderConfig,
+    ) -> Result<Packet<'a>, WireGuardError> {
         if src.len() < 4 {
             return Err(WireGuardError::InvalidPacket);
         }
 
-        // Checks the type, as well as the reserved zero fields
+        // Read the type field — may be a dynamic AmneziaWG header value
         let packet_type = u32::from_le_bytes(src[0..4].try_into().unwrap());
 
-        Ok(match (packet_type, src.len()) {
-            (HANDSHAKE_INIT, HANDSHAKE_INIT_SZ) => Packet::HandshakeInit(HandshakeInit {
+        // Classify by checking against configured header ranges
+        if header_config.init.contains(packet_type) && src.len() == HANDSHAKE_INIT_SZ {
+            Ok(Packet::HandshakeInit(HandshakeInit {
                 sender_idx: u32::from_le_bytes(src[4..8].try_into().unwrap()),
                 unencrypted_ephemeral: <&[u8; 32] as TryFrom<&[u8]>>::try_from(&src[8..40])
                     .expect("length already checked above"),
                 encrypted_static: &src[40..88],
                 encrypted_timestamp: &src[88..116],
-            }),
-            (HANDSHAKE_RESP, HANDSHAKE_RESP_SZ) => Packet::HandshakeResponse(HandshakeResponse {
+            }))
+        } else if header_config.response.contains(packet_type) && src.len() == HANDSHAKE_RESP_SZ {
+            Ok(Packet::HandshakeResponse(HandshakeResponse {
                 sender_idx: u32::from_le_bytes(src[4..8].try_into().unwrap()),
                 receiver_idx: u32::from_le_bytes(src[8..12].try_into().unwrap()),
                 unencrypted_ephemeral: <&[u8; 32] as TryFrom<&[u8]>>::try_from(&src[12..44])
                     .expect("length already checked above"),
                 encrypted_nothing: &src[44..60],
-            }),
-            (COOKIE_REPLY, COOKIE_REPLY_SZ) => Packet::PacketCookieReply(PacketCookieReply {
+            }))
+        } else if header_config.cookie.contains(packet_type) && src.len() == COOKIE_REPLY_SZ {
+            Ok(Packet::PacketCookieReply(PacketCookieReply {
                 receiver_idx: u32::from_le_bytes(src[4..8].try_into().unwrap()),
                 nonce: &src[8..32],
                 encrypted_cookie: &src[32..64],
-            }),
-            (DATA, DATA_OVERHEAD_SZ..=std::usize::MAX) => Packet::PacketData(PacketData {
+            }))
+        } else if header_config.transport.contains(packet_type) && src.len() >= DATA_OVERHEAD_SZ {
+            Ok(Packet::PacketData(PacketData {
                 receiver_idx: u32::from_le_bytes(src[4..8].try_into().unwrap()),
                 counter: u64::from_le_bytes(src[8..16].try_into().unwrap()),
                 encrypted_encapsulated_packet: &src[16..],
-            }),
-            _ => return Err(WireGuardError::InvalidPacket),
-        })
+            }))
+        } else {
+            Err(WireGuardError::InvalidPacket)
+        }
     }
 
     pub fn is_expired(&self) -> bool {
@@ -199,6 +215,27 @@ impl Tunn {
         index: u32,
         rate_limiter: Option<Arc<RateLimiter>>,
     ) -> Self {
+        Self::new_with_header_config(
+            static_private,
+            peer_static_public,
+            preshared_key,
+            persistent_keepalive,
+            index,
+            rate_limiter,
+            HeaderConfig::default(),
+        )
+    }
+
+    /// Create a new tunnel with AmneziaWG dynamic header configuration
+    pub fn new_with_header_config(
+        static_private: x25519::StaticSecret,
+        peer_static_public: x25519::PublicKey,
+        preshared_key: Option<[u8; 32]>,
+        persistent_keepalive: Option<u16>,
+        index: u32,
+        rate_limiter: Option<Arc<RateLimiter>>,
+        header_config: HeaderConfig,
+    ) -> Self {
         let static_public = x25519::PublicKey::from(&static_private);
 
         Tunn {
@@ -220,6 +257,7 @@ impl Tunn {
             rate_limiter: rate_limiter.unwrap_or_else(|| {
                 Arc::new(RateLimiter::new(&static_public, PEER_HANDSHAKE_RATE_LIMIT))
             }),
+            header_config,
         }
     }
 
@@ -251,7 +289,8 @@ impl Tunn {
         let current = self.current;
         if let Some(ref session) = self.sessions[current % N_SESSIONS] {
             // Send the packet using an established session
-            let packet = session.format_packet_data(src, dst);
+            let transport_type = self.header_config.transport.generate(&mut OsRandom);
+            let packet = session.format_packet_data(src, dst, transport_type);
             self.timer_tick(TimerName::TimeLastPacketSent);
             // Exclude Keepalive packets from timer update.
             if !src.is_empty() {
@@ -287,7 +326,7 @@ impl Tunn {
         let mut cookie = [0u8; COOKIE_REPLY_SZ];
         let packet = match self
             .rate_limiter
-            .verify_packet(src_addr, datagram, &mut cookie)
+            .verify_packet(src_addr, datagram, &mut cookie, &self.header_config)
         {
             Ok(packet) => packet,
             Err(TunnResult::WriteToNetwork(cookie)) => {
@@ -325,7 +364,10 @@ impl Tunn {
             remote_idx = p.sender_idx
         );
 
-        let (packet, session) = self.handshake.receive_handshake_initialization(p, dst)?;
+        let resp_type = self.header_config.response.generate(&mut OsRandom);
+        let (packet, session) =
+            self.handshake
+                .receive_handshake_initialization(p, dst, resp_type)?;
 
         // Store new session in ring buffer
         let index = session.local_index();
@@ -353,7 +395,8 @@ impl Tunn {
 
         let session = self.handshake.receive_handshake_response(p)?;
 
-        let keepalive_packet = session.format_packet_data(&[], dst);
+        let transport_type = self.header_config.transport.generate(&mut OsRandom);
+        let keepalive_packet = session.format_packet_data(&[], dst, transport_type);
         // Store new session in ring buffer
         let l_idx = session.local_index();
         let index = l_idx % N_SESSIONS;
@@ -444,8 +487,9 @@ impl Tunn {
         }
 
         let starting_new_handshake = !self.handshake.is_in_progress();
+        let init_type = self.header_config.init.generate(&mut OsRandom);
 
-        match self.handshake.format_handshake_initiation(dst) {
+        match self.handshake.format_handshake_initiation(dst, init_type) {
             Ok(packet) => {
                 tracing::debug!("Sending handshake_initiation");
 

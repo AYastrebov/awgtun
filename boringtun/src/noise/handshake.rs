@@ -482,6 +482,7 @@ impl Handshake {
         &mut self,
         packet: HandshakeInit,
         dst: &'a mut [u8],
+        resp_msg_type: u32,
     ) -> Result<(&'a mut [u8], Session), WireGuardError> {
         // initiator.chaining_key = HASH(CONSTRUCTION)
         let mut chaining_key = INITIAL_CHAIN_KEY;
@@ -559,7 +560,7 @@ impl Handshake {
             },
         );
 
-        self.format_handshake_response(dst)
+        self.format_handshake_response(dst, resp_msg_type)
     }
 
     pub(super) fn receive_handshake_response(
@@ -709,6 +710,7 @@ impl Handshake {
     pub(super) fn format_handshake_initiation<'a>(
         &mut self,
         dst: &'a mut [u8],
+        msg_type: u32,
     ) -> Result<&'a mut [u8], WireGuardError> {
         if dst.len() < super::HANDSHAKE_INIT_SZ {
             return Err(WireGuardError::DestinationBufferTooSmall);
@@ -729,9 +731,8 @@ impl Handshake {
         hash = b2s_hash(&hash, self.params.peer_static_public.as_bytes());
         // initiator.ephemeral_private = DH_GENERATE()
         let ephemeral_private = x25519::ReusableSecret::random_from_rng(OsRng);
-        // msg.message_type = 1
-        // msg.reserved_zero = { 0, 0, 0 }
-        message_type.copy_from_slice(&super::HANDSHAKE_INIT.to_le_bytes());
+        // msg.message_type = dynamic AmneziaWG header (or standard WG type 1)
+        message_type.copy_from_slice(&msg_type.to_le_bytes());
         // msg.sender_index = little_endian(initiator.sender_index)
         sender_index.copy_from_slice(&local_index.to_le_bytes());
         // msg.unencrypted_ephemeral = DH_PUBKEY(initiator.ephemeral_private)
@@ -789,6 +790,7 @@ impl Handshake {
     fn format_handshake_response<'a>(
         &mut self,
         dst: &'a mut [u8],
+        msg_type: u32,
     ) -> Result<(&'a mut [u8], Session), WireGuardError> {
         if dst.len() < super::HANDSHAKE_RESP_SZ {
             return Err(WireGuardError::DestinationBufferTooSmall);
@@ -816,9 +818,8 @@ impl Handshake {
         // responder.ephemeral_private = DH_GENERATE()
         let ephemeral_private = x25519::ReusableSecret::random_from_rng(OsRng);
         let local_index = self.inc_index();
-        // msg.message_type = 2
-        // msg.reserved_zero = { 0, 0, 0 }
-        message_type.copy_from_slice(&super::HANDSHAKE_RESP.to_le_bytes());
+        // msg.message_type = dynamic AmneziaWG header (or standard WG type 2)
+        message_type.copy_from_slice(&msg_type.to_le_bytes());
         // msg.sender_index = little_endian(responder.sender_index)
         sender_index.copy_from_slice(&local_index.to_le_bytes());
         // msg.receiver_index = little_endian(initiator.sender_index)
