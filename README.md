@@ -92,6 +92,51 @@ The library exposes a set of C ABI bindings, those are defined in the `wireguard
 
 The library exposes a set of Java Native Interface bindings, those are defined in `src/jni.rs`.
 
+## AmneziaWG 2.0 Support
+
+This fork adds [AmneziaWG 2.0](https://docs.amnezia.org/documentation/amnezia-wg/) protocol support, enabling packet obfuscation to resist deep packet inspection (DPI) while maintaining the WireGuard cryptographic guarantees.
+
+### Features
+
+- **Dynamic headers (H1-H4):** Replaces fixed WireGuard message type constants with configurable random values from user-defined ranges. Headers participate in MAC authentication.
+- **Packet padding (S1-S4):** Prepends random bytes to handshake, cookie, and transport packets to obscure packet sizes.
+- **Junk packets (Jc/Jmin/Jmax):** Sends random-sized decoy packets before handshake initiation.
+- **Init packets (I1-I5):** Sends CPS (Custom Packet Signature) datagrams before handshake for protocol camouflage.
+- **Full backward compatibility:** When all AmneziaWG parameters are zeroed/default, the tunnel behaves as standard WireGuard.
+
+### Usage
+
+```rust
+use boringtun::noise::Tunn;
+use boringtun::amnezia::Amnezia2Config;
+
+let amnezia = Amnezia2Config {
+    headers: HeaderConfig::new(
+        HeaderRange::new(100, 200).unwrap(),  // H1: init
+        HeaderRange::new(201, 300).unwrap(),  // H2: response
+        HeaderRange::new(301, 400).unwrap(),  // H3: cookie
+        HeaderRange::new(401, 500).unwrap(),  // H4: transport
+    ).unwrap(),
+    paddings: PaddingConfig::new(16, 16, 16, 8).unwrap(),
+    junk: JunkConfig::new(3, 64, 256).unwrap(),
+    init_packets: InitPacketConfig::default(),
+};
+
+let tunnel = Tunn::new_with_amnezia(
+    private_key, peer_public_key, None, Some(25), index, None, amnezia,
+);
+
+// Before sending handshake, drain pre-handshake datagrams
+while let Some(packet) = tunnel.poll_outgoing_packet() {
+    udp_socket.send_to(&packet, peer_addr);
+}
+```
+
+### Reference
+
+- [AmneziaWG protocol documentation](https://docs.amnezia.org/documentation/amnezia-wg/)
+- [amneziawg-go reference implementation](https://github.com/amnezia-vpn/amneziawg-go)
+
 ## License
 
 The project is licensed under the [3-Clause BSD License](https://opensource.org/licenses/BSD-3-Clause).
