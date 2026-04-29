@@ -145,6 +145,7 @@ impl Tunn {
         }
 
         self.packet_queue.clear();
+        self.network_outgoing.clear();
 
         self.timers.clear();
     }
