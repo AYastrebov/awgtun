@@ -1,13 +1,14 @@
 // Copyright (c) 2019 Cloudflare, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
-//! AmneziaWG 2.0 configuration types.
+//! AmneziaWG 2.0 configuration and packet generation.
 //!
 //! This module intentionally models only the AmneziaWG 2.0 fields. Legacy
 //! 1.0/1.5-only aliases are rejected by name.
 
 use std::fmt;
 use std::num::ParseIntError;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const AWG2_MAX_HANDSHAKE_PADDING: u8 = 64;
 pub const AWG2_MAX_TRANSPORT_PADDING: u8 = 32;
@@ -17,6 +18,43 @@ pub const AWG2_MAX_JUNK_SIZE: u16 = 1024;
 pub const AWG2_MAX_CPS_RANDOM_LEN: usize = 1000;
 
 const STANDARD_WIREGUARD_HEADERS: [u32; 4] = [1, 2, 3, 4];
+
+// ---------------------------------------------------------------------------
+// RandomSource — injectable RNG for deterministic testing
+// ---------------------------------------------------------------------------
+
+/// Trait for injectable randomness. Production uses `OsRandom`; tests use a
+/// deterministic implementation.
+pub trait RandomSource {
+    fn fill_bytes(&mut self, out: &mut [u8]);
+
+    /// Generate a random `u32` in `[start, end]` (inclusive).
+    fn gen_range_u32(&mut self, start: u32, end: u32) -> u32 {
+        if start == end {
+            return start;
+        }
+        let range = end - start + 1;
+        let mut buf = [0u8; 4];
+        self.fill_bytes(&mut buf);
+        let raw = u32::from_le_bytes(buf);
+        start + (raw % range)
+    }
+
+    /// Generate a random `u16` in `[start, end]` (inclusive).
+    fn gen_range_u16(&mut self, start: u16, end: u16) -> u16 {
+        self.gen_range_u32(u32::from(start), u32::from(end)) as u16
+    }
+}
+
+/// Production random source backed by the OS CSPRNG.
+pub struct OsRandom;
+
+impl RandomSource for OsRandom {
+    fn fill_bytes(&mut self, out: &mut [u8]) {
+        use rand_core::{OsRng, RngCore};
+        OsRng.fill_bytes(out);
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigError {
@@ -287,6 +325,11 @@ impl HeaderRange {
     pub fn overlaps(self, other: Self) -> bool {
         self.start <= other.end && other.start <= self.end
     }
+
+    /// Pick a random value from this range.
+    pub fn generate(&self, rng: &mut dyn RandomSource) -> u32 {
+        rng.gen_range_u32(self.start, self.end)
+    }
 }
 
 fn parse_u32_part(input: &str, part: Option<&str>) -> Result<u32, ConfigError> {
@@ -491,6 +534,22 @@ impl JunkConfig {
         }
         Ok(())
     }
+
+    /// Generate junk packets as a `Vec` of random byte buffers.
+    /// Returns an empty vec if junk is disabled.
+    pub fn generate_junk_packets(&self, rng: &mut dyn RandomSource) -> Vec<Vec<u8>> {
+        if self.count == 0 {
+            return Vec::new();
+        }
+        let mut packets = Vec::with_capacity(self.count as usize);
+        for _ in 0..self.count {
+            let size = rng.gen_range_u16(self.min_size, self.max_size) as usize;
+            let mut buf = vec![0u8; size];
+            rng.fill_bytes(&mut buf);
+            packets.push(buf);
+        }
+        packets
+    }
 }
 
 fn validate_junk_size(field: JunkSizeKind, value: u16) -> Result<(), ConfigError> {
@@ -520,8 +579,34 @@ impl CpsChain {
         &self.tags
     }
 
-    pub fn encoded_len(&self) -> usize {
-        self.tags.iter().map(CpsTag::encoded_len).sum()
+    /// Returns the total encoded byte length of this chain.
+    ///
+    /// `data_len` is the byte length of the source data fed to the chain.
+    /// For I1-I5 init packets this is always 0.
+    pub fn encoded_len(&self, data_len: usize) -> usize {
+        self.tags.iter().map(|t| t.encoded_len(data_len)).sum()
+    }
+
+    /// Convenience: encoded length assuming no source data (I1-I5 init packets).
+    pub fn encoded_len_for_init(&self) -> usize {
+        self.encoded_len(0)
+    }
+
+    /// Generate the full chain bytes into a new `Vec<u8>`.
+    pub fn generate(&self, rng: &mut dyn RandomSource, data: &[u8]) -> Vec<u8> {
+        let total = self.encoded_len(data.len());
+        let mut out = vec![0u8; total];
+        let mut offset = 0;
+        for tag in &self.tags {
+            offset += tag.generate(rng, data, &mut out, offset);
+        }
+        debug_assert_eq!(offset, total);
+        out
+    }
+
+    /// Convenience: generate with no source data (I1-I5 init packets).
+    pub fn generate_for_init(&self, rng: &mut dyn RandomSource) -> Vec<u8> {
+        self.generate(rng, &[])
     }
 }
 
@@ -532,16 +617,104 @@ pub enum CpsTag {
     RandomBytes { len: usize },
     RandomChars { len: usize },
     RandomDigits { len: usize },
+    /// Pass-through copy of source data (`<d>`).
+    /// For I1-I5 init packets (no source data), produces zero bytes.
+    Data,
+    /// Base64 encoding of source data (`<ds>`).
+    /// For I1-I5 init packets (no source data), produces zero bytes.
+    DataString,
+    /// N-byte big-endian length of source data (`<dz N>`).
+    DataSize { len: usize },
 }
 
 impl CpsTag {
-    fn encoded_len(&self) -> usize {
+    /// Returns the encoded byte length of this tag.
+    ///
+    /// `data_len` is the byte length of the source data fed to the chain.
+    /// For I1-I5 init packets this is always 0.
+    fn encoded_len(&self, data_len: usize) -> usize {
         match self {
             CpsTag::Bytes(bytes) => bytes.len(),
             CpsTag::Timestamp => 4,
             CpsTag::RandomBytes { len }
             | CpsTag::RandomChars { len }
             | CpsTag::RandomDigits { len } => *len,
+            CpsTag::Data => data_len,
+            CpsTag::DataString => {
+                if data_len == 0 {
+                    0
+                } else {
+                    // Standard base64 output length (with padding)
+                    ((data_len + 2) / 3) * 4
+                }
+            }
+            CpsTag::DataSize { len } => *len,
+        }
+    }
+
+    /// Write this tag's bytes into `out` starting at `offset`. Returns the
+    /// number of bytes written.
+    fn generate(
+        &self,
+        rng: &mut dyn RandomSource,
+        data: &[u8],
+        out: &mut [u8],
+        offset: usize,
+    ) -> usize {
+        match self {
+            CpsTag::Bytes(bytes) => {
+                out[offset..offset + bytes.len()].copy_from_slice(bytes);
+                bytes.len()
+            }
+            CpsTag::Timestamp => {
+                let ts = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as u32;
+                out[offset..offset + 4].copy_from_slice(&ts.to_be_bytes());
+                4
+            }
+            CpsTag::RandomBytes { len } => {
+                rng.fill_bytes(&mut out[offset..offset + len]);
+                *len
+            }
+            CpsTag::RandomChars { len } => {
+                const ALPHA: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+                for i in 0..*len {
+                    let idx = rng.gen_range_u32(0, (ALPHA.len() - 1) as u32) as usize;
+                    out[offset + i] = ALPHA[idx];
+                }
+                *len
+            }
+            CpsTag::RandomDigits { len } => {
+                for i in 0..*len {
+                    out[offset + i] = b'0' + rng.gen_range_u32(0, 9) as u8;
+                }
+                *len
+            }
+            CpsTag::Data => {
+                out[offset..offset + data.len()].copy_from_slice(data);
+                data.len()
+            }
+            CpsTag::DataString => {
+                if data.is_empty() {
+                    0
+                } else {
+                    use base64::Engine;
+                    let encoded = base64::engine::general_purpose::STANDARD.encode(data);
+                    let bytes = encoded.as_bytes();
+                    out[offset..offset + bytes.len()].copy_from_slice(bytes);
+                    bytes.len()
+                }
+            }
+            CpsTag::DataSize { len } => {
+                let size = data.len() as u64;
+                let be = size.to_be_bytes();
+                // Write the last `len` bytes of the big-endian representation
+                let start = 8 - len;
+                out[offset..offset + len].copy_from_slice(&be[start..]);
+                *len
+            }
         }
     }
 }
@@ -607,6 +780,15 @@ impl<'a> CpsParser<'a> {
     }
 }
 
+fn reject_arg(tag: &str, arg: Option<&str>) -> Result<(), ConfigError> {
+    if arg.is_some() {
+        return Err(ConfigError::InvalidCps {
+            reason: format!("<{}> does not take an argument", tag),
+        });
+    }
+    Ok(())
+}
+
 fn parse_cps_tag(tag: &str) -> Result<CpsTag, ConfigError> {
     let mut parts = tag.split_whitespace();
     let name = parts.next().ok_or_else(|| ConfigError::InvalidCps {
@@ -622,16 +804,21 @@ fn parse_cps_tag(tag: &str) -> Result<CpsTag, ConfigError> {
     match name {
         "b" => parse_bytes_tag(arg),
         "t" => {
-            if arg.is_some() {
-                return Err(ConfigError::InvalidCps {
-                    reason: "<t> does not take an argument".to_owned(),
-                });
-            }
+            reject_arg("t", arg)?;
             Ok(CpsTag::Timestamp)
         }
         "r" => parse_len_tag("r", arg).map(|len| CpsTag::RandomBytes { len }),
         "rc" => parse_len_tag("rc", arg).map(|len| CpsTag::RandomChars { len }),
         "rd" => parse_len_tag("rd", arg).map(|len| CpsTag::RandomDigits { len }),
+        "d" => {
+            reject_arg("d", arg)?;
+            Ok(CpsTag::Data)
+        }
+        "ds" => {
+            reject_arg("ds", arg)?;
+            Ok(CpsTag::DataString)
+        }
+        "dz" => parse_len_tag("dz", arg).map(|len| CpsTag::DataSize { len }),
         _ => Err(ConfigError::UnsupportedCpsTag {
             tag: name.to_owned(),
         }),
@@ -810,6 +997,27 @@ impl Default for Amnezia2Config {
 mod tests {
     use super::*;
 
+    /// Deterministic RNG that produces a repeating counter byte sequence.
+    /// Useful for golden tests where exact output must be reproducible.
+    struct DetRng {
+        counter: u8,
+    }
+
+    impl DetRng {
+        fn new(seed: u8) -> Self {
+            DetRng { counter: seed }
+        }
+    }
+
+    impl RandomSource for DetRng {
+        fn fill_bytes(&mut self, out: &mut [u8]) {
+            for byte in out.iter_mut() {
+                *byte = self.counter;
+                self.counter = self.counter.wrapping_add(1);
+            }
+        }
+    }
+
     fn chain(input: &str) -> CpsChain {
         CpsChain::parse(input).unwrap()
     }
@@ -950,7 +1158,20 @@ mod tests {
                 CpsTag::Timestamp,
             ]
         );
-        assert_eq!(parsed.encoded_len(), 15);
+        assert_eq!(parsed.encoded_len(0), 15);
+    }
+
+    #[test]
+    fn parses_cps_data_tags() {
+        let parsed = CpsChain::parse("<d><ds><dz 4>").unwrap();
+        assert_eq!(
+            parsed.tags(),
+            &[CpsTag::Data, CpsTag::DataString, CpsTag::DataSize { len: 4 },]
+        );
+        // With no source data (init packets), Data and DataString produce 0 bytes
+        assert_eq!(parsed.encoded_len(0), 4);
+        // With 10 bytes of source data
+        assert_eq!(parsed.encoded_len(10), 10 + 16 + 4); // data + base64(10)=16 + dz(4)
     }
 
     #[test]
@@ -962,6 +1183,8 @@ mod tests {
         assert!(CpsChain::parse("<c>").is_err());
         assert!(CpsChain::parse("prefix <r 1>").is_err());
         assert!(CpsChain::parse("<t 1>").is_err());
+        assert!(CpsChain::parse("<d 1>").is_err());
+        assert!(CpsChain::parse("<ds 1>").is_err());
     }
 
     #[test]
@@ -1010,7 +1233,7 @@ mod tests {
         };
         let lengths = config
             .active_chains()
-            .map(CpsChain::encoded_len)
+            .map(|c| c.encoded_len_for_init())
             .collect::<Vec<_>>();
         assert_eq!(lengths, vec![1, 2]);
     }
@@ -1026,5 +1249,130 @@ mod tests {
             Amnezia2Config::validate_field_name("itime"),
             Err(ConfigError::UnsupportedLegacyField { .. })
         ));
+    }
+
+    // -- Phase 2: CPS generation tests --
+
+    #[test]
+    fn generates_static_bytes() {
+        let c = chain("<b 0xDEAD>");
+        let mut rng = DetRng::new(0);
+        let out = c.generate_for_init(&mut rng);
+        assert_eq!(out, vec![0xDE, 0xAD]);
+    }
+
+    #[test]
+    fn generates_random_bytes() {
+        let c = chain("<r 5>");
+        let mut rng = DetRng::new(10);
+        let out = c.generate_for_init(&mut rng);
+        assert_eq!(out, vec![10, 11, 12, 13, 14]);
+    }
+
+    #[test]
+    fn generates_random_chars() {
+        let c = chain("<rc 4>");
+        let mut rng = DetRng::new(0);
+        let out = c.generate_for_init(&mut rng);
+        // All bytes must be ASCII letters
+        assert_eq!(out.len(), 4);
+        for &b in &out {
+            assert!(b.is_ascii_alphabetic(), "byte {} is not alphabetic", b);
+        }
+    }
+
+    #[test]
+    fn generates_random_digits() {
+        let c = chain("<rd 3>");
+        let mut rng = DetRng::new(0);
+        let out = c.generate_for_init(&mut rng);
+        assert_eq!(out.len(), 3);
+        for &b in &out {
+            assert!(b >= b'0' && b <= b'9', "byte {} is not a digit", b);
+        }
+    }
+
+    #[test]
+    fn generates_compound_chain() {
+        let c = chain("<b 0xFF><r 2><rd 1>");
+        let mut rng = DetRng::new(0);
+        let out = c.generate_for_init(&mut rng);
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[0], 0xFF); // static byte
+        assert_eq!(out[1], 0); // first random byte (DetRng seed=0)
+        assert_eq!(out[2], 1); // second random byte
+        assert!(out[3] >= b'0' && out[3] <= b'9'); // random digit
+    }
+
+    #[test]
+    fn generates_data_tags_with_source() {
+        let c = chain("<d><dz 2>");
+        let mut rng = DetRng::new(0);
+        let out = c.generate(&mut rng, b"hello");
+        // <d> produces "hello" (5 bytes), <dz 2> produces big-endian len=5 in 2 bytes
+        assert_eq!(&out[..5], b"hello");
+        assert_eq!(&out[5..], &[0, 5]);
+    }
+
+    #[test]
+    fn generates_data_string_tag() {
+        let c = chain("<ds>");
+        let mut rng = DetRng::new(0);
+        let out = c.generate(&mut rng, b"Hi");
+        // base64("Hi") = "SGk="
+        assert_eq!(&out, b"SGk=");
+    }
+
+    #[test]
+    fn generates_data_tags_empty_for_init() {
+        let c = chain("<d><ds><dz 4>");
+        let mut rng = DetRng::new(0);
+        let out = c.generate_for_init(&mut rng);
+        // <d> and <ds> produce 0 bytes; <dz 4> produces 4 zero bytes (len=0)
+        assert_eq!(out, vec![0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn header_range_generate() {
+        let range = HeaderRange::new(100, 200).unwrap();
+        let mut rng = DetRng::new(0);
+        for _ in 0..50 {
+            let v = range.generate(&mut rng);
+            assert!(v >= 100 && v <= 200, "value {} out of range", v);
+        }
+
+        let single = HeaderRange::single(42);
+        assert_eq!(single.generate(&mut rng), 42);
+    }
+
+    // -- Phase 3: Junk generation tests --
+
+    #[test]
+    fn junk_disabled_produces_nothing() {
+        let config = JunkConfig::disabled();
+        let mut rng = DetRng::new(0);
+        assert!(config.generate_junk_packets(&mut rng).is_empty());
+    }
+
+    #[test]
+    fn junk_generates_correct_count_and_sizes() {
+        let config = JunkConfig::new(3, 64, 128).unwrap();
+        let mut rng = DetRng::new(0);
+        let packets = config.generate_junk_packets(&mut rng);
+        assert_eq!(packets.len(), 3);
+        for pkt in &packets {
+            assert!(pkt.len() >= 64 && pkt.len() <= 128, "size {} out of range", pkt.len());
+        }
+    }
+
+    #[test]
+    fn junk_fixed_size_when_min_equals_max() {
+        let config = JunkConfig::new(2, 100, 100).unwrap();
+        let mut rng = DetRng::new(0);
+        let packets = config.generate_junk_packets(&mut rng);
+        assert_eq!(packets.len(), 2);
+        for pkt in &packets {
+            assert_eq!(pkt.len(), 100);
+        }
     }
 }
