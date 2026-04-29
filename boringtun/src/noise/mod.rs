@@ -8,7 +8,7 @@ pub mod rate_limiter;
 mod session;
 mod timers;
 
-use crate::amnezia::{HeaderConfig, OsRandom, PaddingConfig};
+use crate::amnezia::{Amnezia2Config, HeaderConfig, JunkConfig, InitPacketConfig, OsRandom, PaddingConfig};
 use crate::amnezia::RandomSource as _;
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::Handshake;
@@ -77,6 +77,13 @@ pub struct Tunn {
     header_config: HeaderConfig,
     /// AmneziaWG padding configuration
     padding_config: PaddingConfig,
+    /// AmneziaWG junk configuration
+    junk_config: JunkConfig,
+    /// AmneziaWG init packet (CPS) configuration
+    init_packet_config: InitPacketConfig,
+    /// Queue for pre-handshake datagrams (I-packets, junk) that need to be
+    /// sent before the actual handshake initiation.
+    network_outgoing: VecDeque<Vec<u8>>,
 }
 
 type MessageType = u32;
@@ -218,28 +225,26 @@ impl Tunn {
         index: u32,
         rate_limiter: Option<Arc<RateLimiter>>,
     ) -> Self {
-        Self::new_with_amnezia_config(
+        Self::new_with_amnezia(
             static_private,
             peer_static_public,
             preshared_key,
             persistent_keepalive,
             index,
             rate_limiter,
-            HeaderConfig::default(),
-            PaddingConfig::default(),
+            Amnezia2Config::default(),
         )
     }
 
-    /// Create a new tunnel with AmneziaWG configuration
-    pub fn new_with_amnezia_config(
+    /// Create a new tunnel with AmneziaWG 2.0 configuration
+    pub fn new_with_amnezia(
         static_private: x25519::StaticSecret,
         peer_static_public: x25519::PublicKey,
         preshared_key: Option<[u8; 32]>,
         persistent_keepalive: Option<u16>,
         index: u32,
         rate_limiter: Option<Arc<RateLimiter>>,
-        header_config: HeaderConfig,
-        padding_config: PaddingConfig,
+        amnezia: Amnezia2Config,
     ) -> Self {
         let static_public = x25519::PublicKey::from(&static_private);
 
@@ -262,8 +267,11 @@ impl Tunn {
             rate_limiter: rate_limiter.unwrap_or_else(|| {
                 Arc::new(RateLimiter::new(&static_public, PEER_HANDSHAKE_RATE_LIMIT))
             }),
-            header_config,
-            padding_config,
+            header_config: amnezia.headers,
+            padding_config: amnezia.paddings,
+            junk_config: amnezia.junk,
+            init_packet_config: amnezia.init_packets,
+            network_outgoing: VecDeque::new(),
         }
     }
 
@@ -503,6 +511,18 @@ impl Tunn {
         Ok(self.validate_decapsulated_packet(decapsulated_packet))
     }
 
+    /// Returns the next queued pre-handshake datagram (I-packet or junk), if any.
+    /// The caller should send these datagrams to the network before the handshake
+    /// initiation packet. Call repeatedly until `None` is returned.
+    pub fn poll_outgoing_packet(&mut self) -> Option<Vec<u8>> {
+        self.network_outgoing.pop_front()
+    }
+
+    /// Returns true if there are queued pre-handshake datagrams.
+    pub fn has_outgoing_packets(&self) -> bool {
+        !self.network_outgoing.is_empty()
+    }
+
     /// Formats a new handshake initiation message and store it in dst. If force_resend is true will send
     /// a new handshake, even if a handshake is already in progress (for example when a handshake times out)
     pub fn format_handshake_initiation<'a>(
@@ -519,6 +539,11 @@ impl Tunn {
         }
 
         let starting_new_handshake = !self.handshake.is_in_progress();
+
+        // Queue I-packets and junk before the handshake initiation
+        // (sent as separate UDP datagrams before the real init)
+        self.queue_pre_handshake_packets();
+
         let init_type = self.header_config.init.generate(&mut OsRandom);
         let s1 = self.padding_config.s1 as usize;
 
@@ -538,6 +563,24 @@ impl Tunn {
                 TunnResult::WriteToNetwork(&mut dst[..s1 + packet_len])
             }
             Err(e) => TunnResult::Err(e),
+        }
+    }
+
+    /// Generate and queue I-packets (CPS chains) and junk packets.
+    /// These are sent as separate UDP datagrams before the handshake initiation.
+    fn queue_pre_handshake_packets(&mut self) {
+        // I-packets first
+        for chain in self.init_packet_config.active_chains() {
+            let packet = chain.generate_for_init(&mut OsRandom);
+            if !packet.is_empty() {
+                self.network_outgoing.push_back(packet);
+            }
+        }
+
+        // Then junk packets
+        let junk_packets = self.junk_config.generate_junk_packets(&mut OsRandom);
+        for junk in junk_packets {
+            self.network_outgoing.push_back(junk);
         }
     }
 
