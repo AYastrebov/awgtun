@@ -8,7 +8,8 @@ pub mod rate_limiter;
 mod session;
 mod timers;
 
-use crate::amnezia::{HeaderConfig, OsRandom, RandomSource};
+use crate::amnezia::{HeaderConfig, OsRandom, PaddingConfig};
+use crate::amnezia::RandomSource as _;
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::Handshake;
 use crate::noise::rate_limiter::RateLimiter;
@@ -74,6 +75,8 @@ pub struct Tunn {
     rate_limiter: Arc<RateLimiter>,
     /// AmneziaWG dynamic header configuration
     header_config: HeaderConfig,
+    /// AmneziaWG padding configuration
+    padding_config: PaddingConfig,
 }
 
 type MessageType = u32;
@@ -215,7 +218,7 @@ impl Tunn {
         index: u32,
         rate_limiter: Option<Arc<RateLimiter>>,
     ) -> Self {
-        Self::new_with_header_config(
+        Self::new_with_amnezia_config(
             static_private,
             peer_static_public,
             preshared_key,
@@ -223,11 +226,12 @@ impl Tunn {
             index,
             rate_limiter,
             HeaderConfig::default(),
+            PaddingConfig::default(),
         )
     }
 
-    /// Create a new tunnel with AmneziaWG dynamic header configuration
-    pub fn new_with_header_config(
+    /// Create a new tunnel with AmneziaWG configuration
+    pub fn new_with_amnezia_config(
         static_private: x25519::StaticSecret,
         peer_static_public: x25519::PublicKey,
         preshared_key: Option<[u8; 32]>,
@@ -235,6 +239,7 @@ impl Tunn {
         index: u32,
         rate_limiter: Option<Arc<RateLimiter>>,
         header_config: HeaderConfig,
+        padding_config: PaddingConfig,
     ) -> Self {
         let static_public = x25519::PublicKey::from(&static_private);
 
@@ -258,6 +263,7 @@ impl Tunn {
                 Arc::new(RateLimiter::new(&static_public, PEER_HANDSHAKE_RATE_LIMIT))
             }),
             header_config,
+            padding_config,
         }
     }
 
@@ -290,14 +296,25 @@ impl Tunn {
         if let Some(ref session) = self.sessions[current % N_SESSIONS] {
             // Send the packet using an established session
             let transport_type = self.header_config.transport.generate(&mut OsRandom);
-            let packet = session.format_packet_data(src, dst, transport_type);
+            // S4 padding only for non-keepalive packets (matching amneziawg-go)
+            let s4 = if src.is_empty() {
+                0
+            } else {
+                self.padding_config.s4 as usize
+            };
+            // Write WG packet at offset s4, then fill the prefix with random padding
+            let packet = session.format_packet_data(src, &mut dst[s4..], transport_type);
+            let packet_len = packet.len();
+            if s4 > 0 {
+                OsRandom.fill_bytes(&mut dst[..s4]);
+            }
             self.timer_tick(TimerName::TimeLastPacketSent);
             // Exclude Keepalive packets from timer update.
             if !src.is_empty() {
                 self.timer_tick(TimerName::TimeLastDataPacketSent);
             }
             self.tx_bytes += src.len();
-            return TunnResult::WriteToNetwork(packet);
+            return TunnResult::WriteToNetwork(&mut dst[..s4 + packet_len]);
         }
 
         // If there is no session, queue the packet for future retry
@@ -323,15 +340,24 @@ impl Tunn {
             return self.send_queued_packet(dst);
         }
 
+        // Strip AmneziaWG padding before parsing
+        let padding = self.determine_padding(datagram).unwrap_or(0);
+        let stripped = &datagram[padding..];
+
         let mut cookie = [0u8; COOKIE_REPLY_SZ];
         let packet = match self
             .rate_limiter
-            .verify_packet(src_addr, datagram, &mut cookie, &self.header_config)
+            .verify_packet(src_addr, stripped, &mut cookie, &self.header_config)
         {
             Ok(packet) => packet,
             Err(TunnResult::WriteToNetwork(cookie)) => {
-                dst[..cookie.len()].copy_from_slice(cookie);
-                return TunnResult::WriteToNetwork(&mut dst[..cookie.len()]);
+                // Add S3 padding to cookie reply
+                let s3 = self.padding_config.s3 as usize;
+                if s3 > 0 {
+                    OsRandom.fill_bytes(&mut dst[..s3]);
+                }
+                dst[s3..s3 + cookie.len()].copy_from_slice(cookie);
+                return TunnResult::WriteToNetwork(&mut dst[..s3 + cookie.len()]);
             }
             Err(TunnResult::Err(e)) => return TunnResult::Err(e),
             _ => unreachable!(),
@@ -365,13 +391,19 @@ impl Tunn {
         );
 
         let resp_type = self.header_config.response.generate(&mut OsRandom);
+        let s2 = self.padding_config.s2 as usize;
         let (packet, session) =
             self.handshake
-                .receive_handshake_initialization(p, dst, resp_type)?;
+                .receive_handshake_initialization(p, &mut dst[s2..], resp_type)?;
 
         // Store new session in ring buffer
         let index = session.local_index();
         self.sessions[index % N_SESSIONS] = Some(session);
+
+        let packet_len = packet.len();
+        if s2 > 0 {
+            OsRandom.fill_bytes(&mut dst[..s2]);
+        }
 
         self.timer_tick(TimerName::TimeLastPacketReceived);
         self.timer_tick(TimerName::TimeLastPacketSent);
@@ -379,7 +411,7 @@ impl Tunn {
 
         tracing::debug!(message = "Sending handshake_response", local_idx = index);
 
-        Ok(TunnResult::WriteToNetwork(packet))
+        Ok(TunnResult::WriteToNetwork(&mut dst[..s2 + packet_len]))
     }
 
     fn handle_handshake_response<'a>(
@@ -488,16 +520,22 @@ impl Tunn {
 
         let starting_new_handshake = !self.handshake.is_in_progress();
         let init_type = self.header_config.init.generate(&mut OsRandom);
+        let s1 = self.padding_config.s1 as usize;
 
-        match self.handshake.format_handshake_initiation(dst, init_type) {
+        match self.handshake.format_handshake_initiation(&mut dst[s1..], init_type) {
             Ok(packet) => {
                 tracing::debug!("Sending handshake_initiation");
+
+                let packet_len = packet.len();
+                if s1 > 0 {
+                    OsRandom.fill_bytes(&mut dst[..s1]);
+                }
 
                 if starting_new_handshake {
                     self.timer_tick(TimerName::TimeLastHandshakeStarted);
                 }
                 self.timer_tick(TimerName::TimeLastPacketSent);
-                TunnResult::WriteToNetwork(packet)
+                TunnResult::WriteToNetwork(&mut dst[..s1 + packet_len])
             }
             Err(e) => TunnResult::Err(e),
         }
@@ -582,6 +620,55 @@ impl Tunn {
 
     fn dequeue_packet(&mut self) -> Option<Vec<u8>> {
         self.packet_queue.pop_front()
+    }
+
+    /// Determine the padding length for an incoming packet by trying each
+    /// message type's padding + expected size, then validating the header at
+    /// the padding offset. Returns `Some(padding_bytes)` or `None` if no match.
+    fn determine_padding(&self, src: &[u8]) -> Option<usize> {
+        let checks: [(usize, &crate::amnezia::HeaderRange, usize, bool); 4] = [
+            (
+                self.padding_config.s1 as usize,
+                &self.header_config.init,
+                HANDSHAKE_INIT_SZ,
+                true,
+            ),
+            (
+                self.padding_config.s2 as usize,
+                &self.header_config.response,
+                HANDSHAKE_RESP_SZ,
+                true,
+            ),
+            (
+                self.padding_config.s3 as usize,
+                &self.header_config.cookie,
+                COOKIE_REPLY_SZ,
+                true,
+            ),
+            (
+                self.padding_config.s4 as usize,
+                &self.header_config.transport,
+                DATA_OVERHEAD_SZ,
+                false,
+            ),
+        ];
+
+        for &(padding, header_range, expected_size, exact) in &checks {
+            let size_ok = if exact {
+                src.len() == padding + expected_size
+            } else {
+                src.len() >= padding + expected_size
+            };
+
+            if size_ok && padding + 4 <= src.len() {
+                let header =
+                    u32::from_le_bytes(src[padding..padding + 4].try_into().unwrap());
+                if header_range.contains(header) {
+                    return Some(padding);
+                }
+            }
+        }
+        None
     }
 
     fn estimate_loss(&self) -> f32 {
