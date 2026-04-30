@@ -134,6 +134,7 @@ while let Some(packet) = tunnel.poll_outgoing_packet() {
 
 ### Reference
 
+- [`AMNEZIA.md`](AMNEZIA.md) — detailed implementation docs, wire format, API reference, and comparison with amneziawg-go
 - [AmneziaWG protocol documentation](https://docs.amnezia.org/documentation/amnezia-wg/)
 - [amneziawg-go reference implementation](https://github.com/amnezia-vpn/amneziawg-go)
 
