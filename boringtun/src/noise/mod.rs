@@ -8,7 +8,7 @@ pub mod rate_limiter;
 mod session;
 mod timers;
 
-use crate::amnezia::{Amnezia2Config, HeaderConfig, JunkConfig, InitPacketConfig, OsRandom, PaddingConfig};
+use crate::amnezia::{Amnezia2Config, ConfigError, HeaderConfig, JunkConfig, InitPacketConfig, OsRandom, PaddingConfig};
 use crate::amnezia::RandomSource as _;
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::Handshake;
@@ -234,9 +234,13 @@ impl Tunn {
             rate_limiter,
             Amnezia2Config::default(),
         )
+        .expect("default Amnezia2Config is always valid")
     }
 
-    /// Create a new tunnel with AmneziaWG 2.0 configuration
+    /// Create a new tunnel with AmneziaWG 2.0 configuration.
+    ///
+    /// Returns `Err(ConfigError)` if the AmneziaWG config is invalid
+    /// (e.g. overlapping header ranges, padding out of bounds).
     pub fn new_with_amnezia(
         static_private: x25519::StaticSecret,
         peer_static_public: x25519::PublicKey,
@@ -245,10 +249,11 @@ impl Tunn {
         index: u32,
         rate_limiter: Option<Arc<RateLimiter>>,
         amnezia: Amnezia2Config,
-    ) -> Self {
+    ) -> Result<Self, ConfigError> {
+        amnezia.validate()?;
         let static_public = x25519::PublicKey::from(&static_private);
 
-        Tunn {
+        Ok(Tunn {
             handshake: Handshake::new(
                 static_private,
                 static_public,
@@ -272,7 +277,7 @@ impl Tunn {
             junk_config: amnezia.junk,
             init_packet_config: amnezia.init_packets,
             network_outgoing: VecDeque::new(),
-        }
+        })
     }
 
     /// Update the private key and clear existing sessions
@@ -298,7 +303,9 @@ impl Tunn {
     ///
     /// # Panics
     /// Panics if dst buffer is too small.
-    /// Size of dst should be at least src.len() + 32, and no less than 148 bytes.
+    /// Size of dst should be at least `src.len() + 32 + S4` for data packets,
+    /// and no less than `148 + S1` bytes (to hold a padded handshake initiation).
+    /// When AmneziaWG is disabled (default config), S1 and S4 are both 0.
     pub fn encapsulate<'a>(&mut self, src: &[u8], dst: &'a mut [u8]) -> TunnResult<'a> {
         let current = self.current;
         if let Some(ref session) = self.sessions[current % N_SESSIONS] {
@@ -524,7 +531,12 @@ impl Tunn {
     }
 
     /// Formats a new handshake initiation message and store it in dst. If force_resend is true will send
-    /// a new handshake, even if a handshake is already in progress (for example when a handshake times out)
+    /// a new handshake, even if a handshake is already in progress (for example when a handshake times out).
+    ///
+    /// Before sending the returned packet, the caller must drain `poll_outgoing_packet()` and
+    /// send those datagrams first (I-packets and junk).
+    ///
+    /// dst must be at least `148 + S1` bytes (handshake init size + padding).
     pub fn format_handshake_initiation<'a>(
         &mut self,
         dst: &'a mut [u8],
