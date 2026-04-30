@@ -7,6 +7,10 @@
 
 //! C bindings for the BoringTun library
 use super::noise::{Tunn, TunnResult};
+use crate::amnezia::{
+    Amnezia2Config, CpsChain, HeaderConfig, HeaderRange, InitPacketConfig, JunkConfig,
+    PaddingConfig,
+};
 use crate::x25519::{PublicKey, StaticSecret};
 use base64::{decode, encode};
 use hex::encode as encode_hex;
@@ -311,6 +315,189 @@ pub unsafe extern "C" fn new_tunnel(
     Box::into_raw(tunnel)
 }
 
+/// AmneziaWG 2.0 configuration for the C FFI.
+///
+/// Set all fields to zero for standard WireGuard behavior.
+/// I1-I5 are optional CPS chain strings (UTF-8, null-terminated). Pass NULL to disable.
+#[repr(C)]
+pub struct amnezia_config {
+    /// Dynamic header ranges (H1-H4). Each pair is (start, end) inclusive.
+    /// Use start == end for a single fixed value.
+    pub h1_start: u32,
+    pub h1_end: u32,
+    pub h2_start: u32,
+    pub h2_end: u32,
+    pub h3_start: u32,
+    pub h3_end: u32,
+    pub h4_start: u32,
+    pub h4_end: u32,
+    /// Padding sizes (S1-S4)
+    pub s1: u8,
+    pub s2: u8,
+    pub s3: u8,
+    pub s4: u8,
+    /// Junk packet config
+    pub jc: u8,
+    pub jmin: u16,
+    pub jmax: u16,
+    /// CPS init packet chain strings (null-terminated UTF-8, or NULL to skip).
+    pub i1: *const c_char,
+    pub i2: *const c_char,
+    pub i3: *const c_char,
+    pub i4: *const c_char,
+    pub i5: *const c_char,
+}
+
+/// Parse an optional CPS chain from a C string pointer. Returns Ok(None) for NULL.
+unsafe fn parse_optional_cps(ptr: *const c_char) -> Result<Option<CpsChain>, ()> {
+    if ptr.is_null() {
+        return Ok(None);
+    }
+    let s = CStr::from_ptr(ptr).to_str().map_err(|_| ())?;
+    if s.is_empty() {
+        return Ok(None);
+    }
+    CpsChain::parse(s).map(Some).map_err(|_| ())
+}
+
+/// Allocate a new tunnel with AmneziaWG 2.0 configuration.
+/// Returns NULL on failure (invalid keys or invalid amnezia config).
+/// Keys must be valid base64 encoded 32-byte keys.
+#[no_mangle]
+pub unsafe extern "C" fn new_tunnel_amnezia(
+    static_private: *const c_char,
+    server_static_public: *const c_char,
+    preshared_key: *const c_char,
+    keep_alive: u16,
+    index: u32,
+    config: *const amnezia_config,
+) -> *mut Mutex<Tunn> {
+    if config.is_null() {
+        return new_tunnel(static_private, server_static_public, preshared_key, keep_alive, index);
+    }
+    let cfg = &*config;
+
+    // Parse header ranges
+    let headers = match HeaderConfig::new(
+        HeaderRange { start: cfg.h1_start, end: cfg.h1_end },
+        HeaderRange { start: cfg.h2_start, end: cfg.h2_end },
+        HeaderRange { start: cfg.h3_start, end: cfg.h3_end },
+        HeaderRange { start: cfg.h4_start, end: cfg.h4_end },
+    ) {
+        Ok(h) => h,
+        Err(_) => return null_mut(),
+    };
+
+    let paddings = match PaddingConfig::new(cfg.s1, cfg.s2, cfg.s3, cfg.s4) {
+        Ok(p) => p,
+        Err(_) => return null_mut(),
+    };
+
+    let junk = if cfg.jc == 0 {
+        JunkConfig::disabled()
+    } else {
+        match JunkConfig::new(cfg.jc, cfg.jmin, cfg.jmax) {
+            Ok(j) => j,
+            Err(_) => return null_mut(),
+        }
+    };
+
+    let i1 = match parse_optional_cps(cfg.i1) { Ok(v) => v, Err(_) => return null_mut() };
+    let i2 = match parse_optional_cps(cfg.i2) { Ok(v) => v, Err(_) => return null_mut() };
+    let i3 = match parse_optional_cps(cfg.i3) { Ok(v) => v, Err(_) => return null_mut() };
+    let i4 = match parse_optional_cps(cfg.i4) { Ok(v) => v, Err(_) => return null_mut() };
+    let i5 = match parse_optional_cps(cfg.i5) { Ok(v) => v, Err(_) => return null_mut() };
+
+    let amnezia = Amnezia2Config {
+        headers,
+        paddings,
+        junk,
+        init_packets: InitPacketConfig { i1, i2, i3, i4, i5 },
+    };
+
+    // Parse keys (same as new_tunnel)
+    let c_str = CStr::from_ptr(static_private);
+    let static_private = match c_str.to_str() {
+        Err(_) => return ptr::null_mut(),
+        Ok(string) => string,
+    };
+
+    let c_str = CStr::from_ptr(server_static_public);
+    let server_static_public = match c_str.to_str() {
+        Err(_) => return ptr::null_mut(),
+        Ok(string) => string,
+    };
+
+    let preshared_key = if preshared_key.is_null() {
+        None
+    } else {
+        let c_str = CStr::from_ptr(preshared_key);
+        if let Ok(string) = c_str.to_str() {
+            if let Ok(key) = string.parse::<KeyBytes>() {
+                Some(key.0)
+            } else {
+                return null_mut();
+            }
+        } else {
+            return null_mut();
+        }
+    };
+
+    let private_key = match static_private.parse::<KeyBytes>() {
+        Err(_) => return ptr::null_mut(),
+        Ok(key) => StaticSecret::from(key.0),
+    };
+
+    let public_key = match server_static_public.parse::<KeyBytes>() {
+        Err(_) => return ptr::null_mut(),
+        Ok(key) => PublicKey::from(key.0),
+    };
+
+    let keep_alive = if keep_alive == 0 { None } else { Some(keep_alive) };
+
+    let tunnel = match Tunn::new_with_amnezia(
+        private_key, public_key, preshared_key, keep_alive, index, None, amnezia,
+    ) {
+        Ok(t) => t,
+        Err(_) => return null_mut(),
+    };
+
+    PANIC_HOOK.call_once(|| {
+        panic::set_hook(Box::new(move |_| {
+            raise(SIGSEGV);
+        }));
+    });
+
+    Box::into_raw(Box::new(Mutex::new(tunnel)))
+}
+
+/// Returns the next pre-handshake packet (I-packet or junk) that should be sent
+/// before the handshake initiation. Writes the packet to dst and returns the size.
+/// Returns 0 when there are no more packets to drain.
+///
+/// Call this in a loop after `new_tunnel_amnezia`, `wireguard_write`, `wireguard_tick`,
+/// or `wireguard_force_handshake` until it returns 0, sending each packet to the network.
+#[no_mangle]
+pub unsafe extern "C" fn wireguard_poll_outgoing_packet(
+    tunnel: *const Mutex<Tunn>,
+    dst: *mut u8,
+    dst_size: u32,
+) -> usize {
+    let mut tunnel = tunnel.as_ref().unwrap().lock();
+    match tunnel.poll_outgoing_packet() {
+        Some(packet) => {
+            let len = packet.len();
+            if len > dst_size as usize {
+                return 0;
+            }
+            let dst = slice::from_raw_parts_mut(dst, dst_size as usize);
+            dst[..len].copy_from_slice(&packet);
+            len
+        }
+        None => 0,
+    }
+}
+
 /// Drops the Tunn object
 #[no_mangle]
 pub unsafe extern "C" fn tunnel_free(tunnel: *mut Mutex<Tunn>) {
@@ -365,7 +552,8 @@ pub unsafe extern "C" fn wireguard_tick(
     wireguard_result::from(tunnel.update_timers(dst))
 }
 
-/// Force the tunnel to initiate a new handshake, dst buffer must be at least 148 byte long.
+/// Force the tunnel to initiate a new handshake, dst buffer must be at least 148 + S1 bytes long.
+/// After this call, drain `wireguard_poll_outgoing_packet` before sending the handshake init.
 #[no_mangle]
 pub unsafe extern "C" fn wireguard_force_handshake(
     tunnel: *const Mutex<Tunn>,
