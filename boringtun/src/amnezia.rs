@@ -47,6 +47,7 @@ pub trait RandomSource {
 }
 
 /// Production random source backed by the OS CSPRNG.
+#[derive(Debug, Clone, Copy)]
 pub struct OsRandom;
 
 impl RandomSource for OsRandom {
@@ -57,6 +58,7 @@ impl RandomSource for OsRandom {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ConfigError {
     InvalidHeaderRange {
         value: String,
@@ -611,6 +613,7 @@ impl CpsChain {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CpsTag {
     Bytes(Vec<u8>),
     Timestamp,
@@ -932,6 +935,7 @@ impl InitPacketConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Amnezia2Config {
     pub junk: JunkConfig,
     pub paddings: PaddingConfig,

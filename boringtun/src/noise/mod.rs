@@ -716,8 +716,11 @@ impl Tunn {
             };
 
             if size_ok && padding + 4 <= src.len() {
-                let header =
-                    u32::from_le_bytes(src[padding..padding + 4].try_into().unwrap());
+                let header = u32::from_le_bytes(
+                    src[padding..padding + 4]
+                        .try_into()
+                        .expect("bounds checked: padding + 4 <= src.len()"),
+                );
                 if header_range.contains(header) {
                     return Some(padding);
                 }
