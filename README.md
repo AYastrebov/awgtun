@@ -1,57 +1,79 @@
 ![boringtun logo banner](./banner.png)
 
-# BoringTun
+# BoringTun + AmneziaWG 2.0
 
-## Warning
-Boringtun is currently undergoing a restructuring. You should probably not rely on or link to 
-the master branch right now. Instead you should use the crates.io page.
+This is a fork of [cloudflare/boringtun](https://github.com/cloudflare/boringtun) that adds [AmneziaWG 2.0](https://docs.amnezia.org/documentation/amnezia-wg/) protocol support. The upstream WireGuard implementation is preserved — when AmneziaWG parameters are left at their defaults, the tunnel behaves exactly like standard WireGuard.
 
-- boringtun: [![crates.io](https://img.shields.io/crates/v/boringtun.svg)](https://crates.io/crates/boringtun)
-- boringtun-cli [![crates.io](https://img.shields.io/crates/v/boringtun-cli.svg)](https://crates.io/crates/boringtun-cli)
-
-**BoringTun** is an implementation of the [WireGuard<sup>®</sup>](https://www.wireguard.com/) protocol designed for portability and speed.
-
-**BoringTun** is successfully deployed on millions of [iOS](https://apps.apple.com/us/app/1-1-1-1-faster-internet/id1423538627) and [Android](https://play.google.com/store/apps/details?id=com.cloudflare.onedotonedotonedotone&hl=en_US) consumer devices as well as thousands of Cloudflare Linux servers. 
+The fork is client-focused. It can initiate tunnels, maintain handshakes, encrypt and decrypt IP packets, and keep sessions alive against AmneziaWG 2.0 servers. It does not implement server/inbound mode.
 
 The project consists of two parts:
 
-* The executable `boringtun-cli`, a [userspace WireGuard](https://www.wireguard.com/xplatform/) 
-  implementation for Linux and macOS.
-* The library `boringtun` that can be used to implement fast and efficient WireGuard client apps on various platforms, including iOS and Android. It implements the underlying WireGuard protocol, without the network or tunnel stacks, those can be implemented in a platform idiomatic way.
-
-### Installation
-
-You can install this project using `cargo`:
-
-```
-cargo install boringtun-cli
-```
+* The library `boringtun` — a portable WireGuard + AmneziaWG implementation without network or tunnel stacks. Callers provide their own I/O.
+* The executable `boringtun-cli` — a [userspace WireGuard](https://www.wireguard.com/xplatform/) tunnel for Linux and macOS (does not include AWG support).
 
 ### Building
 
-- Library only: `cargo build --lib --no-default-features --release [--target $(TARGET_TRIPLE)]`
-- Executable: `cargo build --bin boringtun-cli --release [--target $(TARGET_TRIPLE)]`
-
-By default the executable is placed in the `./target/release` folder. You can copy it to a desired location manually, or install it using `cargo install --bin boringtun --path .`.
-
-### Running
-
-As per the specification, to start a tunnel use:
-
-`boringtun-cli [-f/--foreground] INTERFACE-NAME`
-
-The tunnel can then be configured using [wg](https://git.zx2c4.com/WireGuard/about/src/tools/man/wg.8), as a regular WireGuard tunnel, or any other tool.
-
-It is also possible to use with [wg-quick](https://git.zx2c4.com/WireGuard/about/src/tools/man/wg-quick.8) by setting the environment variable `WG_QUICK_USERSPACE_IMPLEMENTATION` to `boringtun`. For example:
-
-`sudo WG_QUICK_USERSPACE_IMPLEMENTATION=boringtun-cli WG_SUDO=1 wg-quick up CONFIGURATION`
+- Library only: `cargo build --lib -p boringtun --release`
+- With FFI bindings: `cargo build --lib -p boringtun --features ffi-bindings --release`
+- CLI executable: `cargo build --bin boringtun-cli --release`
 
 ### Testing
 
-Testing this project has a few requirements:
+The test runner is configured to use `sudo` for TUN device tests. To run unit tests without sudo, build first, then run the binary directly:
 
-- `sudo`: required to create tunnels. When you run `cargo test` you'll be prompted for your password.
-- Docker: you can install it [here](https://www.docker.com/get-started). If you are on Ubuntu/Debian you can run `apt-get install docker.io`.
+```bash
+cargo test -p boringtun --lib --no-run
+./target/debug/deps/boringtun-* --no-capture
+```
+
+## AmneziaWG 2.0 support
+
+AmneziaWG 2.0 makes WireGuard traffic harder to identify through deep packet inspection. It does this by randomizing packet headers, sizes, and timing patterns while keeping WireGuard's cryptography untouched.
+
+Four obfuscation mechanisms, each independently configurable:
+
+- **Dynamic headers (H1-H4)** — WireGuard normally uses fixed message type values (1, 2, 3, 4) in the first four bytes of every packet. AmneziaWG replaces these with random values drawn from configurable ranges. The randomized header is written into the packet before MAC computation, so it's covered by authentication.
+- **Packet padding (S1-S4)** — random bytes prepended to each packet type after MAC computation. This changes packet sizes without breaking authentication. S4 (transport padding) is skipped for keepalive packets, matching the Go reference.
+- **Junk packets (Jc/Jmin/Jmax)** — random-sized decoy datagrams sent before handshake initiation. The server silently discards them.
+- **Init packets (I1-I5)** — structured camouflage datagrams (CPS chains) sent before junk. These use a tag-based format (`<b 0xFF><r 16><t>`) to generate protocol-mimicking byte sequences.
+
+### Rust API
+
+```rust
+use boringtun::noise::Tunn;
+use boringtun::amnezia::*;
+
+let config = Amnezia2Config {
+    headers: HeaderConfig::new(
+        HeaderRange::new(100, 200)?,  // H1: handshake init
+        HeaderRange::new(201, 300)?,  // H2: handshake response
+        HeaderRange::new(301, 400)?,  // H3: cookie reply
+        HeaderRange::new(401, 500)?,  // H4: transport data
+    )?,
+    paddings: PaddingConfig::new(16, 16, 16, 8)?,
+    junk: JunkConfig::new(3, 64, 256)?,
+    init_packets: InitPacketConfig::default(),
+};
+
+let mut tunnel = Tunn::new_with_amnezia(
+    private_key, peer_public_key, None, Some(25), index, None, config,
+)?;
+
+// Before sending the handshake init, drain pre-handshake datagrams
+while let Some(packet) = tunnel.poll_outgoing_packet() {
+    udp_socket.send_to(&packet, peer_addr)?;
+}
+```
+
+### C FFI
+
+The library also exposes AmneziaWG through C bindings (`amnezia_config` struct, `new_tunnel_amnezia`, `wireguard_poll_outgoing_packet`). See [`AMNEZIA.md`](AMNEZIA.md) for the full C API reference.
+
+### Further reading
+
+- [`AMNEZIA.md`](AMNEZIA.md) — wire format, implementation details, and comparison with amneziawg-go
+- [AmneziaWG protocol docs](https://docs.amnezia.org/documentation/amnezia-wg/)
+- [amneziawg-go](https://github.com/amnezia-vpn/amneziawg-go) — the Go reference implementation this fork was validated against
 
 ## Supported platforms
 
@@ -67,8 +89,6 @@ armv7-apple-ios               |      | ✓    |
 armv7s-apple-ios              |      | ✓    |
 aarch64-linux-android         |      | ✓    |
 arm-linux-androideabi         |      | ✓    |
-
-<sub>Other platforms may be added in the future</sub>
 
 #### Linux
 
@@ -86,57 +106,11 @@ The behaviour is similar to that of [wireguard-go](https://git.zx2c4.com/wiregua
 
 #### FFI bindings
 
-The library exposes a set of C ABI bindings, those are defined in the `wireguard_ffi.h` header file. The C bindings can be used with C/C++, Swift (using a bridging header) or C# (using [DLLImport](https://docs.microsoft.com/en-us/dotnet/api/system.runtime.interopservices.dllimportattribute?view=netcore-2.2) with [CallingConvention](https://docs.microsoft.com/en-us/dotnet/api/system.runtime.interopservices.dllimportattribute.callingconvention?view=netcore-2.2) set to `Cdecl`).
+The library exposes C ABI bindings defined in the `wireguard_ffi.h` header file. These work with C/C++, Swift (bridging header), or C# ([DLLImport](https://docs.microsoft.com/en-us/dotnet/api/system.runtime.interopservices.dllimportattribute?view=netcore-2.2) with `CallingConvention.Cdecl`).
 
 #### JNI bindings
 
-The library exposes a set of Java Native Interface bindings, those are defined in `src/jni.rs`.
-
-## AmneziaWG 2.0 Support
-
-This fork adds [AmneziaWG 2.0](https://docs.amnezia.org/documentation/amnezia-wg/) protocol support, enabling packet obfuscation to resist deep packet inspection (DPI) while maintaining the WireGuard cryptographic guarantees.
-
-### Features
-
-- **Dynamic headers (H1-H4):** Replaces fixed WireGuard message type constants with configurable random values from user-defined ranges. Headers participate in MAC authentication.
-- **Packet padding (S1-S4):** Prepends random bytes to handshake, cookie, and transport packets to obscure packet sizes.
-- **Junk packets (Jc/Jmin/Jmax):** Sends random-sized decoy packets before handshake initiation.
-- **Init packets (I1-I5):** Sends CPS (Custom Packet Signature) datagrams before handshake for protocol camouflage.
-- **Full backward compatibility:** When all AmneziaWG parameters are zeroed/default, the tunnel behaves as standard WireGuard.
-
-### Usage
-
-```rust
-use boringtun::noise::Tunn;
-use boringtun::amnezia::Amnezia2Config;
-
-let amnezia = Amnezia2Config {
-    headers: HeaderConfig::new(
-        HeaderRange::new(100, 200).unwrap(),  // H1: init
-        HeaderRange::new(201, 300).unwrap(),  // H2: response
-        HeaderRange::new(301, 400).unwrap(),  // H3: cookie
-        HeaderRange::new(401, 500).unwrap(),  // H4: transport
-    ).unwrap(),
-    paddings: PaddingConfig::new(16, 16, 16, 8).unwrap(),
-    junk: JunkConfig::new(3, 64, 256).unwrap(),
-    init_packets: InitPacketConfig::default(),
-};
-
-let tunnel = Tunn::new_with_amnezia(
-    private_key, peer_public_key, None, Some(25), index, None, amnezia,
-);
-
-// Before sending handshake, drain pre-handshake datagrams
-while let Some(packet) = tunnel.poll_outgoing_packet() {
-    udp_socket.send_to(&packet, peer_addr);
-}
-```
-
-### Reference
-
-- [`AMNEZIA.md`](AMNEZIA.md) — detailed implementation docs, wire format, API reference, and comparison with amneziawg-go
-- [AmneziaWG protocol documentation](https://docs.amnezia.org/documentation/amnezia-wg/)
-- [amneziawg-go reference implementation](https://github.com/amnezia-vpn/amneziawg-go)
+Java Native Interface bindings are defined in `src/jni.rs`.
 
 ## License
 
