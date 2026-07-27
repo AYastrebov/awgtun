@@ -1143,6 +1143,105 @@ impl HeaderProtection {
     }
 }
 
+// ---------------------------------------------------------------------------
+// AWG 3.0 — aggregate configuration
+// ---------------------------------------------------------------------------
+
+/// AmneziaWG 3.0 configuration: all AWG 2.0 obfuscation parameters plus
+/// header protection, content padding, and randomized timings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Amnezia3Config {
+    pub junk: JunkConfig,
+    pub paddings: PaddingConfig,
+    pub headers: HeaderConfig,
+    pub init_packets: InitPacketConfig,
+    /// Header protection key. `None` disables header protection.
+    /// When set, all of S1-S4 must be >= [`HEADER_PROTECTION_MIN_PADDING`].
+    pub header_protection_key: Option<[u8; HEADER_PROTECTION_KEY_SIZE]>,
+    /// Random extra content padding for transport packets (inside AEAD).
+    pub content_padding_addition: Option<U32Range>,
+    /// Randomized WireGuard timing parameters.
+    pub timing_ranges: TimingRanges,
+    /// Outer MTU used to clamp content padding (amneziawg-go uses the device
+    /// MTU; boringtun's `Tunn` has no MTU concept, so it is configured here).
+    pub mtu: u32,
+}
+
+impl Amnezia3Config {
+    pub fn wireguard_compatible() -> Self {
+        Amnezia3Config::default()
+    }
+
+    /// Lift an AWG 2.0 config into 3.0 with all 3.0 features disabled.
+    pub fn from_amnezia2(config: Amnezia2Config) -> Self {
+        Amnezia3Config {
+            junk: config.junk,
+            paddings: config.paddings,
+            headers: config.headers,
+            init_packets: config.init_packets,
+            header_protection_key: None,
+            content_padding_addition: None,
+            timing_ranges: TimingRanges::default(),
+            mtu: AWG3_DEFAULT_MTU,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        self.junk.validate()?;
+        self.paddings.validate()?;
+        self.init_packets.validate()?;
+
+        if self.junk == JunkConfig::disabled()
+            && self.paddings == PaddingConfig::default()
+            && self.headers == HeaderConfig::wireguard_compatible()
+            && self.init_packets == InitPacketConfig::default()
+        {
+            self.headers.validate_wireguard_compatible()?;
+        } else {
+            self.headers.validate()?;
+        }
+
+        if self.header_protection_key.is_some() {
+            for (field, value) in [
+                (PaddingKind::Init, self.paddings.s1),
+                (PaddingKind::Response, self.paddings.s2),
+                (PaddingKind::Cookie, self.paddings.s3),
+                (PaddingKind::Transport, self.paddings.s4),
+            ] {
+                if value < HEADER_PROTECTION_MIN_PADDING {
+                    return Err(ConfigError::HeaderProtectionPaddingTooSmall {
+                        field,
+                        value,
+                        min: HEADER_PROTECTION_MIN_PADDING,
+                    });
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn header_protection(&self) -> Option<HeaderProtection> {
+        self.header_protection_key.map(HeaderProtection::new)
+    }
+}
+
+impl Default for Amnezia3Config {
+    fn default() -> Self {
+        Amnezia3Config {
+            junk: JunkConfig::disabled(),
+            paddings: PaddingConfig::default(),
+            headers: HeaderConfig::wireguard_compatible(),
+            init_packets: InitPacketConfig::default(),
+            header_protection_key: None,
+            content_padding_addition: None,
+            timing_ranges: TimingRanges::default(),
+            mtu: AWG3_DEFAULT_MTU,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Amnezia2Config {
@@ -1675,5 +1774,82 @@ mod tests {
             hp.peek_type(&prefix, type_bytes),
             u32::from_le_bytes([0x11; 4])
         );
+    }
+
+    fn awg3_base_config() -> Amnezia3Config {
+        Amnezia3Config {
+            junk: JunkConfig::disabled(),
+            paddings: PaddingConfig::new(16, 16, 16, 16).expect("valid paddings"),
+            headers: HeaderConfig::new(
+                HeaderRange::new(100, 199).expect("valid range"),
+                HeaderRange::new(200, 299).expect("valid range"),
+                HeaderRange::new(300, 399).expect("valid range"),
+                HeaderRange::new(400, 499).expect("valid range"),
+            )
+            .expect("valid headers"),
+            init_packets: InitPacketConfig::default(),
+            header_protection_key: Some([0x42; HEADER_PROTECTION_KEY_SIZE]),
+            content_padding_addition: Some(U32Range::single(16)),
+            timing_ranges: TimingRanges::default(),
+            mtu: AWG3_DEFAULT_MTU,
+        }
+    }
+
+    #[test]
+    fn amnezia3_valid_config_passes() {
+        assert!(awg3_base_config().validate().is_ok());
+    }
+
+    #[test]
+    fn amnezia3_header_protection_requires_padding_12() {
+        for (s1, s2, s3, s4) in [
+            (11, 16, 16, 16),
+            (16, 11, 16, 16),
+            (16, 16, 11, 16),
+            (16, 16, 16, 11),
+        ] {
+            let mut config = awg3_base_config();
+            config.paddings = PaddingConfig::new(s1, s2, s3, s4).expect("valid paddings");
+            let err = config.validate().expect_err("padding < 12 must fail");
+            assert!(matches!(
+                err,
+                ConfigError::HeaderProtectionPaddingTooSmall {
+                    min: HEADER_PROTECTION_MIN_PADDING,
+                    ..
+                }
+            ));
+        }
+
+        // Without a key, small paddings are fine.
+        let mut config = awg3_base_config();
+        config.header_protection_key = None;
+        config.paddings = PaddingConfig::new(0, 0, 0, 0).expect("valid paddings");
+        // zero paddings + awg headers → not wireguard-compatible, still valid
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn amnezia3_from_amnezia2_preserves_fields() {
+        let v2 = Amnezia2Config {
+            junk: JunkConfig::disabled(),
+            paddings: PaddingConfig::new(1, 2, 3, 4).expect("valid paddings"),
+            headers: HeaderConfig::new(
+                HeaderRange::single(100),
+                HeaderRange::single(200),
+                HeaderRange::single(300),
+                HeaderRange::single(400),
+            )
+            .expect("valid headers"),
+            init_packets: InitPacketConfig::default(),
+        };
+        let v3 = Amnezia3Config::from_amnezia2(v2.clone());
+        assert_eq!(v3.junk, v2.junk);
+        assert_eq!(v3.paddings, v2.paddings);
+        assert_eq!(v3.headers, v2.headers);
+        assert_eq!(v3.init_packets, v2.init_packets);
+        assert_eq!(v3.header_protection_key, None);
+        assert_eq!(v3.content_padding_addition, None);
+        assert!(v3.timing_ranges.is_zero());
+        assert_eq!(v3.mtu, AWG3_DEFAULT_MTU);
     }
 }

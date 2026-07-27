@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 use super::errors::WireGuardError;
+use crate::amnezia::TimingRanges;
 use crate::noise::{Tunn, TunnResult};
 use std::mem;
 use std::ops::{Index, IndexMut};
@@ -61,12 +62,21 @@ pub struct Timers {
     /// Did we send data without hearing back?
     want_handshake: bool,
     persistent_keepalive: usize,
+    /// AWG 3.0 randomized timing ranges. Stored here but not read until the
+    /// randomized-timers task wires them into `update_timers`; Task 7 removes
+    /// this allow.
+    #[allow(dead_code)]
+    timing_ranges: TimingRanges,
     /// Should this timer call reset rr function (if not a shared rr instance)
     pub(super) should_reset_rr: bool,
 }
 
 impl Timers {
-    pub(super) fn new(persistent_keepalive: Option<u16>, reset_rr: bool) -> Timers {
+    pub(super) fn new(
+        persistent_keepalive: Option<u16>,
+        reset_rr: bool,
+        timing_ranges: TimingRanges,
+    ) -> Timers {
         Timers {
             is_initiator: false,
             time_started: Instant::now(),
@@ -75,6 +85,7 @@ impl Timers {
             want_keepalive: Default::default(),
             want_handshake: Default::default(),
             persistent_keepalive: usize::from(persistent_keepalive.unwrap_or(0)),
+            timing_ranges,
             should_reset_rr: reset_rr,
         }
     }

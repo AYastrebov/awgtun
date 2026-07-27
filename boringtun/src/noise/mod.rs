@@ -8,7 +8,7 @@ pub mod rate_limiter;
 mod session;
 mod timers;
 
-use crate::amnezia::{Amnezia2Config, ConfigError, HeaderConfig, JunkConfig, InitPacketConfig, OsRandom, PaddingConfig};
+use crate::amnezia::{Amnezia2Config, Amnezia3Config, ConfigError, HeaderConfig, HeaderProtection, HeaderRange, JunkConfig, InitPacketConfig, OsRandom, PaddingConfig, U32Range};
 use crate::amnezia::RandomSource as _;
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::Handshake;
@@ -81,6 +81,12 @@ pub struct Tunn {
     junk_config: JunkConfig,
     /// AmneziaWG init packet (CPS) configuration
     init_packet_config: InitPacketConfig,
+    /// AWG 3.0 header protection (ChaCha20 over the WG message header)
+    header_protection: Option<HeaderProtection>,
+    /// AWG 3.0 content padding addition range for transport packets
+    content_padding: Option<U32Range>,
+    /// Outer MTU used to clamp content padding
+    mtu: u32,
     /// Queue for pre-handshake datagrams (I-packets, junk) that need to be
     /// sent before the actual handshake initiation.
     network_outgoing: VecDeque<Vec<u8>>,
@@ -250,8 +256,35 @@ impl Tunn {
         rate_limiter: Option<Arc<RateLimiter>>,
         amnezia: Amnezia2Config,
     ) -> Result<Self, ConfigError> {
+        Self::new_with_amnezia3(
+            static_private,
+            peer_static_public,
+            preshared_key,
+            persistent_keepalive,
+            index,
+            rate_limiter,
+            Amnezia3Config::from_amnezia2(amnezia),
+        )
+    }
+
+    /// Create a new tunnel with AmneziaWG 3.0 configuration.
+    ///
+    /// Returns `Err(ConfigError)` if the AmneziaWG config is invalid
+    /// (e.g. overlapping header ranges, padding out of bounds, header
+    /// protection enabled with S1-S4 < 12).
+    pub fn new_with_amnezia3(
+        static_private: x25519::StaticSecret,
+        peer_static_public: x25519::PublicKey,
+        preshared_key: Option<[u8; 32]>,
+        persistent_keepalive: Option<u16>,
+        index: u32,
+        rate_limiter: Option<Arc<RateLimiter>>,
+        amnezia: Amnezia3Config,
+    ) -> Result<Self, ConfigError> {
         amnezia.validate()?;
         let static_public = x25519::PublicKey::from(&static_private);
+        // Computed before the struct literal because `init_packets` is not Copy
+        let header_protection = amnezia.header_protection();
 
         Ok(Tunn {
             handshake: Handshake::new(
@@ -267,7 +300,11 @@ impl Tunn {
             rx_bytes: Default::default(),
 
             packet_queue: VecDeque::new(),
-            timers: Timers::new(persistent_keepalive, rate_limiter.is_none()),
+            timers: Timers::new(
+                persistent_keepalive,
+                rate_limiter.is_none(),
+                amnezia.timing_ranges,
+            ),
 
             rate_limiter: rate_limiter.unwrap_or_else(|| {
                 Arc::new(RateLimiter::new(&static_public, PEER_HANDSHAKE_RATE_LIMIT))
@@ -276,6 +313,9 @@ impl Tunn {
             padding_config: amnezia.paddings,
             junk_config: amnezia.junk,
             init_packet_config: amnezia.init_packets,
+            header_protection,
+            content_padding: amnezia.content_padding_addition,
+            mtu: amnezia.mtu,
             network_outgoing: VecDeque::new(),
         })
     }
@@ -979,5 +1019,45 @@ mod tests {
             unreachable!();
         };
         assert_eq!(sent_packet_buf, recv_packet_buf);
+    }
+
+    fn awg3_test_config(key: [u8; 32]) -> crate::amnezia::Amnezia3Config {
+        crate::amnezia::Amnezia3Config {
+            junk: JunkConfig::disabled(),
+            paddings: PaddingConfig::new(16, 16, 16, 16).expect("valid paddings"),
+            headers: HeaderConfig::new(
+                HeaderRange::new(100, 199).expect("valid range"),
+                HeaderRange::new(200, 299).expect("valid range"),
+                HeaderRange::new(300, 399).expect("valid range"),
+                HeaderRange::new(400, 499).expect("valid range"),
+            )
+            .expect("valid headers"),
+            init_packets: InitPacketConfig::default(),
+            header_protection_key: Some(key),
+            content_padding_addition: None,
+            timing_ranges: Default::default(),
+            mtu: crate::amnezia::AWG3_DEFAULT_MTU,
+        }
+    }
+
+    #[test]
+    fn new_with_amnezia3_constructs() {
+        let my_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let my_public_key = x25519_dalek::PublicKey::from(&my_secret_key);
+        let their_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let their_public_key = x25519_dalek::PublicKey::from(&their_secret_key);
+        let config = awg3_test_config([0x42; 32]);
+        let tun = Tunn::new_with_amnezia3(
+            my_secret_key,
+            their_public_key,
+            None,
+            None,
+            1,
+            None,
+            config,
+        );
+        assert!(tun.is_ok());
+        // silence unused warning for their_secret_key's counterpart in later tasks
+        let _ = (my_public_key, their_secret_key);
     }
 }
