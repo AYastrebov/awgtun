@@ -116,6 +116,15 @@ pub enum ConfigError {
     UnsupportedLegacyField {
         field: String,
     },
+    InvalidRange {
+        value: String,
+        reason: &'static str,
+    },
+    HeaderProtectionPaddingTooSmall {
+        field: PaddingKind,
+        value: u8,
+        min: u8,
+    },
 }
 
 impl fmt::Display for ConfigError {
@@ -174,6 +183,14 @@ impl fmt::Display for ConfigError {
             ConfigError::UnsupportedLegacyField { field } => {
                 write!(f, "`{}` is not an AmneziaWG 2.0 field", field)
             }
+            ConfigError::InvalidRange { value, reason } => {
+                write!(f, "invalid range `{}`: {}", value, reason)
+            }
+            ConfigError::HeaderProtectionPaddingTooSmall { field, value, min } => write!(
+                f,
+                "{} padding {} is below the header-protection minimum {}",
+                field, value, min
+            ),
         }
     }
 }
@@ -934,6 +951,151 @@ impl InitPacketConfig {
     }
 }
 
+// ---------------------------------------------------------------------------
+// AWG 3.0 — generic ranges and timing configuration
+// ---------------------------------------------------------------------------
+
+/// Default outer MTU used for content-padding clamping (matches amneziawg-go's
+/// default device MTU).
+pub const AWG3_DEFAULT_MTU: u32 = 1420;
+
+/// Minimum S1-S4 padding when header protection is enabled: the ChaCha20
+/// nonce is read from the first 12 bytes of the random padding prefix.
+pub const HEADER_PROTECTION_MIN_PADDING: u8 = 12;
+
+/// Inclusive `u32` range used by AWG 3.0 content padding and timing
+/// parameters. A fully-zero range means "unset" (fall back to the WireGuard
+/// default), matching amneziawg-go's `UintRange`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct U32Range {
+    pub lo: u32,
+    pub hi: u32,
+}
+
+impl U32Range {
+    pub const fn zero() -> Self {
+        U32Range { lo: 0, hi: 0 }
+    }
+
+    pub const fn single(value: u32) -> Self {
+        U32Range {
+            lo: value,
+            hi: value,
+        }
+    }
+
+    pub fn new(lo: u32, hi: u32) -> Result<Self, ConfigError> {
+        if hi < lo {
+            return Err(ConfigError::InvalidRange {
+                value: format!("{}-{}", lo, hi),
+                reason: "range end is smaller than start",
+            });
+        }
+        Ok(U32Range { lo, hi })
+    }
+
+    /// Parse `"a"` or `"a-b"` (decimal, inclusive).
+    pub fn parse(input: &str) -> Result<Self, ConfigError> {
+        let input = input.trim();
+        if input.is_empty() {
+            return Err(ConfigError::InvalidRange {
+                value: input.to_owned(),
+                reason: "empty value",
+            });
+        }
+
+        let mut parts = input.split('-');
+        let lo = parse_range_part(input, parts.next())?;
+        let hi = match parts.next() {
+            Some(part) => parse_range_part(input, Some(part))?,
+            None => lo,
+        };
+        if parts.next().is_some() {
+            return Err(ConfigError::InvalidRange {
+                value: input.to_owned(),
+                reason: "expected `value` or `start-end`",
+            });
+        }
+
+        U32Range::new(lo, hi)
+    }
+
+    /// A fully-zero range means "unset" — callers fall back to defaults.
+    pub fn is_zero(&self) -> bool {
+        self.lo == 0 && self.hi == 0
+    }
+
+    /// Pick a random value from `[lo, hi]` (inclusive).
+    pub fn generate(&self, rng: &mut dyn RandomSource) -> u32 {
+        rng.gen_range_u32(self.lo, self.hi)
+    }
+
+    /// Random pick, or `default` when the range is unset.
+    pub fn pick_or(&self, rng: &mut dyn RandomSource, default: u32) -> u32 {
+        if self.is_zero() {
+            default
+        } else {
+            self.generate(rng)
+        }
+    }
+
+    /// Range lower bound, or `default` when unset.
+    pub fn lo_or(&self, default: u32) -> u32 {
+        if self.is_zero() {
+            default
+        } else {
+            self.lo
+        }
+    }
+
+    /// Range upper bound, or `default` when unset.
+    pub fn hi_or(&self, default: u32) -> u32 {
+        if self.is_zero() {
+            default
+        } else {
+            self.hi
+        }
+    }
+}
+
+fn parse_range_part(input: &str, part: Option<&str>) -> Result<u32, ConfigError> {
+    let part = part.unwrap_or_default().trim();
+    if part.is_empty() {
+        return Err(ConfigError::InvalidRange {
+            value: input.to_owned(),
+            reason: "empty range bound",
+        });
+    }
+    part.parse::<u32>().map_err(|_| ConfigError::InvalidRange {
+        value: input.to_owned(),
+        reason: "expected decimal digits",
+    })
+}
+
+/// AWG 3.0 randomized timing parameters (all ranges, seconds except
+/// `max_handshake_attempts` which is a count). Unset (zero) ranges fall back
+/// to the classic WireGuard constants, preserving standard behavior.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TimingRanges {
+    pub rekey_after_time: U32Range,
+    pub rekey_timeout: U32Range,
+    pub reject_after_time: U32Range,
+    pub keepalive_timeout: U32Range,
+    pub max_handshake_attempts: U32Range,
+    pub persistent_keepalive: U32Range,
+}
+
+impl TimingRanges {
+    pub fn is_zero(&self) -> bool {
+        self.rekey_after_time.is_zero()
+            && self.rekey_timeout.is_zero()
+            && self.reject_after_time.is_zero()
+            && self.keepalive_timeout.is_zero()
+            && self.max_handshake_attempts.is_zero()
+            && self.persistent_keepalive.is_zero()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Amnezia2Config {
@@ -1378,5 +1540,51 @@ mod tests {
         for pkt in &packets {
             assert_eq!(pkt.len(), 100);
         }
+    }
+
+    #[test]
+    fn u32_range_parse_and_generate() {
+        let single = U32Range::parse("25").expect("single value parses");
+        assert_eq!(single, U32Range::single(25));
+
+        let range = U32Range::parse("120-240").expect("range parses");
+        assert_eq!(range, U32Range { lo: 120, hi: 240 });
+
+        assert!(U32Range::parse("240-120").is_err());
+        assert!(U32Range::parse("1-2-3").is_err());
+        assert!(U32Range::parse("").is_err());
+        assert!(U32Range::parse("abc").is_err());
+
+        let mut rng = DetRng::new(0xAA);
+        for _ in 0..32 {
+            let v = range.generate(&mut rng);
+            assert!((120..=240).contains(&v));
+        }
+        assert_eq!(U32Range::single(7).generate(&mut rng), 7);
+    }
+
+    #[test]
+    fn u32_range_defaults() {
+        let zero = U32Range::zero();
+        assert!(zero.is_zero());
+        let mut rng = DetRng::new(0xFF);
+        assert_eq!(zero.pick_or(&mut rng, 120), 120);
+        assert_eq!(zero.lo_or(10), 10);
+        assert_eq!(zero.hi_or(180), 180);
+        let range = U32Range::single(30);
+        assert_eq!(range.pick_or(&mut rng, 120), 30);
+        assert_eq!(range.lo_or(10), 30);
+        assert_eq!(range.hi_or(180), 30);
+    }
+
+    #[test]
+    fn timing_ranges_default_is_zero() {
+        let ranges = TimingRanges::default();
+        assert!(ranges.is_zero());
+        let ranges = TimingRanges {
+            rekey_timeout: U32Range::single(5),
+            ..TimingRanges::default()
+        };
+        assert!(!ranges.is_zero());
     }
 }
