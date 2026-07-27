@@ -102,6 +102,7 @@ const HANDSHAKE_INIT_SZ: usize = 148;
 const HANDSHAKE_RESP_SZ: usize = 92;
 const COOKIE_REPLY_SZ: usize = 64;
 const DATA_OVERHEAD_SZ: usize = 32;
+const TRANSPORT_HEADER_SZ: usize = 16; // type(4) + receiver(4) + counter(8)
 
 #[derive(Debug)]
 pub struct HandshakeInit<'a> {
@@ -345,37 +346,54 @@ impl Tunn {
     /// Panics if dst buffer is too small.
     /// Size of dst should be at least `src.len() + 32 + S4` for data packets,
     /// and no less than `148 + S1` bytes (to hold a padded handshake initiation).
+    /// Keepalive packets also occupy `S4` bytes of padding (amneziawg-go
+    /// f4f4c99). With AWG 3.0 header protection enabled, the first 16 bytes
+    /// after the padding prefix are ChaCha20-encrypted.
     /// When AmneziaWG is disabled (default config), S1 and S4 are both 0.
     pub fn encapsulate<'a>(&mut self, src: &[u8], dst: &'a mut [u8]) -> TunnResult<'a> {
         let current = self.current;
         if let Some(ref session) = self.sessions[current % N_SESSIONS] {
             // Send the packet using an established session
-            let transport_type = self.header_config.transport.generate(&mut OsRandom);
-            // S4 padding only for non-keepalive packets (matching amneziawg-go)
-            let s4 = if src.is_empty() {
-                0
-            } else {
-                self.padding_config.s4 as usize
-            };
-            // Write WG packet at offset s4, then fill the prefix with random padding
-            let packet = session.format_packet_data(src, &mut dst[s4..], transport_type);
-            let packet_len = packet.len();
-            if s4 > 0 {
-                OsRandom.fill_bytes(&mut dst[..s4]);
-            }
+            let packet = self.format_transport_packet(session, src, dst);
             self.timer_tick(TimerName::TimeLastPacketSent);
             // Exclude Keepalive packets from timer update.
             if !src.is_empty() {
                 self.timer_tick(TimerName::TimeLastDataPacketSent);
             }
             self.tx_bytes += src.len();
-            return TunnResult::WriteToNetwork(&mut dst[..s4 + packet_len]);
+            return TunnResult::WriteToNetwork(packet);
         }
 
         // If there is no session, queue the packet for future retry
         self.queue_packet(src);
         // Initiate a new handshake if none is in progress
         self.format_handshake_initiation(dst, false)
+    }
+
+    /// Format a transport (data or keepalive) packet: dynamic H4 header,
+    /// S4 random prefix (applied to keepalives as well, matching
+    /// amneziawg-go f4f4c99), and AWG 3.0 header protection over the
+    /// 16-byte transport header when enabled.
+    fn format_transport_packet<'a>(
+        &self,
+        session: &session::Session,
+        src: &[u8],
+        dst: &'a mut [u8],
+    ) -> &'a mut [u8] {
+        let transport_type = self.header_config.transport.generate(&mut OsRandom);
+        let s4 = self.padding_config.s4 as usize;
+
+        // Write WG packet at offset s4, then fill the prefix with random padding
+        let packet = session.format_packet_data(src, &mut dst[s4..], transport_type);
+        let packet_len = packet.len();
+        if s4 > 0 {
+            OsRandom.fill_bytes(&mut dst[..s4]);
+        }
+        if let Some(hp) = self.header_protection {
+            let (prefix, message) = dst.split_at_mut(s4);
+            hp.apply(prefix, &mut message[..TRANSPORT_HEADER_SZ]);
+        }
+        &mut dst[..s4 + packet_len]
     }
 
     /// Receives a UDP datagram from the network and parses it.
@@ -412,6 +430,10 @@ impl Tunn {
                     OsRandom.fill_bytes(&mut dst[..s3]);
                 }
                 dst[s3..s3 + cookie.len()].copy_from_slice(cookie);
+                if let Some(hp) = self.header_protection {
+                    let (prefix, message) = dst.split_at_mut(s3);
+                    hp.apply(prefix, &mut message[..cookie.len()]);
+                }
                 return TunnResult::WriteToNetwork(&mut dst[..s3 + cookie.len()]);
             }
             Err(TunnResult::Err(e)) => return TunnResult::Err(e),
@@ -459,6 +481,10 @@ impl Tunn {
         if s2 > 0 {
             OsRandom.fill_bytes(&mut dst[..s2]);
         }
+        if let Some(hp) = self.header_protection {
+            let (prefix, message) = dst.split_at_mut(s2);
+            hp.apply(prefix, &mut message[..packet_len]);
+        }
 
         self.timer_tick(TimerName::TimeLastPacketReceived);
         self.timer_tick(TimerName::TimeLastPacketSent);
@@ -482,8 +508,7 @@ impl Tunn {
 
         let session = self.handshake.receive_handshake_response(p)?;
 
-        let transport_type = self.header_config.transport.generate(&mut OsRandom);
-        let keepalive_packet = session.format_packet_data(&[], dst, transport_type);
+        let keepalive_packet = self.format_transport_packet(&session, &[], dst);
         // Store new session in ring buffer
         let l_idx = session.local_index();
         let index = l_idx % N_SESSIONS;
@@ -606,6 +631,10 @@ impl Tunn {
                 let packet_len = packet.len();
                 if s1 > 0 {
                     OsRandom.fill_bytes(&mut dst[..s1]);
+                }
+                if let Some(hp) = self.header_protection {
+                    let (prefix, message) = dst.split_at_mut(s1);
+                    hp.apply(prefix, &mut message[..packet_len]);
                 }
 
                 if starting_new_handshake {
@@ -1059,5 +1088,83 @@ mod tests {
         assert!(tun.is_ok());
         // silence unused warning for their_secret_key's counterpart in later tasks
         let _ = (my_public_key, their_secret_key);
+    }
+
+    fn create_two_tuns_awg3() -> (Tunn, Tunn) {
+        let my_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let my_public_key = x25519_dalek::PublicKey::from(&my_secret_key);
+        let their_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let their_public_key = x25519_dalek::PublicKey::from(&their_secret_key);
+        let key = [0x42; 32];
+
+        let my_tun = Tunn::new_with_amnezia3(
+            my_secret_key,
+            their_public_key,
+            None,
+            None,
+            1,
+            None,
+            awg3_test_config(key),
+        )
+        .expect("valid awg3 config");
+        let their_tun = Tunn::new_with_amnezia3(
+            their_secret_key,
+            my_public_key,
+            None,
+            None,
+            2,
+            None,
+            awg3_test_config(key),
+        )
+        .expect("valid awg3 config");
+        (my_tun, their_tun)
+    }
+
+    #[test]
+    fn awg3_handshake_init_is_header_protected() {
+        let (mut my_tun, _) = create_two_tuns_awg3();
+        let init = create_handshake_init(&mut my_tun);
+        // S1 = 16 padding + 148 init message
+        assert_eq!(init.len(), 16 + 148);
+
+        // Decrypting with the configured key yields a valid initiation.
+        let hp = crate::amnezia::HeaderProtection::new([0x42; 32]);
+        let mut decrypted = init[16..].to_vec();
+        hp.apply(&init[..16], &mut decrypted);
+        let packet = Tunn::parse_incoming_packet_config(
+            &decrypted,
+            &HeaderConfig::new(
+                HeaderRange::new(100, 199).unwrap(),
+                HeaderRange::new(200, 299).unwrap(),
+                HeaderRange::new(300, 399).unwrap(),
+                HeaderRange::new(400, 499).unwrap(),
+            )
+            .unwrap(),
+        );
+        assert!(matches!(packet, Ok(Packet::HandshakeInit(_))));
+    }
+
+    /// Strip the padding prefix and header protection from an outgoing AWG
+    /// 3.0 packet, simulating the receive side (implemented in Task 5).
+    fn hp_strip(packet: &[u8], padding: usize) -> Vec<u8> {
+        let hp = crate::amnezia::HeaderProtection::new([0x42; 32]);
+        let mut message = packet[padding..].to_vec();
+        hp.apply(&packet[..padding], &mut message);
+        message
+    }
+
+    #[test]
+    fn awg3_keepalive_has_s4_prefix() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_awg3();
+        let init = create_handshake_init(&mut my_tun);
+        // Receive-side header protection removal does not exist yet (Task 5),
+        // so decrypt the handshake messages in-test.
+        let resp = create_handshake_response(&mut their_tun, &hp_strip(&init, 16));
+        // Response: S2 (16) + 92
+        assert_eq!(resp.len(), 16 + 92);
+        let keepalive = parse_handshake_resp(&mut my_tun, &hp_strip(&resp, 16));
+        // Keepalive transport packet: S4 (16) + 16 header + 16 tag.
+        // (Previously keepalives skipped S4; amneziawg-go f4f4c99 applies it.)
+        assert_eq!(keepalive.len(), 16 + 32);
     }
 }
