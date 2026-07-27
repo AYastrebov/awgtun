@@ -413,9 +413,19 @@ impl Tunn {
             return self.send_queued_packet(dst);
         }
 
-        // Strip AmneziaWG padding before parsing
-        let padding = self.determine_padding(datagram).unwrap_or(0);
-        let stripped = &datagram[padding..];
+        // Strip AmneziaWG padding before parsing; with AWG 3.0 header
+        // protection, decrypt the protected region first.
+        let (padding, protected_len) = self.determine_padding(datagram).unwrap_or((0, 0));
+        let mut decrypted;
+        let stripped: &[u8] = match self.header_protection {
+            Some(hp) if protected_len > 0 => {
+                decrypted = datagram[padding..].to_vec();
+                let protected = protected_len.min(decrypted.len());
+                hp.apply(&datagram[..padding], &mut decrypted[..protected]);
+                &decrypted
+            }
+            _ => &datagram[padding..],
+        };
 
         let mut cookie = [0u8; COOKIE_REPLY_SZ];
         let packet = match self
@@ -748,8 +758,14 @@ impl Tunn {
 
     /// Determine the padding length for an incoming packet by trying each
     /// message type's padding + expected size, then validating the header at
-    /// the padding offset. Returns `Some(padding_bytes)` or `None` if no match.
-    fn determine_padding(&self, src: &[u8]) -> Option<usize> {
+    /// the padding offset. With AWG 3.0 header protection enabled, the
+    /// 4 type bytes are decrypted before the range check.
+    ///
+    /// Returns `Some((padding, protected_len))` where `protected_len` is the
+    /// number of bytes after the padding covered by header protection (the
+    /// full message for handshake types, the 16-byte header for transport),
+    /// or `None` if no match.
+    fn determine_padding(&self, src: &[u8]) -> Option<(usize, usize)> {
         let checks: [(usize, &crate::amnezia::HeaderRange, usize, bool); 4] = [
             (
                 self.padding_config.s1 as usize,
@@ -785,13 +801,20 @@ impl Tunn {
             };
 
             if size_ok && padding + 4 <= src.len() {
-                let header = u32::from_le_bytes(
-                    src[padding..padding + 4]
-                        .try_into()
-                        .expect("bounds checked: padding + 4 <= src.len()"),
-                );
+                let type_bytes: [u8; 4] = src[padding..padding + 4]
+                    .try_into()
+                    .expect("bounds checked: padding + 4 <= src.len()");
+                let header = match self.header_protection {
+                    Some(hp) => hp.peek_type(&src[..padding], type_bytes),
+                    None => u32::from_le_bytes(type_bytes),
+                };
                 if header_range.contains(header) {
-                    return Some(padding);
+                    let protected_len = if exact {
+                        expected_size
+                    } else {
+                        TRANSPORT_HEADER_SZ
+                    };
+                    return Some((padding, protected_len));
                 }
             }
         }
@@ -1144,27 +1167,82 @@ mod tests {
         assert!(matches!(packet, Ok(Packet::HandshakeInit(_))));
     }
 
-    /// Strip the padding prefix and header protection from an outgoing AWG
-    /// 3.0 packet, simulating the receive side (implemented in Task 5).
-    fn hp_strip(packet: &[u8], padding: usize) -> Vec<u8> {
-        let hp = crate::amnezia::HeaderProtection::new([0x42; 32]);
-        let mut message = packet[padding..].to_vec();
-        hp.apply(&packet[..padding], &mut message);
-        message
-    }
-
     #[test]
     fn awg3_keepalive_has_s4_prefix() {
         let (mut my_tun, mut their_tun) = create_two_tuns_awg3();
         let init = create_handshake_init(&mut my_tun);
-        // Receive-side header protection removal does not exist yet (Task 5),
-        // so decrypt the handshake messages in-test.
-        let resp = create_handshake_response(&mut their_tun, &hp_strip(&init, 16));
+        let resp = create_handshake_response(&mut their_tun, &init);
         // Response: S2 (16) + 92
         assert_eq!(resp.len(), 16 + 92);
-        let keepalive = parse_handshake_resp(&mut my_tun, &hp_strip(&resp, 16));
+        let keepalive = parse_handshake_resp(&mut my_tun, &resp);
         // Keepalive transport packet: S4 (16) + 16 header + 16 tag.
         // (Previously keepalives skipped S4; amneziawg-go f4f4c99 applies it.)
         assert_eq!(keepalive.len(), 16 + 32);
+    }
+
+    fn ipv4_packet() -> Vec<u8> {
+        // Minimal 24-byte IPv4 packet: 20-byte header + 4 payload bytes
+        let mut p = vec![0u8; 24];
+        p[0] = 0x45; // version 4, IHL 5
+        p[2..4].copy_from_slice(&24u16.to_be_bytes()); // total length
+        p[12..16].copy_from_slice(&[10, 0, 0, 1]); // src
+        p[16..20].copy_from_slice(&[10, 0, 0, 2]); // dst
+        p
+    }
+
+    #[test]
+    fn awg3_full_handshake_and_data_round_trip() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_awg3();
+        let init = create_handshake_init(&mut my_tun);
+        let resp = create_handshake_response(&mut their_tun, &init);
+        let keepalive = parse_handshake_resp(&mut my_tun, &resp);
+
+        // Responder consumes the keepalive (header-protected transport).
+        let mut dst = vec![0u8; 2048];
+        let result = their_tun.decapsulate(None, &keepalive, &mut dst);
+        assert!(matches!(result, TunnResult::Done));
+
+        // Data packet my -> their, through S4 + header protection.
+        let ip = ipv4_packet();
+        let mut enc_buf = vec![0u8; 2048];
+        let encapsulated = match my_tun.encapsulate(&ip, &mut enc_buf) {
+            TunnResult::WriteToNetwork(packet) => packet.len(),
+            other => panic!("expected WriteToNetwork, got {:?}", other),
+        };
+        let wire = enc_buf[..encapsulated].to_vec();
+        assert_eq!(wire.len(), 16 + 16 + ip.len() + 16); // S4 + header + content + tag
+
+        let mut dec_buf = vec![0u8; 2048];
+        match their_tun.decapsulate(None, &wire, &mut dec_buf) {
+            TunnResult::WriteToTunnelV4(packet, addr) => {
+                assert_eq!(packet, &ip[..]);
+                assert_eq!(addr, std::net::IpAddr::from([10, 0, 0, 1]));
+            }
+            other => panic!("expected WriteToTunnelV4, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn awg3_mismatched_header_protection_key_drops() {
+        let (mut my_tun, _) = create_two_tuns_awg3();
+        let their_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let my_public_key = x25519_dalek::PublicKey::from(
+            &x25519_dalek::StaticSecret::random_from_rng(OsRng),
+        );
+        let mut wrong_key_tun = Tunn::new_with_amnezia3(
+            their_secret_key,
+            my_public_key,
+            None,
+            None,
+            2,
+            None,
+            awg3_test_config([0x99; 32]), // different header protection key
+        )
+        .expect("valid awg3 config");
+
+        let init = create_handshake_init(&mut my_tun);
+        let mut dst = vec![0u8; 2048];
+        let result = wrong_key_tun.decapsulate(None, &init, &mut dst);
+        assert!(matches!(result, TunnResult::Err(WireGuardError::InvalidPacket)));
     }
 }
