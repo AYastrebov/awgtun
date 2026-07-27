@@ -1096,6 +1096,53 @@ impl TimingRanges {
     }
 }
 
+// ---------------------------------------------------------------------------
+// AWG 3.0 — header protection (ChaCha20 over low-entropy header fields)
+// ---------------------------------------------------------------------------
+
+pub const HEADER_PROTECTION_KEY_SIZE: usize = 32;
+pub const HEADER_PROTECTION_NONCE_SIZE: usize = 12;
+
+/// AWG 3.0 header protection key. Applies raw (unauthenticated) ChaCha20 to
+/// the WireGuard message that follows the random padding prefix; the first
+/// 12 bytes of that prefix are the nonce. Mirrors amneziawg-go's
+/// `Device.HeaderProtectionCipher`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeaderProtection {
+    key: [u8; HEADER_PROTECTION_KEY_SIZE],
+}
+
+impl HeaderProtection {
+    pub fn new(key: [u8; HEADER_PROTECTION_KEY_SIZE]) -> Self {
+        HeaderProtection { key }
+    }
+
+    /// XOR `message` in place with the ChaCha20 keystream (block counter 0).
+    /// `prefix` is the random crypto padding preceding the message; its first
+    /// 12 bytes are the nonce.
+    ///
+    /// # Panics
+    /// Panics if `prefix` is shorter than the nonce size. Config validation
+    /// (S1-S4 >= 12) guarantees this cannot happen for real packets.
+    pub fn apply(&self, prefix: &[u8], message: &mut [u8]) {
+        use chacha20::cipher::{KeyIvInit, StreamCipher};
+        use std::convert::TryInto;
+
+        let nonce: &[u8; HEADER_PROTECTION_NONCE_SIZE] = prefix[..HEADER_PROTECTION_NONCE_SIZE]
+            .try_into()
+            .expect("header protection requires at least 12 bytes of padding prefix");
+        let mut cipher = chacha20::ChaCha20::new((&self.key).into(), nonce.into());
+        cipher.apply_keystream(message);
+    }
+
+    /// Decrypt a 4-byte message-type candidate (keystream bytes 0..4).
+    pub fn peek_type(&self, prefix: &[u8], type_bytes: [u8; 4]) -> u32 {
+        let mut buf = type_bytes;
+        self.apply(prefix, &mut buf);
+        u32::from_le_bytes(buf)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Amnezia2Config {
@@ -1586,5 +1633,47 @@ mod tests {
             ..TimingRanges::default()
         };
         assert!(!ranges.is_zero());
+    }
+
+    #[test]
+    fn header_protection_chacha20_known_answer() {
+        // RFC 8439 A.1 test vector #1: zero key, zero nonce, counter 0.
+        let hp = HeaderProtection::new([0u8; HEADER_PROTECTION_KEY_SIZE]);
+        let prefix = [0u8; HEADER_PROTECTION_NONCE_SIZE];
+        let mut message = [0u8; 64];
+        hp.apply(&prefix, &mut message);
+        let expected: [u8; 64] = [
+            0x76, 0xb8, 0xe0, 0xad, 0xa0, 0xf1, 0x3d, 0x90, 0x40, 0x5d, 0x6a, 0xe5, 0x53, 0x86,
+            0xbd, 0x28, 0xbd, 0xd2, 0x19, 0xb8, 0xa0, 0x8d, 0xed, 0x1a, 0xa8, 0x36, 0xef, 0xcc,
+            0x8b, 0x77, 0x0d, 0xc7, 0xda, 0x41, 0x59, 0x7c, 0x51, 0x57, 0x48, 0x8d, 0x77, 0x24,
+            0xe0, 0x3f, 0xb8, 0xd8, 0x4a, 0x37, 0x6a, 0x43, 0xb8, 0xf4, 0x15, 0x18, 0xa1, 0x1c,
+            0xc3, 0x87, 0xb6, 0x69, 0xb2, 0xee, 0x65, 0x86,
+        ];
+        assert_eq!(message, expected);
+    }
+
+    #[test]
+    fn header_protection_round_trip_and_peek() {
+        let hp = HeaderProtection::new([0x42; HEADER_PROTECTION_KEY_SIZE]);
+        let mut prefix = [0u8; 16];
+        DetRng::new(7).fill_bytes(&mut prefix);
+
+        let plaintext: [u8; 32] = [0x11; 32];
+        let mut message = plaintext;
+        hp.apply(&prefix, &mut message);
+        assert_ne!(message, plaintext);
+
+        // decrypt restores the plaintext (XOR is its own inverse)
+        hp.apply(&prefix, &mut message);
+        assert_eq!(message, plaintext);
+
+        // peek_type decrypts exactly the first 4 keystream bytes
+        let mut type_bytes = [0u8; 4];
+        type_bytes.copy_from_slice(&plaintext[..4]);
+        hp.apply(&prefix, &mut type_bytes);
+        assert_eq!(
+            hp.peek_type(&prefix, type_bytes),
+            u32::from_le_bytes([0x11; 4])
+        );
     }
 }
