@@ -124,6 +124,14 @@ pub enum ConfigError {
         value: String,
         reason: &'static str,
     },
+    InvalidConfigLine {
+        line: String,
+        reason: &'static str,
+    },
+    InvalidFieldValue {
+        field: String,
+        reason: &'static str,
+    },
     HeaderProtectionPaddingTooSmall {
         field: PaddingKind,
         value: u8,
@@ -189,6 +197,12 @@ impl fmt::Display for ConfigError {
             }
             ConfigError::InvalidRange { value, reason } => {
                 write!(f, "invalid range `{}`: {}", value, reason)
+            }
+            ConfigError::InvalidConfigLine { line, reason } => {
+                write!(f, "invalid config line `{}`: {}", line, reason)
+            }
+            ConfigError::InvalidFieldValue { field, reason } => {
+                write!(f, "invalid value for `{}`: {}", field, reason)
             }
             ConfigError::HeaderProtectionPaddingTooSmall { field, value, min } => write!(
                 f,
@@ -1284,6 +1298,179 @@ impl Amnezia3Config {
     pub fn header_protection(&self) -> Option<HeaderProtection> {
         self.header_protection_key.map(HeaderProtection::new)
     }
+
+    /// Parse a newline-separated `key=value` configuration block, the format
+    /// amneziawg-tools emits and AmneziaWG `.conf` files carry.
+    ///
+    /// Recognized keys are the AmneziaWG 2.0 set (`jc`, `jmin`, `jmax`,
+    /// `s1`-`s4`, `h1`-`h4`, `i1`-`i5`) plus the 3.0 set
+    /// (`header_protection_key` as 64 hex characters,
+    /// `content_padding_addition`, `rekey_after_time`, `rekey_timeout`,
+    /// `reject_after_time`, `keepalive_timeout`, `max_handshake_attempts`,
+    /// `persistent_keepalive_interval`) and the fork-specific `mtu`.
+    ///
+    /// Blank lines and `#` comments are ignored. Unset keys keep their
+    /// defaults, so an empty input yields a standard WireGuard configuration.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError`] for a malformed line, an unknown or legacy key,
+    /// an unparseable value, or a combination that fails [`Self::validate`].
+    pub fn parse(input: &str) -> Result<Self, ConfigError> {
+        let mut config = Amnezia3Config::default();
+        // Header ranges are validated as a set, so collect them before building.
+        let mut headers = HeaderConfig::wireguard_compatible();
+        let mut saw_header = false;
+
+        for raw_line in input.lines() {
+            let line = raw_line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+
+            let (key, value) =
+                line.split_once('=')
+                    .ok_or_else(|| ConfigError::InvalidConfigLine {
+                        line: line.to_owned(),
+                        reason: "expected `key=value`",
+                    })?;
+            let key = key.trim().to_ascii_lowercase();
+            let value = value.trim();
+
+            match key.as_str() {
+                "jc" => config.junk.count = parse_field_u8(&key, value)?,
+                "jmin" => config.junk.min_size = parse_field_u16(&key, value)?,
+                "jmax" => config.junk.max_size = parse_field_u16(&key, value)?,
+                "s1" => config.paddings.s1 = parse_field_u8(&key, value)?,
+                "s2" => config.paddings.s2 = parse_field_u8(&key, value)?,
+                "s3" => config.paddings.s3 = parse_field_u8(&key, value)?,
+                "s4" => config.paddings.s4 = parse_field_u8(&key, value)?,
+                "h1" => {
+                    headers.init = HeaderRange::parse(value)?;
+                    saw_header = true;
+                }
+                "h2" => {
+                    headers.response = HeaderRange::parse(value)?;
+                    saw_header = true;
+                }
+                "h3" => {
+                    headers.cookie = HeaderRange::parse(value)?;
+                    saw_header = true;
+                }
+                "h4" => {
+                    headers.transport = HeaderRange::parse(value)?;
+                    saw_header = true;
+                }
+                "i1" => config.init_packets.i1 = Some(CpsChain::parse(value)?),
+                "i2" => config.init_packets.i2 = Some(CpsChain::parse(value)?),
+                "i3" => config.init_packets.i3 = Some(CpsChain::parse(value)?),
+                "i4" => config.init_packets.i4 = Some(CpsChain::parse(value)?),
+                "i5" => config.init_packets.i5 = Some(CpsChain::parse(value)?),
+                "header_protection_key" => {
+                    let key = parse_header_protection_key(value)?;
+                    // An all-zero key means "disabled" upstream.
+                    config.header_protection_key = if key.iter().all(|byte| *byte == 0) {
+                        None
+                    } else {
+                        Some(key)
+                    };
+                }
+                "content_padding_addition" => {
+                    let range = U32Range::parse(value)?;
+                    config.content_padding_addition =
+                        if range.is_zero() { None } else { Some(range) };
+                }
+                "rekey_after_time" => {
+                    config.timing_ranges.rekey_after_time = U32Range::parse(value)?
+                }
+                "rekey_timeout" => config.timing_ranges.rekey_timeout = U32Range::parse(value)?,
+                "reject_after_time" => {
+                    config.timing_ranges.reject_after_time = U32Range::parse(value)?
+                }
+                "keepalive_timeout" => {
+                    config.timing_ranges.keepalive_timeout = U32Range::parse(value)?
+                }
+                "max_handshake_attempts" => {
+                    config.timing_ranges.max_handshake_attempts = U32Range::parse(value)?
+                }
+                // Per-peer upstream; `Tunn` is already per-peer, so it lands in
+                // the timing ranges alongside the device-scoped ones.
+                "persistent_keepalive_interval" => {
+                    config.timing_ranges.persistent_keepalive = U32Range::parse(value)?
+                }
+                // Not an upstream UAPI key: amneziawg-go clamps content padding
+                // against the device MTU, which `Tunn` has no concept of.
+                "mtu" => config.mtu = parse_field_u32(&key, value)?,
+                _ => {
+                    // Reuse the 2.0 key table so the AmneziaWG 1.x fields keep
+                    // reporting as legacy rather than merely unknown. Every key
+                    // it accepts is handled above, so this always errors.
+                    Amnezia2Config::validate_field_name(&key)?;
+                    return Err(ConfigError::UnsupportedLegacyField { field: key });
+                }
+            }
+        }
+
+        if saw_header {
+            config.headers = HeaderConfig::new(
+                headers.init,
+                headers.response,
+                headers.cookie,
+                headers.transport,
+            )?;
+        }
+
+        config.validate()?;
+        Ok(config)
+    }
+}
+
+fn parse_field_u8(field: &str, value: &str) -> Result<u8, ConfigError> {
+    value
+        .parse::<u8>()
+        .map_err(|_| ConfigError::InvalidFieldValue {
+            field: field.to_owned(),
+            reason: "expected a decimal value in 0-255",
+        })
+}
+
+fn parse_field_u16(field: &str, value: &str) -> Result<u16, ConfigError> {
+    value
+        .parse::<u16>()
+        .map_err(|_| ConfigError::InvalidFieldValue {
+            field: field.to_owned(),
+            reason: "expected a decimal value in 0-65535",
+        })
+}
+
+fn parse_field_u32(field: &str, value: &str) -> Result<u32, ConfigError> {
+    value
+        .parse::<u32>()
+        .map_err(|_| ConfigError::InvalidFieldValue {
+            field: field.to_owned(),
+            reason: "expected a decimal value",
+        })
+}
+
+/// Decode the 32-byte header protection key from hex, as amneziawg-go's UAPI
+/// does. An all-zero key means "disabled", matching `HeaderCipherKey::IsZero`.
+fn parse_header_protection_key(
+    value: &str,
+) -> Result<[u8; HEADER_PROTECTION_KEY_SIZE], ConfigError> {
+    use std::convert::TryInto;
+
+    let bytes = hex::decode(value).map_err(|_| ConfigError::InvalidFieldValue {
+        field: "header_protection_key".to_owned(),
+        reason: "expected hex characters",
+    })?;
+    let key: [u8; HEADER_PROTECTION_KEY_SIZE] =
+        bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| ConfigError::InvalidFieldValue {
+                field: "header_protection_key".to_owned(),
+                reason: "expected exactly 32 bytes (64 hex characters)",
+            })?;
+    Ok(key)
 }
 
 impl Default for Amnezia3Config {
@@ -1339,6 +1526,8 @@ impl Amnezia2Config {
             && self.init_packets == InitPacketConfig::default()
     }
 
+    /// Accept the AmneziaWG 2.0 configuration keys, rejecting the AmneziaWG
+    /// 1.x fields (`j1`, `j2`, `j3`, `itime`) explicitly.
     pub fn validate_field_name(field: &str) -> Result<(), ConfigError> {
         match field.to_ascii_lowercase().as_str() {
             "jc" | "jmin" | "jmax" | "s1" | "s2" | "s3" | "s4" | "h1" | "h2" | "h3" | "h4"
@@ -1923,6 +2112,147 @@ mod tests {
         config.paddings = PaddingConfig::new(0, 0, 0, 0).expect("valid paddings");
         // zero paddings + awg headers → not wireguard-compatible, still valid
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn amnezia3_parses_a_full_config_block() {
+        let config = Amnezia3Config::parse(
+            "\n\
+             # AmneziaWG 3.0\n\
+             jc=4\n\
+             jmin=64\n\
+             jmax=256\n\
+             s1=16\n\
+             s2=17\n\
+             s3=18\n\
+             s4=19\n\
+             h1=100-199\n\
+             h2=200-299\n\
+             h3=300-399\n\
+             h4=400-499\n\
+             i1=<b 0xff><r 16>\n\
+             header_protection_key=\
+             4242424242424242424242424242424242424242424242424242424242424242\n\
+             content_padding_addition=1-64\n\
+             rekey_after_time=100-140\n\
+             rekey_timeout=3-9\n\
+             reject_after_time=170-200\n\
+             keepalive_timeout=8-15\n\
+             max_handshake_attempts=10-20\n\
+             persistent_keepalive_interval=20-30\n\
+             mtu=1400\n",
+        )
+        .expect("valid config block");
+
+        assert_eq!(
+            config.junk,
+            JunkConfig::new(4, 64, 256).expect("valid junk")
+        );
+        assert_eq!(
+            config.paddings,
+            PaddingConfig::new(16, 17, 18, 19).expect("valid paddings")
+        );
+        assert_eq!(config.headers.init, HeaderRange::new(100, 199).unwrap());
+        assert_eq!(
+            config.headers.transport,
+            HeaderRange::new(400, 499).unwrap()
+        );
+        assert!(config.init_packets.i1.is_some());
+        assert!(config.init_packets.i2.is_none());
+        assert_eq!(config.header_protection_key, Some([0x42; 32]));
+        assert_eq!(
+            config.content_padding_addition,
+            Some(U32Range { lo: 1, hi: 64 })
+        );
+        assert_eq!(
+            config.timing_ranges.rekey_timeout,
+            U32Range { lo: 3, hi: 9 }
+        );
+        assert_eq!(
+            config.timing_ranges.persistent_keepalive,
+            U32Range { lo: 20, hi: 30 }
+        );
+        assert_eq!(config.mtu, 1400);
+    }
+
+    #[test]
+    fn amnezia3_parses_empty_and_two_zero_configs() {
+        // Nothing configured is standard WireGuard.
+        let config = Amnezia3Config::parse("").expect("empty input is valid");
+        assert_eq!(config, Amnezia3Config::default());
+
+        // A 2.0-only block leaves every 3.0 feature off.
+        let config = Amnezia3Config::parse(
+            "jc=2\njmin=64\njmax=128\ns1=8\ns2=8\nh1=100\nh2=200\nh3=300\nh4=400\n",
+        )
+        .expect("valid 2.0 block");
+        assert_eq!(config.header_protection_key, None);
+        assert_eq!(config.content_padding_addition, None);
+        assert!(config.timing_ranges.is_zero());
+        assert_eq!(config.mtu, AWG3_DEFAULT_MTU);
+    }
+
+    #[test]
+    fn amnezia3_parse_treats_zero_valued_keys_as_unset() {
+        let config = Amnezia3Config::parse(
+            "header_protection_key=\
+             0000000000000000000000000000000000000000000000000000000000000000\n\
+             content_padding_addition=0\n",
+        )
+        .expect("zero values disable the features");
+        assert_eq!(config.header_protection_key, None);
+        assert_eq!(config.content_padding_addition, None);
+    }
+
+    #[test]
+    fn amnezia3_parse_rejects_bad_input() {
+        // Malformed line
+        assert!(matches!(
+            Amnezia3Config::parse("jc"),
+            Err(ConfigError::InvalidConfigLine { .. })
+        ));
+        // AmneziaWG 1.x fields still report as legacy
+        assert!(matches!(
+            Amnezia3Config::parse("itime=30"),
+            Err(ConfigError::UnsupportedLegacyField { .. })
+        ));
+        assert!(matches!(
+            Amnezia3Config::parse("j1=whatever"),
+            Err(ConfigError::UnsupportedLegacyField { .. })
+        ));
+        // Unknown key
+        assert!(Amnezia3Config::parse("not_a_key=1").is_err());
+        // Non-numeric scalar
+        assert!(matches!(
+            Amnezia3Config::parse("s1=big"),
+            Err(ConfigError::InvalidFieldValue { .. })
+        ));
+        // Bad header protection keys
+        assert!(matches!(
+            Amnezia3Config::parse("header_protection_key=zz"),
+            Err(ConfigError::InvalidFieldValue { .. })
+        ));
+        assert!(matches!(
+            Amnezia3Config::parse("header_protection_key=4242"),
+            Err(ConfigError::InvalidFieldValue { .. })
+        ));
+        // Inverted range
+        assert!(Amnezia3Config::parse("rekey_timeout=9-3").is_err());
+        // Overlapping headers are caught by HeaderConfig::new
+        assert!(Amnezia3Config::parse("h1=100-200\nh2=150-250\nh3=300\nh4=400").is_err());
+    }
+
+    #[test]
+    fn amnezia3_parse_enforces_header_protection_padding() {
+        // S1-S4 >= 12 is enforced through the shared validate().
+        let config = "h1=100\nh2=200\nh3=300\nh4=400\n\
+                      s1=11\ns2=16\ns3=16\ns4=16\n\
+                      header_protection_key=\
+                      4242424242424242424242424242424242424242424242424242424242424242\n";
+        assert!(matches!(
+            Amnezia3Config::parse(config),
+            Err(ConfigError::HeaderProtectionPaddingTooSmall { .. })
+        ));
     }
 
     #[test]

@@ -1785,6 +1785,34 @@ mod tests {
     }
 
     #[test]
+    fn awg3_parsed_config_matches_the_struct_literal_on_the_wire() {
+        // The JNI surface configures tunnels from a text block rather than a
+        // struct, so a parsed config must produce byte-identical framing.
+        let parsed = crate::amnezia::Amnezia3Config::parse(
+            "s1=16\ns2=16\ns3=16\ns4=16\n\
+             h1=100-199\nh2=200-299\nh3=300-399\nh4=400-499\n\
+             header_protection_key=\
+             4242424242424242424242424242424242424242424242424242424242424242\n",
+        )
+        .expect("valid config block");
+        assert_eq!(parsed, awg3_test_config([0x42; 32]));
+
+        // And it actually drives a tunnel: same S1 prefix, same protected span.
+        let my_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let their_public_key =
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::random_from_rng(OsRng));
+        let mut tun =
+            Tunn::new_with_amnezia3(my_secret_key, their_public_key, None, None, 1, None, parsed)
+                .expect("valid awg3 config");
+
+        let init = create_handshake_init(&mut tun);
+        assert_eq!(init.len(), 16 + HANDSHAKE_INIT_SZ);
+        let decrypted = go_style_decrypt(&[0x42; 32], &init, 16, HANDSHAKE_INIT_SZ);
+        let plain_type = u32::from_le_bytes(decrypted[..4].try_into().expect("4 bytes"));
+        assert!((100..=199).contains(&plain_type), "H1 type {}", plain_type);
+    }
+
+    #[test]
     fn awg3_keepalive_has_s4_prefix() {
         let (mut my_tun, mut their_tun) = create_two_tuns_awg3();
         let init = create_handshake_init(&mut my_tun);
