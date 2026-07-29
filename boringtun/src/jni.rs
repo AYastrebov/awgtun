@@ -14,7 +14,12 @@ use jni::sys::{jbyteArray, jint, jlong, jshort, jstring};
 use jni::JNIEnv;
 use parking_lot::Mutex;
 
+use crate::amnezia::Amnezia3Config;
+use crate::ffi::build_amnezia3_tunnel;
 use crate::ffi::new_tunnel;
+use crate::ffi::parse_tunnel_identity;
+use crate::ffi::tunnel_free;
+use crate::ffi::wireguard_poll_outgoing_packet;
 use crate::ffi::wireguard_read;
 use crate::ffi::wireguard_result;
 use crate::ffi::wireguard_tick;
@@ -168,6 +173,112 @@ pub unsafe extern "C" fn create_new_tunnel(
     }
 
     tunnel as jlong
+}
+
+/// Creates a new tunnel with AmneziaWG 2.0/3.0 configuration.
+///
+/// `arg_config` is a newline-separated `key=value` block in the AmneziaWG UAPI
+/// format — see [`crate::amnezia::Amnezia3Config::parse`] for the accepted keys.
+/// An empty string yields a standard WireGuard tunnel.
+///
+/// Returns 0 on failure, matching `new_tunnel`.
+///
+/// After this call, and after every `wireguard_write` and `wireguard_tick`, the
+/// caller must drain `wireguard_poll_outgoing_packet` until it returns 0 and
+/// send each datagram before the handshake initiation. Junk packets and the
+/// I1-I5 signature packets are delivered only through that queue.
+#[no_mangle]
+#[export_name = "Java_com_cloudflare_app_boringtun_BoringTunJNI_new_1tunnel_1amnezia3"]
+pub unsafe extern "C" fn create_new_amnezia3_tunnel(
+    env: JNIEnv,
+    _class: JClass,
+    arg_secret_key: JString,
+    arg_public_key: JString,
+    arg_preshared_key: JString,
+    keep_alive: jshort,
+    index: jint,
+    arg_config: JString,
+) -> jlong {
+    let secret_key = match env.get_string_utf_chars(arg_secret_key) {
+        Ok(v) => v,
+        Err(_) => return 0,
+    };
+
+    let public_key = match env.get_string_utf_chars(arg_public_key) {
+        Ok(v) => v,
+        Err(_) => return 0,
+    };
+
+    let preshared_key = if arg_preshared_key.is_null() {
+        ptr::null_mut()
+    } else {
+        match env.get_string_utf_chars(arg_preshared_key) {
+            Ok(v) => v,
+            Err(_) => return 0,
+        }
+    };
+
+    let config = if arg_config.is_null() {
+        String::new()
+    } else {
+        match env.get_string(arg_config) {
+            Ok(v) => v.into(),
+            Err(_) => return 0,
+        }
+    };
+
+    let amnezia = match Amnezia3Config::parse(&config) {
+        Ok(amnezia) => amnezia,
+        Err(_) => return 0,
+    };
+
+    let identity =
+        match parse_tunnel_identity(secret_key, public_key, preshared_key, keep_alive as u16) {
+            Ok(identity) => identity,
+            Err(()) => return 0,
+        };
+
+    let tunnel = build_amnezia3_tunnel(identity, index as u32, amnezia);
+    if tunnel.is_null() {
+        return 0;
+    }
+
+    tunnel as jlong
+}
+
+/// Drains the next pre-handshake datagram (I-packet or junk) into `dst`,
+/// returning its size, or 0 when the queue is empty.
+///
+/// Call in a loop until it returns 0 after creating a tunnel and after every
+/// `wireguard_write` / `wireguard_tick`, sending each datagram to the network
+/// before the handshake initiation those calls produced.
+#[no_mangle]
+#[export_name = "Java_com_cloudflare_app_boringtun_BoringTunJNI_wireguard_1poll_1outgoing_1packet"]
+pub unsafe extern "C" fn poll_outgoing_packet(
+    env: JNIEnv,
+    _class: JClass,
+    tunnel: jlong,
+    dst: JByteBuffer,
+    dst_size: jint,
+) -> jint {
+    let dst_ptr: *mut u8 = match env.get_direct_buffer_address(dst) {
+        Ok(v) => v.as_mut_ptr(),
+        Err(_) => return 0,
+    };
+
+    wireguard_poll_outgoing_packet(tunnel as *const Mutex<Tunn>, dst_ptr, dst_size as u32) as jint
+}
+
+/// Frees a tunnel created by `new_tunnel` or `new_tunnel_amnezia3`.
+///
+/// The handle must not be used afterwards. Passing 0 is a no-op.
+#[no_mangle]
+#[export_name = "Java_com_cloudflare_app_boringtun_BoringTunJNI_tunnel_1free"]
+pub unsafe extern "C" fn free_tunnel(_env: JNIEnv, _class: JClass, tunnel: jlong) {
+    if tunnel == 0 {
+        return;
+    }
+    tunnel_free(tunnel as *mut Mutex<Tunn>);
 }
 
 /// Encrypts raw IP packets into WG formatted packets.
