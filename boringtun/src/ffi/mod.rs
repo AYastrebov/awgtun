@@ -973,6 +973,129 @@ mod tests {
     }
 
     #[test]
+    fn amnezia3_null_config_falls_back_to_wireguard() {
+        let (my_secret, _) = keypair();
+        let (_, their_public) = keypair();
+        unsafe {
+            let tunnel = new_tunnel_amnezia3(
+                my_secret.as_ptr(),
+                their_public.as_ptr(),
+                ptr::null(),
+                0,
+                1,
+                ptr::null(),
+            );
+            assert!(!tunnel.is_null());
+            tunnel_free(tunnel);
+        }
+    }
+
+    #[test]
+    fn amnezia3_rejects_invalid_keys_and_null_pointers() {
+        let config = zeroed_config();
+        let (my_secret, _) = keypair();
+        let (_, their_public) = keypair();
+        let garbage = CString::new("not-a-base64-key").expect("no interior nul");
+
+        unsafe {
+            // NULL key pointers are rejected rather than dereferenced.
+            assert!(new_tunnel_amnezia3(
+                ptr::null(),
+                their_public.as_ptr(),
+                ptr::null(),
+                0,
+                1,
+                &config
+            )
+            .is_null());
+            assert!(new_tunnel_amnezia3(
+                my_secret.as_ptr(),
+                ptr::null(),
+                ptr::null(),
+                0,
+                1,
+                &config
+            )
+            .is_null());
+            // Unparseable keys are rejected.
+            assert!(new_tunnel_amnezia3(
+                garbage.as_ptr(),
+                their_public.as_ptr(),
+                ptr::null(),
+                0,
+                1,
+                &config
+            )
+            .is_null());
+            // An unparseable preshared key is rejected too.
+            assert!(new_tunnel_amnezia3(
+                my_secret.as_ptr(),
+                their_public.as_ptr(),
+                garbage.as_ptr(),
+                0,
+                1,
+                &config
+            )
+            .is_null());
+        }
+    }
+
+    #[test]
+    fn amnezia3_tunnel_emits_awg3_shaped_packets() {
+        // The other FFI tests only prove construction; this one drives the
+        // tunnel and checks the wire format actually reflects the config.
+        let key = [0x42u8; HEADER_PROTECTION_KEY_SIZE];
+        let mut config = zeroed_config();
+        config.base.h1_start = 100;
+        config.base.h1_end = 199;
+        config.base.h2_start = 200;
+        config.base.h2_end = 299;
+        config.base.h3_start = 300;
+        config.base.h3_end = 399;
+        config.base.h4_start = 400;
+        config.base.h4_end = 499;
+        config.base.s1 = 16;
+        config.base.s2 = 16;
+        config.base.s3 = 16;
+        config.base.s4 = 16;
+        config.header_protection_key = key.as_ptr();
+
+        let (my_secret, _) = keypair();
+        let (_, their_public) = keypair();
+
+        unsafe {
+            let tunnel = new_tunnel_amnezia3(
+                my_secret.as_ptr(),
+                their_public.as_ptr(),
+                ptr::null(),
+                0,
+                1,
+                &config,
+            );
+            assert!(!tunnel.is_null());
+
+            let mut dst = vec![0u8; 2048];
+            let result = wireguard_force_handshake(tunnel, dst.as_mut_ptr(), dst.len() as u32);
+            assert!(matches!(result.op, result_type::WRITE_TO_NETWORK));
+            // S1 prefix plus the 148-byte initiation.
+            assert_eq!(result.size, 16 + 148);
+
+            // The type field on the wire is header-protected, so it must not
+            // fall in the configured H1 range as-is.
+            let mut type_bytes = [0u8; 4];
+            type_bytes.copy_from_slice(&dst[16..20]);
+            let wire_type = u32::from_le_bytes(type_bytes);
+            assert!(
+                !(100..=199).contains(&wire_type),
+                "type {} leaked in plaintext",
+                wire_type
+            );
+
+            tunnel_free(tunnel);
+        }
+    }
+
+    #[test]
     fn amnezia3_rejects_inverted_ranges() {
         let mut config = zeroed_config();
         config.rekey_timeout_min = 9;
