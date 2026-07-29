@@ -266,10 +266,12 @@ With AmneziaWG padding active, output buffers must be larger:
 
 - Handshake initiation: `148 + S1` bytes
 - Handshake response: `92 + S2` bytes
-- Transport data: `payload.len() + 32 + S4` bytes, plus the upper bound of the content padding range when it is configured
-- `update_timers()` / `wireguard_tick()`: the larger of a handshake initiation (`148 + S1`) and a keepalive (`32 + S4` plus the content padding bound)
+- Transport data: `payload.len() + 32 + S4` bytes
+- `update_timers()` / `wireguard_tick()`: the larger of a handshake initiation (`148 + S1`) and an unpadded keepalive (`32 + S4`)
 
-Content padding makes the keepalive case dominate: with `mtu = 1420`, `S4 = 16` and a padding range topping out at 500, a keepalive is 548 bytes — well past the 164 a handshake initiation needs. Size the tick buffer for the keepalive case whenever content padding is enabled, or `format_packet_data` will panic.
+Content padding does not raise these floors. amneziawg-go writes into pooled 64 KiB buffers (`MaxMessageSize = (1 << 16) - 1`), so its MTU clamp is enough to keep a padded packet in bounds; `Tunn` writes into a buffer the caller owns, so the space left in `dst` is applied as a third term in the same clamp. A tight buffer therefore yields less padding rather than a panic.
+
+To get the full configured range, add the range's upper bound on top of the sizes above. Under-sizing is silent: the packet is still valid and still round-trips, it just carries less padding than configured, which weakens the size obfuscation.
 
 ## C FFI API
 
@@ -344,7 +346,7 @@ size_t wireguard_poll_outgoing_packet(
 | Header protection spans | 148 / 92 / 64 / 16 | Same | Exact |
 | MACs before encryption | Yes | Yes | Exact |
 | All-zero header key = off | Yes | Yes (`Option`/NULL/all-zero) | Exact |
-| Content padding inside AEAD | Yes, clamped to MTU segment | Same | Exact |
+| Content padding inside AEAD | Yes, clamped to MTU segment | Same, plus a clamp to the caller's buffer | Exact when `dst` has room |
 | Non-IP payload on receive | Dropped, counted as data received | Same | Exact |
 | Timing range pick rules | Per-arm (see table above) | Same | Exact |
 | Content padded to multiple of 16 | Yes, when CPA is unset | **No** (never has been) | **Differs** |

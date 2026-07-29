@@ -362,7 +362,7 @@ impl Tunn {
         let current = self.current;
         if let Some(ref session) = self.sessions[current % N_SESSIONS] {
             // Send the packet using an established session
-            let content_padding = self.content_padding_addition(src.len());
+            let content_padding = self.content_padding_addition(src.len(), dst.len());
             let packet = self.format_transport_packet(session, src, content_padding, dst);
             // amneziawg-go classifies an outbound packet as "data sent" by wire
             // size (`len(elem.packet) != MessageKeepaliveSize`), so an S4 prefix
@@ -387,12 +387,13 @@ impl Tunn {
     /// range, clamped to the space left in the last MTU segment. Mirrors
     /// amneziawg-go's `randomPaddingAddition`; boringtun never pads content to a
     /// multiple of 16, so the addition applies as-is.
-    fn content_padding_addition(&self, packet_size: usize) -> usize {
+    fn content_padding_addition(&self, packet_size: usize, dst_len: usize) -> usize {
         let range = match self.content_padding {
             Some(range) => range,
             None => return 0,
         };
         let mut add = range.generate(&mut OsRandom) as usize;
+
         let mtu = self.mtu as usize;
         if mtu != 0 {
             let last_unit = if packet_size > mtu {
@@ -402,7 +403,15 @@ impl Tunn {
             };
             add = add.min(mtu - last_unit);
         }
-        add
+
+        // amneziawg-go writes into pooled 64 KiB buffers, so its MTU clamp is
+        // enough to keep a padded packet in bounds. `Tunn` writes into a buffer
+        // the caller owns, so the space actually left in `dst` is a third term
+        // in the same clamp: after the S4 prefix, the transport header, the
+        // payload and the AEAD tag. Padding is best-effort — a tight buffer
+        // yields less of it rather than a panic.
+        let s4 = self.padding_config.s4 as usize;
+        add.min(dst_len.saturating_sub(s4 + DATA_OVERHEAD_SZ + packet_size))
     }
 
     /// Format a transport (data or keepalive) packet: dynamic H4 header,
@@ -586,7 +595,7 @@ impl Tunn {
 
         let session = self.handshake.receive_handshake_response(p)?;
 
-        let content_padding = self.content_padding_addition(0);
+        let content_padding = self.content_padding_addition(0, dst.len());
         let keepalive_packet = self.format_transport_packet(&session, &[], content_padding, dst);
         // Store new session in ring buffer
         let l_idx = session.local_index();
@@ -1541,6 +1550,59 @@ mod tests {
             other => panic!("expected WriteToNetwork, got {:?}", other),
         };
         assert_eq!(wire_len, 16 + 16 + ip.len() + 100 + 16);
+    }
+
+    #[test]
+    fn awg3_content_padding_is_clamped_to_the_destination_buffer() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_awg3_cpa(500, 500);
+        complete_awg3_handshake(&mut my_tun, &mut their_tun);
+
+        let ip = ipv4_packet();
+        // Room for the packet plus only 40 bytes of padding. amneziawg-go would
+        // emit all 500 into its 64 KiB pooled buffer; we emit what fits.
+        let capped = 16 + 16 + ip.len() + 40 + 16;
+        let mut enc_buf = vec![0u8; capped];
+        let wire_len = match my_tun.encapsulate(&ip, &mut enc_buf) {
+            TunnResult::WriteToNetwork(packet) => packet.len(),
+            other => panic!("expected WriteToNetwork, got {:?}", other),
+        };
+        assert_eq!(wire_len, capped);
+
+        // Clamping must not corrupt the packet: it still round-trips.
+        let mut dec_buf = vec![0u8; 2048];
+        match their_tun.decapsulate(None, &enc_buf[..wire_len], &mut dec_buf) {
+            TunnResult::WriteToTunnelV4(packet, _) => assert_eq!(packet, &ip[..]),
+            other => panic!("expected WriteToTunnelV4, got {:?}", other),
+        }
+
+        // A generous buffer is unaffected — the full 500 bytes are applied.
+        let mut enc_buf = vec![0u8; 4096];
+        let wire_len = match my_tun.encapsulate(&ip, &mut enc_buf) {
+            TunnResult::WriteToNetwork(packet) => packet.len(),
+            other => panic!("expected WriteToNetwork, got {:?}", other),
+        };
+        assert_eq!(wire_len, 16 + 16 + ip.len() + 500 + 16);
+    }
+
+    #[test]
+    fn awg3_content_padded_keepalive_fits_a_handshake_sized_buffer() {
+        // A buffer sized for a handshake initiation used to panic once content
+        // padding pushed the keepalive past it.
+        let (mut my_tun, mut their_tun) = create_two_tuns_awg3_cpa(500, 500);
+        complete_awg3_handshake(&mut my_tun, &mut their_tun);
+
+        let mut tick_buf = vec![0u8; HANDSHAKE_INIT_SZ + 16];
+        let wire_len = match my_tun.encapsulate(&[], &mut tick_buf) {
+            TunnResult::WriteToNetwork(packet) => packet.len(),
+            other => panic!("expected WriteToNetwork, got {:?}", other),
+        };
+        assert_eq!(wire_len, tick_buf.len());
+
+        let mut dec_buf = vec![0u8; 2048];
+        assert!(matches!(
+            their_tun.decapsulate(None, &tick_buf[..wire_len], &mut dec_buf),
+            TunnResult::Done
+        ));
     }
 
     #[test]

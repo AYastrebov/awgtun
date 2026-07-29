@@ -182,8 +182,9 @@ struct wireguard_result wireguard_read(const struct wireguard_tunnel *tunnel,
                                        uint32_t dst_size);
 
 // dst must hold whichever is larger: a handshake initiation (148 + s1 bytes)
-// or a keepalive (32 + s4 bytes plus content_padding_max when content padding
-// is configured). With content padding enabled the keepalive case dominates.
+// or an unpadded keepalive (32 + s4 bytes). Content padding is clamped to the
+// room left in dst, so it does not raise that floor; allow content_padding_max
+// on top to get the full configured range.
 struct wireguard_result wireguard_tick(const struct wireguard_tunnel *tunnel,
                                        uint8_t *dst,
                                        uint32_t dst_size);

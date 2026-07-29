@@ -774,11 +774,12 @@ pub unsafe extern "C" fn wireguard_read(
 /// Recommended interval: 100ms.
 ///
 /// `dst` must hold whichever is larger: a handshake initiation (`148 + s1`
-/// bytes) or a keepalive (`32 + s4` bytes plus `content_padding_max` when
-/// content padding is configured). With content padding enabled the keepalive
-/// case dominates — a 500-byte padding bound needs 548 bytes here, far past the
-/// 164 that `wireguard_force_handshake` requires. Passing a smaller buffer
-/// aborts the process via the FFI panic hook.
+/// bytes) or an unpadded keepalive (`32 + s4` bytes). A smaller buffer aborts
+/// the process via the FFI panic hook.
+///
+/// Content padding does not raise that floor — the addition is clamped to the
+/// room left in `dst` — but to get the full configured range, allow
+/// `content_padding_max` on top of the keepalive size.
 #[no_mangle]
 pub unsafe extern "C" fn wireguard_tick(
     tunnel: *const Mutex<Tunn>,
