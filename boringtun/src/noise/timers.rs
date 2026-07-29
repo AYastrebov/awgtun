@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 use super::errors::WireGuardError;
-use crate::amnezia::TimingRanges;
+use crate::amnezia::{OsRandom, RandomSource, TimingRanges};
 use crate::noise::{Tunn, TunnResult};
 use std::mem;
 use std::ops::{Index, IndexMut};
@@ -17,11 +17,22 @@ use crate::sleepyinstant::Instant;
 
 // Some constants, represent time in seconds
 // https://www.wireguard.com/papers/wireguard.pdf#page=14
-pub(crate) const REKEY_AFTER_TIME: Duration = Duration::from_secs(120);
-const REJECT_AFTER_TIME: Duration = Duration::from_secs(180);
-const REKEY_ATTEMPT_TIME: Duration = Duration::from_secs(90);
-pub(crate) const REKEY_TIMEOUT: Duration = Duration::from_secs(5);
-const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+// These double as the fallbacks for unset AWG 3.0 timing ranges.
+const REKEY_AFTER_TIME_SECS: u32 = 120;
+const REJECT_AFTER_TIME_SECS: u32 = 180;
+const REKEY_TIMEOUT_SECS: u32 = 5;
+const KEEPALIVE_TIMEOUT_SECS: u32 = 10;
+const MAX_TIMER_HANDSHAKES: u32 = 18;
+
+#[allow(dead_code)] // used by the mock-instant test suite
+pub(crate) const REKEY_AFTER_TIME: Duration = Duration::from_secs(REKEY_AFTER_TIME_SECS as u64);
+#[allow(dead_code)] // superseded by Timers::reject_after_time, kept for tests
+const REJECT_AFTER_TIME: Duration = Duration::from_secs(REJECT_AFTER_TIME_SECS as u64);
+/// The classic 90 s give-up deadline is exactly the default retransmit timeout
+/// times the default attempt budget, which is how AWG 3.0 generalizes it.
+const REKEY_ATTEMPT_TIME: Duration =
+    Duration::from_secs((REKEY_TIMEOUT_SECS * MAX_TIMER_HANDSHAKES) as u64);
+pub(crate) const REKEY_TIMEOUT: Duration = Duration::from_secs(REKEY_TIMEOUT_SECS as u64);
 const COOKIE_EXPIRATION_TIME: Duration = Duration::from_secs(120);
 
 #[derive(Debug)]
@@ -62,11 +73,16 @@ pub struct Timers {
     /// Did we send data without hearing back?
     want_handshake: bool,
     persistent_keepalive: usize,
-    /// AWG 3.0 randomized timing ranges. Stored here but not read until the
-    /// randomized-timers task wires them into `update_timers`; Task 7 removes
-    /// this allow.
-    #[allow(dead_code)]
+    /// AWG 3.0 randomized timing ranges. An all-zero range falls back to the
+    /// classic WireGuard constant, so a default `TimingRanges` preserves stock
+    /// behavior exactly.
     timing_ranges: TimingRanges,
+    /// AWG 3.0: retransmit timeout picked for the in-flight handshake
+    rekey_timeout_current: Duration,
+    /// AWG 3.0: give-up deadline picked for the in-flight handshake
+    rekey_attempt_deadline: Duration,
+    /// AWG 3.0: current persistent-keepalive interval, re-picked on every fire
+    persistent_keepalive_next: Duration,
     /// Should this timer call reset rr function (if not a shared rr instance)
     pub(super) should_reset_rr: bool,
 }
@@ -86,8 +102,53 @@ impl Timers {
             want_handshake: Default::default(),
             persistent_keepalive: usize::from(persistent_keepalive.unwrap_or(0)),
             timing_ranges,
+            rekey_timeout_current: REKEY_TIMEOUT,
+            rekey_attempt_deadline: REKEY_ATTEMPT_TIME,
+            persistent_keepalive_next: Duration::from_secs(u64::from(
+                timing_ranges.persistent_keepalive.pick_or(&mut OsRandom, 0),
+            )),
             should_reset_rr: reset_rr,
         }
+    }
+
+    /// AWG 3.0: pick fresh handshake timings. The retransmit timeout is
+    /// re-picked for every initiation, including retries, mirroring
+    /// amneziawg-go's `timersHandshakeInitiated`. The attempt budget is picked
+    /// once per handshake (`SendHandshakeInitiation` only re-rolls
+    /// `maxHandshakeAttempts` when `!isRetry`) and is expressed here as a
+    /// deadline, since boringtun bounds retries by time rather than by count —
+    /// with default ranges `5 s * 18` is exactly `REKEY_ATTEMPT_TIME`.
+    ///
+    /// With all-zero ranges this yields the classic WireGuard constants.
+    pub(super) fn roll_handshake_timings(
+        &mut self,
+        rng: &mut dyn RandomSource,
+        starting_new_handshake: bool,
+    ) {
+        let rekey_timeout = self
+            .timing_ranges
+            .rekey_timeout
+            .pick_or(rng, REKEY_TIMEOUT_SECS);
+        self.rekey_timeout_current = Duration::from_secs(u64::from(rekey_timeout));
+
+        if starting_new_handshake {
+            let max_attempts = self
+                .timing_ranges
+                .max_handshake_attempts
+                .pick_or(rng, MAX_TIMER_HANDSHAKES);
+            self.rekey_attempt_deadline =
+                Duration::from_secs(u64::from(rekey_timeout) * u64::from(max_attempts));
+        }
+    }
+
+    /// AWG 3.0: keypair expiry, `Hi` of the reject-after range
+    /// (`keychainExpireTime`).
+    fn reject_after_time(&self) -> Duration {
+        Duration::from_secs(u64::from(
+            self.timing_ranges
+                .reject_after_time
+                .hi_or(REJECT_AFTER_TIME_SECS),
+        ))
     }
 
     fn is_initiator(&self) -> bool {
@@ -163,9 +224,10 @@ impl Tunn {
 
     fn update_session_timers(&mut self, time_now: Duration) {
         let timers = &mut self.timers;
+        let reject_after_time = timers.reject_after_time();
 
         for (i, t) in timers.session_timers.iter_mut().enumerate() {
-            if time_now - *t > REJECT_AFTER_TIME {
+            if time_now - *t > reject_after_time {
                 if let Some(session) = self.sessions[i].take() {
                     tracing::debug!(
                         message = "SESSION_EXPIRED(REJECT_AFTER_TIME)",
@@ -202,6 +264,7 @@ impl Tunn {
         let data_packet_received = self.timers[TimeLastDataPacketReceived];
         let data_packet_sent = self.timers[TimeLastDataPacketSent];
         let persistent_keepalive = self.timers.persistent_keepalive;
+        let reject_after_time = self.timers.reject_after_time();
 
         {
             if self.handshake.is_expired() {
@@ -217,7 +280,7 @@ impl Tunn {
 
             // All ephemeral private keys and symmetric session keys are zeroed out after
             // (REJECT_AFTER_TIME * 3) ms if no new keys have been exchanged.
-            if now - session_established >= REJECT_AFTER_TIME * 3 {
+            if now - session_established >= reject_after_time * 3 {
                 tracing::error!("CONNECTION_EXPIRED(REJECT_AFTER_TIME * 3)");
                 self.handshake.set_expired();
                 self.clear_all();
@@ -226,7 +289,7 @@ impl Tunn {
 
             if let Some(time_init_sent) = self.handshake.timer() {
                 // Handshake Initiation Retransmission
-                if now - handshake_started >= REKEY_ATTEMPT_TIME {
+                if now - handshake_started >= self.timers.rekey_attempt_deadline {
                     // After REKEY_ATTEMPT_TIME ms of trying to initiate a new handshake,
                     // the retries give up and cease, and clear all existing packets queued
                     // up to be sent. If a packet is explicitly queued up to be sent, then
@@ -237,7 +300,7 @@ impl Tunn {
                     return TunnResult::Err(WireGuardError::ConnectionExpired);
                 }
 
-                if time_init_sent.elapsed() >= REKEY_TIMEOUT {
+                if time_init_sent.elapsed() >= self.timers.rekey_timeout_current {
                     // We avoid using `time` here, because it can be earlier than `time_init_sent`.
                     // Once `checked_duration_since` is stable we can use that.
                     // A handshake initiation is retried after REKEY_TIMEOUT + jitter ms,
@@ -253,8 +316,15 @@ impl Tunn {
                     // ms old, we initiate a new handshake. If the sender was the original
                     // responder of the handshake, it does not re-initiate a new handshake
                     // after REKEY_AFTER_TIME ms like the original initiator does.
+                    // AWG 3.0: `keyRefreshTimeoutSending` — a fresh pick per check
+                    let rekey_after_time = Duration::from_secs(u64::from(
+                        self.timers
+                            .timing_ranges
+                            .rekey_after_time
+                            .pick_or(&mut OsRandom, REKEY_AFTER_TIME_SECS),
+                    ));
                     if session_established < data_packet_sent
-                        && now - session_established >= REKEY_AFTER_TIME
+                        && now - session_established >= rekey_after_time
                     {
                         tracing::debug!("HANDSHAKE(REKEY_AFTER_TIME (on send))");
                         handshake_initiation_required = true;
@@ -264,9 +334,19 @@ impl Tunn {
                     // of the handshake and if the current session key is REJECT_AFTER_TIME
                     // - KEEPALIVE_TIMEOUT - REKEY_TIMEOUT ms old, we initiate a new
                     // handshake.
+                    // AWG 3.0: `keyRefreshTimeoutReceiving` — a fresh pick of the
+                    // reject-after range, less the `Lo` of the two margins
+                    let receiver_rekey_after = {
+                        let ranges = &self.timers.timing_ranges;
+                        let reject = ranges
+                            .reject_after_time
+                            .pick_or(&mut OsRandom, REJECT_AFTER_TIME_SECS);
+                        let margin = ranges.keepalive_timeout.lo_or(KEEPALIVE_TIMEOUT_SECS)
+                            + ranges.rekey_timeout.lo_or(REKEY_TIMEOUT_SECS);
+                        Duration::from_secs(u64::from(reject.saturating_sub(margin)))
+                    };
                     if session_established < data_packet_received
-                        && now - session_established
-                            >= REJECT_AFTER_TIME - KEEPALIVE_TIMEOUT - REKEY_TIMEOUT
+                        && now - session_established >= receiver_rekey_after
                     {
                         tracing::warn!(
                             "HANDSHAKE(REJECT_AFTER_TIME - KEEPALIVE_TIMEOUT - \
@@ -280,8 +360,17 @@ impl Tunn {
                 // If we have sent a packet to a given peer but have not received a
                 // packet after from that peer for (KEEPALIVE + REKEY_TIMEOUT) ms,
                 // we initiate a new handshake.
+                // AWG 3.0: `newHandshakeTimeout` — `Hi` of the keepalive range
+                // plus a fresh pick of the rekey range
+                let new_handshake_after = {
+                    let ranges = &self.timers.timing_ranges;
+                    Duration::from_secs(u64::from(
+                        ranges.keepalive_timeout.hi_or(KEEPALIVE_TIMEOUT_SECS)
+                            + ranges.rekey_timeout.pick_or(&mut OsRandom, REKEY_TIMEOUT_SECS),
+                    ))
+                };
                 if data_packet_sent > aut_packet_received
-                    && now - aut_packet_received >= KEEPALIVE_TIMEOUT + REKEY_TIMEOUT
+                    && now - aut_packet_received >= new_handshake_after
                     && mem::replace(&mut self.timers.want_handshake, false)
                 {
                     tracing::warn!("HANDSHAKE(KEEPALIVE + REKEY_TIMEOUT)");
@@ -291,16 +380,37 @@ impl Tunn {
                 if !handshake_initiation_required {
                     // If a packet has been received from a given peer, but we have not sent one back
                     // to the given peer in KEEPALIVE ms, we send an empty packet.
+                    // AWG 3.0: `sendKeepaliveTimeout` — a fresh pick per check
+                    let keepalive_timeout = Duration::from_secs(u64::from(
+                        self.timers
+                            .timing_ranges
+                            .keepalive_timeout
+                            .pick_or(&mut OsRandom, KEEPALIVE_TIMEOUT_SECS),
+                    ));
                     if data_packet_received > aut_packet_sent
-                        && now - aut_packet_sent >= KEEPALIVE_TIMEOUT
+                        && now - aut_packet_sent >= keepalive_timeout
                         && mem::replace(&mut self.timers.want_keepalive, false)
                     {
                         tracing::debug!("KEEPALIVE(KEEPALIVE_TIMEOUT)");
                         keepalive_required = true;
                     }
 
-                    // Persistent KEEPALIVE
-                    if persistent_keepalive > 0
+                    // Persistent KEEPALIVE: a fixed interval, or an AWG 3.0
+                    // range re-picked on every fire
+                    // (`timersAnyAuthenticatedPacketTraversal`).
+                    let keepalive_range = self.timers.timing_ranges.persistent_keepalive;
+                    if !keepalive_range.is_zero() {
+                        if now - self.timers[TimePersistentKeepalive]
+                            >= self.timers.persistent_keepalive_next
+                        {
+                            self.timers.persistent_keepalive_next = Duration::from_secs(u64::from(
+                                keepalive_range.generate(&mut OsRandom),
+                            ));
+                            tracing::debug!("KEEPALIVE(PERSISTENT_KEEPALIVE)");
+                            self.timer_tick(TimePersistentKeepalive);
+                            keepalive_required = true;
+                        }
+                    } else if persistent_keepalive > 0
                         && (now - self.timers[TimePersistentKeepalive]
                             >= Duration::from_secs(persistent_keepalive as _))
                     {
@@ -343,5 +453,106 @@ impl Tunn {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::amnezia::U32Range;
+
+    /// Deterministic byte source, so range picks are reproducible.
+    struct SeqRng {
+        counter: u8,
+    }
+
+    impl SeqRng {
+        fn new(seed: u8) -> Self {
+            SeqRng { counter: seed }
+        }
+    }
+
+    impl RandomSource for SeqRng {
+        fn fill_bytes(&mut self, out: &mut [u8]) {
+            for byte in out.iter_mut() {
+                *byte = self.counter;
+                self.counter = self.counter.wrapping_add(1);
+            }
+        }
+    }
+
+    #[test]
+    fn roll_handshake_timings_defaults_to_wg_constants() {
+        let mut timers = Timers::new(None, false, TimingRanges::default());
+        let mut rng = SeqRng::new(0xAA);
+        timers.roll_handshake_timings(&mut rng, true);
+        assert_eq!(timers.rekey_timeout_current, REKEY_TIMEOUT);
+        assert_eq!(timers.rekey_attempt_deadline, REKEY_ATTEMPT_TIME);
+    }
+
+    #[test]
+    fn roll_handshake_timings_uses_ranges() {
+        let ranges = TimingRanges {
+            rekey_timeout: U32Range::single(7),
+            max_handshake_attempts: U32Range::single(3),
+            ..TimingRanges::default()
+        };
+        let mut timers = Timers::new(None, false, ranges);
+        let mut rng = SeqRng::new(0xAA);
+        timers.roll_handshake_timings(&mut rng, true);
+        assert_eq!(timers.rekey_timeout_current, Duration::from_secs(7));
+        assert_eq!(timers.rekey_attempt_deadline, Duration::from_secs(21));
+    }
+
+    #[test]
+    fn retry_rerolls_the_timeout_but_keeps_the_deadline() {
+        let ranges = TimingRanges {
+            rekey_timeout: U32Range::new(3, 9).expect("valid range"),
+            max_handshake_attempts: U32Range::single(4),
+            ..TimingRanges::default()
+        };
+        let mut timers = Timers::new(None, false, ranges);
+        let mut rng = SeqRng::new(1);
+        timers.roll_handshake_timings(&mut rng, true);
+        let deadline = timers.rekey_attempt_deadline;
+
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..32 {
+            timers.roll_handshake_timings(&mut rng, false);
+            let secs = timers.rekey_timeout_current.as_secs();
+            assert!((3..=9).contains(&secs), "timeout {} out of range", secs);
+            seen.insert(secs);
+            assert_eq!(timers.rekey_attempt_deadline, deadline);
+        }
+        assert!(seen.len() > 1, "retransmit timeout should vary per retry");
+    }
+
+    #[test]
+    fn reject_after_time_uses_range_upper_bound() {
+        let timers = Timers::new(None, false, TimingRanges::default());
+        assert_eq!(timers.reject_after_time(), REJECT_AFTER_TIME);
+
+        let ranges = TimingRanges {
+            reject_after_time: U32Range::new(100, 200).expect("valid range"),
+            ..TimingRanges::default()
+        };
+        let timers = Timers::new(None, false, ranges);
+        assert_eq!(timers.reject_after_time(), Duration::from_secs(200));
+    }
+
+    #[test]
+    fn persistent_keepalive_range_seeds_the_first_interval() {
+        let ranges = TimingRanges {
+            persistent_keepalive: U32Range::new(20, 30).expect("valid range"),
+            ..TimingRanges::default()
+        };
+        let timers = Timers::new(None, false, ranges);
+        let secs = timers.persistent_keepalive_next.as_secs();
+        assert!((20..=30).contains(&secs), "interval {} out of range", secs);
+
+        // Without a range the interval stays at the fixed scalar path.
+        let timers = Timers::new(Some(25), false, TimingRanges::default());
+        assert_eq!(timers.persistent_keepalive_next, Duration::ZERO);
+        assert_eq!(timers.persistent_keepalive, 25);
     }
 }

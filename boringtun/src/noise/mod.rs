@@ -8,7 +8,10 @@ pub mod rate_limiter;
 mod session;
 mod timers;
 
-use crate::amnezia::{Amnezia2Config, Amnezia3Config, ConfigError, HeaderConfig, HeaderProtection, HeaderRange, JunkConfig, InitPacketConfig, OsRandom, PaddingConfig, U32Range};
+use crate::amnezia::{
+    Amnezia2Config, Amnezia3Config, ConfigError, HeaderConfig, HeaderProtection, InitPacketConfig,
+    JunkConfig, OsRandom, PaddingConfig, U32Range,
+};
 use crate::amnezia::RandomSource as _;
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::Handshake;
@@ -690,6 +693,8 @@ impl Tunn {
         }
 
         let starting_new_handshake = !self.handshake.is_in_progress();
+        self.timers
+            .roll_handshake_timings(&mut OsRandom, starting_new_handshake);
 
         // Queue I-packets and junk before the handshake initiation
         // (sent as separate UDP datagrams before the real init)
@@ -954,6 +959,7 @@ mod tests {
     use crate::noise::timers::{REKEY_AFTER_TIME, REKEY_TIMEOUT};
 
     use super::*;
+    use crate::amnezia::HeaderRange;
     use rand_core::{OsRng, RngCore};
 
     fn create_two_tuns() -> (Tunn, Tunn) {
