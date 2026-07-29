@@ -1397,6 +1397,183 @@ mod tests {
         assert_eq!(tun.persistent_keepalive(), Some(15));
     }
 
+    /// Two tunnels sharing AWG 3.0 timing ranges, on an otherwise standard
+    /// WireGuard wire format, so the timer behavior is isolated from the
+    /// obfuscation layers.
+    #[cfg(feature = "mock-instant")]
+    fn create_two_tuns_with_timings(ranges: crate::amnezia::TimingRanges) -> (Tunn, Tunn) {
+        let my_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let my_public_key = x25519_dalek::PublicKey::from(&my_secret_key);
+        let their_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let their_public_key = x25519_dalek::PublicKey::from(&their_secret_key);
+
+        let mut config = crate::amnezia::Amnezia3Config::default();
+        config.timing_ranges = ranges;
+
+        let my_tun = Tunn::new_with_amnezia3(
+            my_secret_key,
+            their_public_key,
+            None,
+            None,
+            1,
+            None,
+            config.clone(),
+        )
+        .expect("valid timing ranges");
+        let their_tun =
+            Tunn::new_with_amnezia3(their_secret_key, my_public_key, None, None, 2, None, config)
+                .expect("valid timing ranges");
+        (my_tun, their_tun)
+    }
+
+    #[cfg(feature = "mock-instant")]
+    fn handshake_with_timings(ranges: crate::amnezia::TimingRanges) -> (Tunn, Tunn) {
+        let (mut my_tun, mut their_tun) = create_two_tuns_with_timings(ranges);
+        let init = create_handshake_init(&mut my_tun);
+        let resp = create_handshake_response(&mut their_tun, &init);
+        let keepalive = parse_handshake_resp(&mut my_tun, &resp);
+        parse_keepalive(&mut their_tun, &keepalive);
+        (my_tun, their_tun)
+    }
+
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn awg3_rekey_after_time_range_drives_initiator_rekey() {
+        // 10 s instead of the 120 s default: a rekey at 10 s can only come from
+        // the configured range.
+        let (mut my_tun, _their_tun) = handshake_with_timings(crate::amnezia::TimingRanges {
+            rekey_after_time: U32Range::single(10),
+            ..Default::default()
+        });
+
+        // `update_timers` is what advances the timers' notion of "now", so it
+        // has to run before the send for the data-sent tick to be stamped at
+        // t=1 rather than t=0.
+        let mut dst = vec![0u8; 2048];
+        mock_instant::MockClock::advance(Duration::from_secs(1));
+        assert!(matches!(my_tun.update_timers(&mut dst), TunnResult::Done));
+        assert!(matches!(
+            my_tun.encapsulate(&create_ipv4_udp_packet(), &mut dst),
+            TunnResult::WriteToNetwork(_)
+        ));
+
+        // Session established at t=0, so the rekey is due at t=10.
+        mock_instant::MockClock::advance(Duration::from_secs(8));
+        assert!(matches!(my_tun.update_timers(&mut dst), TunnResult::Done));
+
+        mock_instant::MockClock::advance(Duration::from_secs(2));
+        update_timer_results_in_handshake(&mut my_tun);
+    }
+
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn awg3_rekey_timeout_range_drives_retransmit() {
+        // 2 s instead of the 5 s default.
+        let (mut my_tun, _their_tun) = create_two_tuns_with_timings(crate::amnezia::TimingRanges {
+            rekey_timeout: U32Range::single(2),
+            ..Default::default()
+        });
+        let _ = create_handshake_init(&mut my_tun);
+
+        let mut dst = vec![0u8; 2048];
+        mock_instant::MockClock::advance(Duration::from_secs(1));
+        assert!(matches!(my_tun.update_timers(&mut dst), TunnResult::Done));
+
+        mock_instant::MockClock::advance(Duration::from_secs(1));
+        update_timer_results_in_handshake(&mut my_tun);
+    }
+
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn awg3_keepalive_timeout_range_drives_keepalive() {
+        // 3 s instead of the 10 s default.
+        let (mut my_tun, mut their_tun) = handshake_with_timings(crate::amnezia::TimingRanges {
+            keepalive_timeout: U32Range::single(3),
+            ..Default::default()
+        });
+
+        // Data one way arms the responder's keepalive timer. Tick the
+        // responder's clock first so the receive is stamped at t=1.
+        let mut dst = vec![0u8; 2048];
+        let mut their_dst = vec![0u8; 2048];
+        mock_instant::MockClock::advance(Duration::from_secs(1));
+        assert!(matches!(
+            their_tun.update_timers(&mut their_dst),
+            TunnResult::Done
+        ));
+
+        let data = match my_tun.encapsulate(&create_ipv4_udp_packet(), &mut dst) {
+            TunnResult::WriteToNetwork(packet) => packet.to_vec(),
+            other => panic!("expected WriteToNetwork, got {:?}", other),
+        };
+        assert!(matches!(
+            their_tun.decapsulate(None, &data, &mut their_dst),
+            TunnResult::WriteToTunnelV4(..)
+        ));
+
+        // The responder last sent at t=0, so the keepalive is due at t=3.
+        mock_instant::MockClock::advance(Duration::from_secs(1));
+        assert!(matches!(
+            their_tun.update_timers(&mut their_dst),
+            TunnResult::Done
+        ));
+
+        mock_instant::MockClock::advance(Duration::from_secs(1));
+        match their_tun.update_timers(&mut their_dst) {
+            TunnResult::WriteToNetwork(packet) => assert_eq!(packet.len(), KEEPALIVE_SZ),
+            other => panic!("expected a keepalive, got {:?}", other),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn awg3_new_handshake_timer_uses_keepalive_hi_plus_rekey() {
+        // Hi(keepalive) + pick(rekey) = 6 + 2 = 8 s, against the 10 + 5 = 15 s
+        // default. Firing at 8 s can only come from the configured ranges.
+        let (mut my_tun, _their_tun) = handshake_with_timings(crate::amnezia::TimingRanges {
+            keepalive_timeout: U32Range::new(4, 6).expect("valid range"),
+            rekey_timeout: U32Range::single(2),
+            ..Default::default()
+        });
+
+        let mut dst = vec![0u8; 2048];
+        mock_instant::MockClock::advance(Duration::from_secs(1));
+        assert!(matches!(my_tun.update_timers(&mut dst), TunnResult::Done));
+        assert!(matches!(
+            my_tun.encapsulate(&create_ipv4_udp_packet(), &mut dst),
+            TunnResult::WriteToNetwork(_)
+        ));
+
+        // Last authenticated receive was the handshake response at t=0, so the
+        // new-handshake timer is due at t=8.
+        mock_instant::MockClock::advance(Duration::from_secs(6));
+        assert!(matches!(my_tun.update_timers(&mut dst), TunnResult::Done));
+
+        mock_instant::MockClock::advance(Duration::from_secs(1));
+        update_timer_results_in_handshake(&mut my_tun);
+    }
+
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn awg3_reject_after_time_range_expires_the_connection() {
+        // Hi(reject_after) = 60, so key material is zeroed at 3 * 60 = 180 s,
+        // where the 180 s default would give 540 s.
+        let (mut my_tun, _their_tun) = handshake_with_timings(crate::amnezia::TimingRanges {
+            reject_after_time: U32Range::new(50, 60).expect("valid range"),
+            ..Default::default()
+        });
+
+        let mut dst = vec![0u8; 2048];
+        mock_instant::MockClock::advance(Duration::from_secs(179));
+        assert!(matches!(my_tun.update_timers(&mut dst), TunnResult::Done));
+
+        mock_instant::MockClock::advance(Duration::from_secs(1));
+        assert!(matches!(
+            my_tun.update_timers(&mut dst),
+            TunnResult::Err(WireGuardError::ConnectionExpired)
+        ));
+    }
+
     #[test]
     fn awg3_keepalive_has_s4_prefix() {
         let (mut my_tun, mut their_tun) = create_two_tuns_awg3();
