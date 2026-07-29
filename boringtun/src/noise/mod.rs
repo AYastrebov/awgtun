@@ -8,11 +8,11 @@ pub mod rate_limiter;
 mod session;
 mod timers;
 
+use crate::amnezia::RandomSource as _;
 use crate::amnezia::{
     Amnezia2Config, Amnezia3Config, ConfigError, HeaderConfig, HeaderProtection, InitPacketConfig,
     JunkConfig, OsRandom, PaddingConfig, U32Range,
 };
-use crate::amnezia::RandomSource as _;
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::Handshake;
 use crate::noise::rate_limiter::RateLimiter;
@@ -494,10 +494,12 @@ impl Tunn {
         };
 
         let mut cookie = [0u8; COOKIE_REPLY_SZ];
-        let packet = match self
-            .rate_limiter
-            .verify_packet(src_addr, stripped, &mut cookie, &self.header_config)
-        {
+        let packet = match self.rate_limiter.verify_packet(
+            src_addr,
+            stripped,
+            &mut cookie,
+            &self.header_config,
+        ) {
             Ok(packet) => packet,
             Err(TunnResult::WriteToNetwork(cookie)) => {
                 // Add S3 padding to cookie reply
@@ -703,7 +705,10 @@ impl Tunn {
         let init_type = self.header_config.init.generate(&mut OsRandom);
         let s1 = self.padding_config.s1 as usize;
 
-        match self.handshake.format_handshake_initiation(&mut dst[s1..], init_type) {
+        match self
+            .handshake
+            .format_handshake_initiation(&mut dst[s1..], init_type)
+        {
             Ok(packet) => {
                 tracing::debug!("Sending handshake_initiation");
 
@@ -1187,15 +1192,8 @@ mod tests {
         let their_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
         let their_public_key = x25519_dalek::PublicKey::from(&their_secret_key);
         let config = awg3_test_config([0x42; 32]);
-        let tun = Tunn::new_with_amnezia3(
-            my_secret_key,
-            their_public_key,
-            None,
-            None,
-            1,
-            None,
-            config,
-        );
+        let tun =
+            Tunn::new_with_amnezia3(my_secret_key, their_public_key, None, None, 1, None, config);
         assert!(tun.is_ok());
         // silence unused warning for their_secret_key's counterpart in later tasks
         let _ = (my_public_key, their_secret_key);
@@ -1485,9 +1483,8 @@ mod tests {
     fn awg3_mismatched_header_protection_key_drops() {
         let (mut my_tun, _) = create_two_tuns_awg3();
         let their_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
-        let my_public_key = x25519_dalek::PublicKey::from(
-            &x25519_dalek::StaticSecret::random_from_rng(OsRng),
-        );
+        let my_public_key =
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::random_from_rng(OsRng));
         let mut wrong_key_tun = Tunn::new_with_amnezia3(
             their_secret_key,
             my_public_key,
@@ -1502,6 +1499,9 @@ mod tests {
         let init = create_handshake_init(&mut my_tun);
         let mut dst = vec![0u8; 2048];
         let result = wrong_key_tun.decapsulate(None, &init, &mut dst);
-        assert!(matches!(result, TunnResult::Err(WireGuardError::InvalidPacket)));
+        assert!(matches!(
+            result,
+            TunnResult::Err(WireGuardError::InvalidPacket)
+        ));
     }
 }

@@ -638,9 +638,15 @@ impl CpsChain {
 pub enum CpsTag {
     Bytes(Vec<u8>),
     Timestamp,
-    RandomBytes { len: usize },
-    RandomChars { len: usize },
-    RandomDigits { len: usize },
+    RandomBytes {
+        len: usize,
+    },
+    RandomChars {
+        len: usize,
+    },
+    RandomDigits {
+        len: usize,
+    },
     /// Pass-through copy of source data (`<d>`).
     /// For I1-I5 init packets (no source data), produces zero bytes.
     Data,
@@ -648,7 +654,9 @@ pub enum CpsTag {
     /// For I1-I5 init packets (no source data), produces zero bytes.
     DataString,
     /// N-byte big-endian length of source data (`<dz N>`).
-    DataSize { len: usize },
+    DataSize {
+        len: usize,
+    },
 }
 
 impl CpsTag {
@@ -1492,7 +1500,11 @@ mod tests {
         let parsed = CpsChain::parse("<d><ds><dz 4>").unwrap();
         assert_eq!(
             parsed.tags(),
-            &[CpsTag::Data, CpsTag::DataString, CpsTag::DataSize { len: 4 },]
+            &[
+                CpsTag::Data,
+                CpsTag::DataString,
+                CpsTag::DataSize { len: 4 },
+            ]
         );
         // With no source data (init packets), Data and DataString produce 0 bytes
         assert_eq!(parsed.encoded_len(0), 4);
@@ -1687,7 +1699,11 @@ mod tests {
         let packets = config.generate_junk_packets(&mut rng);
         assert_eq!(packets.len(), 3);
         for pkt in &packets {
-            assert!(pkt.len() >= 64 && pkt.len() <= 128, "size {} out of range", pkt.len());
+            assert!(
+                pkt.len() >= 64 && pkt.len() <= 128,
+                "size {} out of range",
+                pkt.len()
+            );
         }
     }
 

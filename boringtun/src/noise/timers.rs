@@ -366,7 +366,9 @@ impl Tunn {
                     let ranges = &self.timers.timing_ranges;
                     Duration::from_secs(u64::from(
                         ranges.keepalive_timeout.hi_or(KEEPALIVE_TIMEOUT_SECS)
-                            + ranges.rekey_timeout.pick_or(&mut OsRandom, REKEY_TIMEOUT_SECS),
+                            + ranges
+                                .rekey_timeout
+                                .pick_or(&mut OsRandom, REKEY_TIMEOUT_SECS),
                     ))
                 };
                 if data_packet_sent > aut_packet_received

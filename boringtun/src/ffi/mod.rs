@@ -524,12 +524,15 @@ pub unsafe extern "C" fn new_tunnel_amnezia(
         Err(()) => return null_mut(),
     };
 
-    let identity =
-        match parse_tunnel_identity(static_private, server_static_public, preshared_key, keep_alive)
-        {
-            Ok(identity) => identity,
-            Err(()) => return null_mut(),
-        };
+    let identity = match parse_tunnel_identity(
+        static_private,
+        server_static_public,
+        preshared_key,
+        keep_alive,
+    ) {
+        Ok(identity) => identity,
+        Err(()) => return null_mut(),
+    };
 
     let tunnel = match Tunn::new_with_amnezia(
         identity.private_key,
@@ -669,12 +672,15 @@ pub unsafe extern "C" fn new_tunnel_amnezia3(
         amnezia.mtu = cfg.mtu;
     }
 
-    let identity =
-        match parse_tunnel_identity(static_private, server_static_public, preshared_key, keep_alive)
-        {
-            Ok(identity) => identity,
-            Err(()) => return null_mut(),
-        };
+    let identity = match parse_tunnel_identity(
+        static_private,
+        server_static_public,
+        preshared_key,
+        keep_alive,
+    ) {
+        Ok(identity) => identity,
+        Err(()) => return null_mut(),
+    };
 
     let tunnel = match Tunn::new_with_amnezia3(
         identity.private_key,
