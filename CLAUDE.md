@@ -2,14 +2,15 @@
 
 ## Project Overview
 
-This is a fork of [cloudflare/boringtun](https://github.com/cloudflare/boringtun) with **AmneziaWG 2.0** protocol support. The fork adds packet obfuscation capabilities while preserving full standard WireGuard compatibility when AmneziaWG features are disabled.
+This is a fork of [cloudflare/boringtun](https://github.com/cloudflare/boringtun) with **AmneziaWG 2.0 and 3.0** protocol support. The fork adds packet obfuscation capabilities while preserving full standard WireGuard compatibility when AmneziaWG features are disabled.
 
 ## Repository Structure
 
 ```
 boringtun/              # Main library crate
   src/
-    amnezia.rs          # AmneziaWG 2.0 config, CPS generator, junk generation
+    amnezia.rs          # AmneziaWG 2.0/3.0 config, CPS generator, junk generation,
+                        # header protection primitive
     noise/
       mod.rs            # Tunn struct, encapsulate/decapsulate, packet parsing
       handshake.rs      # Noise_IK handshake state machine
@@ -25,7 +26,7 @@ boringtun-cli/          # Optional CLI binary
 ## Branch Strategy
 
 - `master` — tracks upstream cloudflare/boringtun
-- `amnezia` — AmneziaWG 2.0 integration (primary development branch)
+- `amnezia` — AmneziaWG 2.0/3.0 integration (primary development branch)
 
 ## Building
 
@@ -53,12 +54,14 @@ Files modified from upstream boringtun (keep these in mind during rebases):
 
 | File | Changes |
 |------|---------|
-| `amnezia.rs` | New file — all AWG config types, CPS generator, junk generation |
-| `noise/mod.rs` | HeaderConfig, PaddingConfig, padding send/receive, multi-datagram output |
+| `amnezia.rs` | New file — all AWG config types, CPS generator, junk generation, ChaCha20 header protection |
+| `noise/mod.rs` | HeaderConfig, PaddingConfig, padding send/receive, multi-datagram output, header protection, content padding |
 | `noise/handshake.rs` | `msg_type` parameter for dynamic headers |
-| `noise/session.rs` | `msg_type` parameter for transport packets |
+| `noise/session.rs` | `msg_type` and `content_padding` parameters for transport packets |
 | `noise/rate_limiter.rs` | HeaderConfig param, dynamic cookie headers |
-| `noise/timers.rs` | Clear network_outgoing queue on reset |
+| `noise/timers.rs` | Clear network_outgoing queue on reset, AWG 3.0 randomized timings |
+| `ffi/mod.rs` | `amnezia_config`/`amnezia3_config`, `new_tunnel_amnezia`/`new_tunnel_amnezia3` |
+| `wireguard_ffi.h` | AWG 2.0 and 3.0 declarations |
 | `device/mod.rs` | Pass default HeaderConfig to verify_packet |
 
 ## Key API
@@ -69,6 +72,9 @@ Tunn::new(private_key, peer_public, psk, keepalive, index, rate_limiter)
 
 // AmneziaWG 2.0
 Tunn::new_with_amnezia(private_key, peer_public, psk, keepalive, index, rate_limiter, amnezia_config)
+
+// AmneziaWG 3.0 (header protection, content padding, randomized timings)
+Tunn::new_with_amnezia3(private_key, peer_public, psk, keepalive, index, rate_limiter, amnezia3_config)
 
 // Before sending handshake init, drain pre-handshake packets:
 while let Some(packet) = tunn.poll_outgoing_packet() {
@@ -83,3 +89,5 @@ while let Some(packet) = tunn.poll_outgoing_packet() {
 - Dynamic headers are written BEFORE MAC computation (inside Noise handshake)
 - Padding is prepended AFTER MAC computation (transport layer)
 - Send order: I-packets -> Junk -> Padded handshake init
+- AWG 3.0 header protection is applied LAST on send, and FIRST on receive; the nonce is the first 12 bytes of the S1-S4 prefix, so those must be >= 12
+- AWG 3.0 content padding goes INSIDE the AEAD envelope; the receiver trims it via the IP total-length field

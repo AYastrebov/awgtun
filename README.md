@@ -1,10 +1,10 @@
 ![boringtun logo banner](./banner.png)
 
-# BoringTun + AmneziaWG 2.0
+# BoringTun + AmneziaWG 2.0 / 3.0
 
-This is a fork of [cloudflare/boringtun](https://github.com/cloudflare/boringtun) that adds [AmneziaWG 2.0](https://docs.amnezia.org/documentation/amnezia-wg/) protocol support. The upstream WireGuard implementation is preserved — when AmneziaWG parameters are left at their defaults, the tunnel behaves exactly like standard WireGuard.
+This is a fork of [cloudflare/boringtun](https://github.com/cloudflare/boringtun) that adds [AmneziaWG](https://docs.amnezia.org/documentation/amnezia-wg/) 2.0 and 3.0 protocol support. The upstream WireGuard implementation is preserved — when AmneziaWG parameters are left at their defaults, the tunnel behaves exactly like standard WireGuard.
 
-The fork is client-focused. It can initiate tunnels, maintain handshakes, encrypt and decrypt IP packets, and keep sessions alive against AmneziaWG 2.0 servers. It does not implement server/inbound mode.
+The fork is client-focused. It can initiate tunnels, maintain handshakes, encrypt and decrypt IP packets, and keep sessions alive against AmneziaWG 2.0 and 3.0 servers. It does not implement server/inbound mode.
 
 The project consists of two parts:
 
@@ -26,16 +26,26 @@ cargo test -p boringtun --lib --no-run
 ./target/debug/deps/boringtun-* --no-capture
 ```
 
-## AmneziaWG 2.0 support
+## AmneziaWG support
 
-AmneziaWG 2.0 makes WireGuard traffic harder to identify through deep packet inspection. It does this by randomizing packet headers, sizes, and timing patterns while keeping WireGuard's cryptography untouched.
+AmneziaWG makes WireGuard traffic harder to identify through deep packet inspection. It does this by randomizing packet headers, sizes, and timing patterns while keeping WireGuard's cryptography untouched.
+
+### 2.0
 
 Four obfuscation mechanisms, each independently configurable:
 
 - **Dynamic headers (H1-H4)** — WireGuard normally uses fixed message type values (1, 2, 3, 4) in the first four bytes of every packet. AmneziaWG replaces these with random values drawn from configurable ranges. The randomized header is written into the packet before MAC computation, so it's covered by authentication.
-- **Packet padding (S1-S4)** — random bytes prepended to each packet type after MAC computation. This changes packet sizes without breaking authentication. S4 (transport padding) is skipped for keepalive packets, matching the Go reference.
+- **Packet padding (S1-S4)** — random bytes prepended to each packet type after MAC computation. This changes packet sizes without breaking authentication. S4 (transport padding) applies to keepalives too, matching the Go reference.
 - **Junk packets (Jc/Jmin/Jmax)** — random-sized decoy datagrams sent before handshake initiation. The server silently discards them.
 - **Init packets (I1-I5)** — structured camouflage datagrams (CPS chains) sent before junk. These use a tag-based format (`<b 0xFF><r 16><t>`) to generate protocol-mimicking byte sequences.
+
+### 3.0
+
+Three further mechanisms, layered on the 2.0 parameters:
+
+- **Header protection** — raw ChaCha20 over the low-entropy header fields, keyed by a shared 32-byte key and nonced from the random padding prefix. Handshake messages are encrypted in full, including their MACs; transport packets have their 16-byte header encrypted. Requires S1-S4 to all be at least 12.
+- **Content padding** — a random number of zero bytes appended to transport content inside the AEAD envelope, so the padding is authenticated and the receiver needs no configuration.
+- **Randomized timings** — the WireGuard timing constants (rekey, keepalive, reject-after, handshake attempts, persistent keepalive) become configurable ranges, picked afresh at each use.
 
 ### Rust API
 
@@ -65,9 +75,25 @@ while let Some(packet) = tunnel.poll_outgoing_packet() {
 }
 ```
 
+For AmneziaWG 3.0, lift the config and set the 3.0 parameters:
+
+```rust
+let mut config = Amnezia3Config::from_amnezia2(config);
+config.header_protection_key = Some(header_key);
+config.content_padding_addition = Some(U32Range::new(1, 64)?);
+config.timing_ranges = TimingRanges {
+    rekey_timeout: U32Range::new(3, 9)?,
+    ..TimingRanges::default()   // unset ranges keep the WireGuard constants
+};
+
+let mut tunnel = Tunn::new_with_amnezia3(
+    private_key, peer_public_key, None, Some(25), index, None, config,
+)?;
+```
+
 ### C FFI
 
-The library also exposes AmneziaWG through C bindings (`amnezia_config` struct, `new_tunnel_amnezia`, `wireguard_poll_outgoing_packet`). See [`AMNEZIA.md`](AMNEZIA.md) for the full C API reference.
+The library also exposes AmneziaWG through C bindings (`amnezia_config` and `amnezia3_config` structs, `new_tunnel_amnezia`, `new_tunnel_amnezia3`, `wireguard_poll_outgoing_packet`), declared in `boringtun/src/wireguard_ffi.h`. See [`AMNEZIA.md`](AMNEZIA.md) for the full C API reference.
 
 ### Further reading
 
