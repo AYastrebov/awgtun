@@ -103,6 +103,9 @@ const HANDSHAKE_RESP_SZ: usize = 92;
 const COOKIE_REPLY_SZ: usize = 64;
 const DATA_OVERHEAD_SZ: usize = 32;
 const TRANSPORT_HEADER_SZ: usize = 16; // type(4) + receiver(4) + counter(8)
+/// Wire size of an unpadded keepalive: transport header + AEAD tag.
+/// Matches amneziawg-go's `MessageKeepaliveSize`.
+const KEEPALIVE_SZ: usize = DATA_OVERHEAD_SZ;
 
 #[derive(Debug)]
 pub struct HandshakeInit<'a> {
@@ -355,9 +358,13 @@ impl Tunn {
         if let Some(ref session) = self.sessions[current % N_SESSIONS] {
             // Send the packet using an established session
             let packet = self.format_transport_packet(session, src, dst);
+            // amneziawg-go classifies an outbound packet as "data sent" by wire
+            // size (`len(elem.packet) != MessageKeepaliveSize`), so an S4 prefix
+            // makes even an empty packet count as data. Match that rule rather
+            // than testing the payload.
+            let is_keepalive = packet.len() == KEEPALIVE_SZ;
             self.timer_tick(TimerName::TimeLastPacketSent);
-            // Exclude Keepalive packets from timer update.
-            if !src.is_empty() {
+            if !is_keepalive {
                 self.timer_tick(TimerName::TimeLastDataPacketSent);
             }
             self.tx_bytes += src.len();
@@ -1248,6 +1255,50 @@ mod tests {
             }
             other => panic!("expected WriteToTunnelV4, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn padded_keepalive_counts_as_data_sent() {
+        // With an S4 prefix the wire size differs from MessageKeepaliveSize, so
+        // amneziawg-go arms the data-sent timer even for an empty payload.
+        let (mut my_tun, mut their_tun) = create_two_tuns_awg3();
+        let init = create_handshake_init(&mut my_tun);
+        let resp = create_handshake_response(&mut their_tun, &init);
+        let _ = parse_handshake_resp(&mut my_tun, &resp);
+
+        let mut buf = vec![0u8; 2048];
+        let _ = my_tun.update_timers(&mut buf);
+        assert!(my_tun.timers[TimerName::TimeCurrent] > Duration::ZERO);
+
+        my_tun.timers[TimerName::TimeLastDataPacketSent] = Duration::ZERO;
+        match my_tun.encapsulate(&[], &mut buf) {
+            TunnResult::WriteToNetwork(_) => {}
+            other => panic!("expected WriteToNetwork, got {:?}", other),
+        }
+        assert_eq!(
+            my_tun.timers[TimerName::TimeLastDataPacketSent],
+            my_tun.timers[TimerName::TimeCurrent]
+        );
+    }
+
+    #[test]
+    fn unpadded_keepalive_is_not_data_sent() {
+        let (mut my_tun, mut their_tun) = create_two_tuns();
+        let init = create_handshake_init(&mut my_tun);
+        let resp = create_handshake_response(&mut their_tun, &init);
+        let _ = parse_handshake_resp(&mut my_tun, &resp);
+
+        let mut buf = vec![0u8; 2048];
+        let _ = my_tun.update_timers(&mut buf);
+        my_tun.timers[TimerName::TimeLastDataPacketSent] = Duration::ZERO;
+        match my_tun.encapsulate(&[], &mut buf) {
+            TunnResult::WriteToNetwork(packet) => assert_eq!(packet.len(), KEEPALIVE_SZ),
+            other => panic!("expected WriteToNetwork, got {:?}", other),
+        }
+        assert_eq!(
+            my_tun.timers[TimerName::TimeLastDataPacketSent],
+            Duration::ZERO
+        );
     }
 
     #[test]
