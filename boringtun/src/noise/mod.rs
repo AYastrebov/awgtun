@@ -351,13 +351,16 @@ impl Tunn {
     /// and no less than `148 + S1` bytes (to hold a padded handshake initiation).
     /// Keepalive packets also occupy `S4` bytes of padding (amneziawg-go
     /// f4f4c99). With AWG 3.0 header protection enabled, the first 16 bytes
-    /// after the padding prefix are ChaCha20-encrypted.
+    /// after the padding prefix are ChaCha20-encrypted. With AWG 3.0 content
+    /// padding configured, dst must additionally hold up to the range's upper
+    /// bound in appended zero bytes.
     /// When AmneziaWG is disabled (default config), S1 and S4 are both 0.
     pub fn encapsulate<'a>(&mut self, src: &[u8], dst: &'a mut [u8]) -> TunnResult<'a> {
         let current = self.current;
         if let Some(ref session) = self.sessions[current % N_SESSIONS] {
             // Send the packet using an established session
-            let packet = self.format_transport_packet(session, src, dst);
+            let content_padding = self.content_padding_addition(src.len());
+            let packet = self.format_transport_packet(session, src, content_padding, dst);
             // amneziawg-go classifies an outbound packet as "data sent" by wire
             // size (`len(elem.packet) != MessageKeepaliveSize`), so an S4 prefix
             // makes even an empty packet count as data. Match that rule rather
@@ -377,21 +380,46 @@ impl Tunn {
         self.format_handshake_initiation(dst, false)
     }
 
+    /// AWG 3.0 content padding addition: a random pick from the configured
+    /// range, clamped to the space left in the last MTU segment. Mirrors
+    /// amneziawg-go's `randomPaddingAddition`; boringtun never pads content to a
+    /// multiple of 16, so the addition applies as-is.
+    fn content_padding_addition(&self, packet_size: usize) -> usize {
+        let range = match self.content_padding {
+            Some(range) => range,
+            None => return 0,
+        };
+        let mut add = range.generate(&mut OsRandom) as usize;
+        let mtu = self.mtu as usize;
+        if mtu != 0 {
+            let last_unit = if packet_size > mtu {
+                packet_size % mtu
+            } else {
+                packet_size
+            };
+            add = add.min(mtu - last_unit);
+        }
+        add
+    }
+
     /// Format a transport (data or keepalive) packet: dynamic H4 header,
     /// S4 random prefix (applied to keepalives as well, matching
-    /// amneziawg-go f4f4c99), and AWG 3.0 header protection over the
-    /// 16-byte transport header when enabled.
+    /// amneziawg-go f4f4c99), AWG 3.0 content padding inside the AEAD envelope,
+    /// and AWG 3.0 header protection over the 16-byte transport header when
+    /// enabled.
     fn format_transport_packet<'a>(
         &self,
         session: &session::Session,
         src: &[u8],
+        content_padding: usize,
         dst: &'a mut [u8],
     ) -> &'a mut [u8] {
         let transport_type = self.header_config.transport.generate(&mut OsRandom);
         let s4 = self.padding_config.s4 as usize;
 
         // Write WG packet at offset s4, then fill the prefix with random padding
-        let packet = session.format_packet_data(src, &mut dst[s4..], transport_type);
+        let packet =
+            session.format_packet_data(src, &mut dst[s4..], transport_type, content_padding);
         let packet_len = packet.len();
         if s4 > 0 {
             OsRandom.fill_bytes(&mut dst[..s4]);
@@ -553,7 +581,8 @@ impl Tunn {
 
         let session = self.handshake.receive_handshake_response(p)?;
 
-        let keepalive_packet = self.format_transport_packet(&session, &[], dst);
+        let content_padding = self.content_padding_addition(0);
+        let keepalive_packet = self.format_transport_packet(&session, &[], content_padding, dst);
         // Store new session in ring buffer
         let l_idx = session.local_index();
         let index = l_idx % N_SESSIONS;
@@ -741,7 +770,13 @@ impl Tunn {
                     IpAddr::from(addr_bytes),
                 )
             }
-            _ => return TunnResult::Err(WireGuardError::InvalidPacket),
+            _ => {
+                // amneziawg-go drops payloads that are neither IPv4 nor IPv6 —
+                // content-padded keepalives decrypt to all zeros — but still
+                // counts them as data received.
+                self.timer_tick(TimerName::TimeLastDataPacketReceived);
+                return TunnResult::Done;
+            }
         };
 
         if computed_len > packet.len() {
@@ -1255,6 +1290,133 @@ mod tests {
             }
             other => panic!("expected WriteToTunnelV4, got {:?}", other),
         }
+    }
+
+    fn create_two_tuns_awg3_cpa(cpa_lo: u32, cpa_hi: u32) -> (Tunn, Tunn) {
+        let my_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let my_public_key = x25519_dalek::PublicKey::from(&my_secret_key);
+        let their_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let their_public_key = x25519_dalek::PublicKey::from(&their_secret_key);
+        let key = [0x42; 32];
+
+        let mut config = awg3_test_config(key);
+        config.content_padding_addition = Some(U32Range::new(cpa_lo, cpa_hi).expect("valid range"));
+
+        let my_tun =
+            Tunn::new_with_amnezia3(my_secret_key, their_public_key, None, None, 1, None, config)
+                .expect("valid awg3 config");
+        let their_tun = Tunn::new_with_amnezia3(
+            their_secret_key,
+            my_public_key,
+            None,
+            None,
+            2,
+            None,
+            // The receiver does not need the CPA range: padding is inside AEAD.
+            awg3_test_config(key),
+        )
+        .expect("valid awg3 config");
+        (my_tun, their_tun)
+    }
+
+    fn complete_awg3_handshake(my_tun: &mut Tunn, their_tun: &mut Tunn) {
+        let init = create_handshake_init(my_tun);
+        let resp = create_handshake_response(their_tun, &init);
+        let keepalive = parse_handshake_resp(my_tun, &resp);
+        let mut dst = vec![0u8; 2048];
+        let _ = their_tun.decapsulate(None, &keepalive, &mut dst);
+    }
+
+    #[test]
+    fn awg3_content_padding_sizes_and_round_trip() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_awg3_cpa(16, 16);
+        complete_awg3_handshake(&mut my_tun, &mut their_tun);
+
+        let ip = ipv4_packet();
+        let mut enc_buf = vec![0u8; 2048];
+        let wire_len = match my_tun.encapsulate(&ip, &mut enc_buf) {
+            TunnResult::WriteToNetwork(packet) => packet.len(),
+            other => panic!("expected WriteToNetwork, got {:?}", other),
+        };
+        // S4 (16) + header (16) + content (24 + 16 CPA zeros) + tag (16)
+        assert_eq!(wire_len, 16 + 16 + 24 + 16 + 16);
+
+        // Receiver trims the CPA zeros via the IP total-length field.
+        let mut dec_buf = vec![0u8; 2048];
+        match their_tun.decapsulate(None, &enc_buf[..wire_len], &mut dec_buf) {
+            TunnResult::WriteToTunnelV4(packet, _) => assert_eq!(packet, &ip[..]),
+            other => panic!("expected WriteToTunnelV4, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn awg3_content_padding_varies_within_range() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_awg3_cpa(1, 64);
+        complete_awg3_handshake(&mut my_tun, &mut their_tun);
+
+        let ip = ipv4_packet();
+        let base = 16 + 16 + ip.len() + 16;
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..32 {
+            let mut enc_buf = vec![0u8; 2048];
+            match my_tun.encapsulate(&ip, &mut enc_buf) {
+                TunnResult::WriteToNetwork(packet) => {
+                    let add = packet.len() - base;
+                    assert!((1..=64).contains(&add), "addition {} out of range", add);
+                    seen.insert(add);
+                }
+                other => panic!("expected WriteToNetwork, got {:?}", other),
+            }
+        }
+        assert!(seen.len() > 1, "content padding should vary across packets");
+    }
+
+    #[test]
+    fn awg3_content_padding_is_clamped_to_mtu() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_awg3_cpa(200, 200);
+        complete_awg3_handshake(&mut my_tun, &mut their_tun);
+
+        // An IP packet 100 bytes short of the MTU leaves room for only 100
+        // padding bytes, so the 200-byte addition is clamped.
+        let mtu = crate::amnezia::AWG3_DEFAULT_MTU as usize;
+        let mut ip = ipv4_packet();
+        ip.resize(mtu - 100, 0);
+        let len = ip.len() as u16;
+        ip[2..4].copy_from_slice(&len.to_be_bytes());
+
+        let mut enc_buf = vec![0u8; 4096];
+        let wire_len = match my_tun.encapsulate(&ip, &mut enc_buf) {
+            TunnResult::WriteToNetwork(packet) => packet.len(),
+            other => panic!("expected WriteToNetwork, got {:?}", other),
+        };
+        assert_eq!(wire_len, 16 + 16 + ip.len() + 100 + 16);
+    }
+
+    #[test]
+    fn awg3_content_padded_keepalive_is_dropped_as_data() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_awg3_cpa(8, 8);
+        complete_awg3_handshake(&mut my_tun, &mut their_tun);
+
+        // CPA-padded keepalive: content is 8 zero bytes inside AEAD.
+        let mut enc_buf = vec![0u8; 2048];
+        let wire_len = match my_tun.encapsulate(&[], &mut enc_buf) {
+            TunnResult::WriteToNetwork(packet) => packet.len(),
+            other => panic!("expected WriteToNetwork, got {:?}", other),
+        };
+        // S4 (16) + header (16) + content (8 zeros) + tag (16)
+        assert_eq!(wire_len, 16 + 16 + 8 + 16);
+
+        // amneziawg-go drops payloads that are neither IPv4 nor IPv6, but still
+        // counts them as data received.
+        let mut dec_buf = vec![0u8; 2048];
+        let _ = their_tun.update_timers(&mut vec![0u8; 2048]);
+        their_tun.timers[TimerName::TimeLastDataPacketReceived] = Duration::ZERO;
+        let result = their_tun.decapsulate(None, &enc_buf[..wire_len], &mut dec_buf);
+        assert!(matches!(result, TunnResult::Done));
+        assert_eq!(
+            their_tun.timers[TimerName::TimeLastDataPacketReceived],
+            their_tun.timers[TimerName::TimeCurrent]
+        );
     }
 
     #[test]

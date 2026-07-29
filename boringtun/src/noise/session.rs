@@ -192,14 +192,18 @@ impl Session {
 
     /// src - an IP packet from the interface
     /// dst - pre-allocated space to hold the encapsulating UDP packet to send over the network
+    /// content_padding - AWG 3.0 zero bytes appended to the content inside the
+    ///                   AEAD seal (0 when content padding is disabled)
     /// returns the size of the formatted packet
     pub(super) fn format_packet_data<'a>(
         &self,
         src: &[u8],
         dst: &'a mut [u8],
         msg_type: u32,
+        content_padding: usize,
     ) -> &'a mut [u8] {
-        if dst.len() < src.len() + super::DATA_OVERHEAD_SZ {
+        let content_len = src.len() + content_padding;
+        if dst.len() < content_len + super::DATA_OVERHEAD_SZ {
             panic!("The destination buffer is too small");
         }
 
@@ -213,20 +217,23 @@ impl Session {
         receiver_index.copy_from_slice(&self.sending_index.to_le_bytes());
         counter.copy_from_slice(&sending_key_counter.to_le_bytes());
 
-        // TODO: spec requires padding to 16 bytes, but actually works fine without it
+        // Note: WireGuard pads content to a multiple of 16; boringtun never has,
+        // and works fine without it. AWG 3.0 content padding is the only content
+        // padding applied here, and it is deliberately not 16-aligned.
         let n = {
             let mut nonce = [0u8; 12];
             nonce[4..12].copy_from_slice(&sending_key_counter.to_le_bytes());
             data[..src.len()].copy_from_slice(src);
+            data[src.len()..content_len].fill(0);
             self.sender
                 .seal_in_place_separate_tag(
                     Nonce::assume_unique_for_key(nonce),
                     Aad::from(&[]),
-                    &mut data[..src.len()],
+                    &mut data[..content_len],
                 )
                 .map(|tag| {
-                    data[src.len()..src.len() + AEAD_SIZE].copy_from_slice(tag.as_ref());
-                    src.len() + AEAD_SIZE
+                    data[content_len..content_len + AEAD_SIZE].copy_from_slice(tag.as_ref());
+                    content_len + AEAD_SIZE
                 })
                 .unwrap()
         };
