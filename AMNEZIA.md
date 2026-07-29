@@ -12,6 +12,7 @@ This document describes the AmneziaWG 2.0 and 3.0 protocol implementation in thi
 - [File-by-File Changes](#file-by-file-changes)
 - [Rust API](#rust-api)
 - [C FFI API](#c-ffi-api)
+- [JNI API (Android)](#jni-api-android)
 - [Comparison with amneziawg-go](#comparison-with-amneziawg-go)
 - [Known Limitations](#known-limitations)
 
@@ -324,6 +325,76 @@ void* new_tunnel_amnezia3(
 size_t wireguard_poll_outgoing_packet(
     void *tunnel, uint8_t *dst, uint32_t dst_size);
 ```
+
+## JNI API (Android)
+
+The `jni-bindings` feature exposes the tunnel to Android's `VpnService` through
+`com.cloudflare.app.boringtun.BoringTunJNI`. AmneziaWG is configured with a
+single UAPI-style `key=value` block rather than a long scalar signature — the
+same text an AmneziaWG `.conf` file carries:
+
+```kotlin
+val config = """
+    jc=4
+    jmin=64
+    jmax=256
+    s1=16
+    s2=16
+    s3=16
+    s4=16
+    h1=100-199
+    h2=200-299
+    h3=300-399
+    h4=400-499
+    header_protection_key=$hexKey
+    content_padding_addition=1-64
+    rekey_timeout=3-9
+    persistent_keepalive_interval=20-30
+""".trimIndent()
+
+val handle = BoringTunJNI.new_tunnel_amnezia3(
+    secretKeyBase64, publicKeyBase64, presharedKeyBase64, keepAlive, index, config,
+)
+require(handle != 0L) { "invalid AmneziaWG configuration" }
+```
+
+Blank lines, indentation and `#` comments are ignored; unset keys keep their
+WireGuard defaults, so an empty string yields a standard WireGuard tunnel. All
+keys are listed under [Configuration Parameters](#configuration-parameters) and
+[AmneziaWG 3.0](#amneziawg-30); `mtu` is a fork extension standing in for the
+device MTU, and an all-zero `header_protection_key` means "disabled".
+
+### The drain contract
+
+This is the easiest thing to get wrong. Junk packets and the I1-I5 signature
+packets are queued, not returned inline, so after creating a tunnel and after
+**every** `wireguard_write` and `wireguard_tick`, drain the queue and send those
+datagrams *before* the handshake initiation the call produced:
+
+```kotlin
+fun drainPreHandshake(handle: Long, socket: DatagramChannel, buf: ByteBuffer) {
+    while (true) {
+        buf.clear()
+        val size = BoringTunJNI.wireguard_poll_outgoing_packet(handle, buf, buf.capacity())
+        if (size == 0) break
+        buf.limit(size)
+        socket.write(buf)
+    }
+}
+```
+
+Skipping this does not break the tunnel — the handshake still completes — but
+`Jc` and `I1`-`I5` silently have no effect on the wire.
+
+### Lifecycle
+
+`BoringTunJNI.tunnel_free(handle)` releases the tunnel. The handle must not be
+used afterwards; passing 0 is a no-op.
+
+> **Note:** every JNI export is bound to the literal class name
+> `com.cloudflare.app.boringtun.BoringTunJNI` via `#[export_name]`. A consumer
+> shipping its own package must either keep that class name or patch the export
+> prefix in `boringtun/src/jni.rs`.
 
 ## Comparison with amneziawg-go
 

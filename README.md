@@ -95,6 +95,19 @@ let mut tunnel = Tunn::new_with_amnezia3(
 
 The library also exposes AmneziaWG through C bindings (`amnezia_config` and `amnezia3_config` structs, `new_tunnel_amnezia`, `new_tunnel_amnezia3`, `wireguard_poll_outgoing_packet`), declared in `boringtun/src/wireguard_ffi.h`. See [`AMNEZIA.md`](AMNEZIA.md) for the full C API reference.
 
+### JNI (Android)
+
+The `jni-bindings` feature exposes the same functionality to Android's `VpnService`. `new_tunnel_amnezia3` takes the AmneziaWG parameters as a single UAPI-style `key=value` block, so no per-field JNI signature is needed:
+
+```kotlin
+val handle = BoringTunJNI.new_tunnel_amnezia3(
+    secretKey, publicKey, presharedKey, keepAlive, index,
+    "s1=16\ns2=16\ns3=16\ns4=16\nh1=100-199\nh2=200-299\nh3=300-399\nh4=400-499\n",
+)
+```
+
+Drain `wireguard_poll_outgoing_packet` after creating the tunnel and after every write/tick, and release it with `tunnel_free`. See [`AMNEZIA.md`](AMNEZIA.md#jni-api-android).
+
 ### Further reading
 
 - [`AMNEZIA.md`](AMNEZIA.md) — wire format, implementation details, and comparison with amneziawg-go

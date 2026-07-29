@@ -80,6 +80,7 @@ noise/rate_limiter.rs — HeaderConfig for packet classification, cookie headers
 noise/timers.rs     — network_outgoing.clear() on reset, 3.0 randomized timings
 ffi/mod.rs          — C FFI: amnezia_config/amnezia3_config, new_tunnel_amnezia{,3}
 wireguard_ffi.h     — C declarations for both AWG surfaces
+jni.rs              — Android: new_tunnel_amnezia3, poll_outgoing_packet, tunnel_free
 ```
 
 ## Task: Rebase on Upstream Master
@@ -217,3 +218,9 @@ UAPI key names for the 3.0 parameters: `header_protection_key`,
 `content_padding_addition`, `rekey_after_time`, `rekey_timeout`,
 `reject_after_time`, `keepalive_timeout`, `max_handshake_attempts`, and the
 now-range-valued per-peer `persistent_keepalive_interval`.
+
+`Amnezia3Config::parse` accepts these same key names in a newline-separated
+`key=value` block, which is how the JNI surface is configured. It also accepts
+the 2.0 keys and a fork-specific `mtu`; unknown keys route through
+`Amnezia2Config::validate_field_name` so AmneziaWG 1.x fields still report as
+legacy.
