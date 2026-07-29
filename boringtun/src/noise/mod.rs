@@ -1622,14 +1622,14 @@ mod tests {
         // amneziawg-go drops payloads that are neither IPv4 nor IPv6, but still
         // counts them as data received.
         let mut dec_buf = vec![0u8; 2048];
-        let _ = their_tun.update_timers(&mut vec![0u8; 2048]);
+        // Pin the reference time so the tick is observable under the frozen
+        // `mock-instant` clock too.
+        let now = Duration::from_secs(42);
+        their_tun.timers[TimerName::TimeCurrent] = now;
         their_tun.timers[TimerName::TimeLastDataPacketReceived] = Duration::ZERO;
         let result = their_tun.decapsulate(None, &enc_buf[..wire_len], &mut dec_buf);
         assert!(matches!(result, TunnResult::Done));
-        assert_eq!(
-            their_tun.timers[TimerName::TimeLastDataPacketReceived],
-            their_tun.timers[TimerName::TimeCurrent]
-        );
+        assert_eq!(their_tun.timers[TimerName::TimeLastDataPacketReceived], now);
     }
 
     #[test]
@@ -1641,19 +1641,19 @@ mod tests {
         let resp = create_handshake_response(&mut their_tun, &init);
         let _ = parse_handshake_resp(&mut my_tun, &resp);
 
-        let mut buf = vec![0u8; 2048];
-        let _ = my_tun.update_timers(&mut buf);
-        assert!(my_tun.timers[TimerName::TimeCurrent] > Duration::ZERO);
-
+        // Pin the reference time rather than reading the clock: under the
+        // `mock-instant` feature it is frozen at zero, which would make the
+        // assertion below vacuous.
+        let now = Duration::from_secs(42);
+        my_tun.timers[TimerName::TimeCurrent] = now;
         my_tun.timers[TimerName::TimeLastDataPacketSent] = Duration::ZERO;
+
+        let mut buf = vec![0u8; 2048];
         match my_tun.encapsulate(&[], &mut buf) {
             TunnResult::WriteToNetwork(_) => {}
             other => panic!("expected WriteToNetwork, got {:?}", other),
         }
-        assert_eq!(
-            my_tun.timers[TimerName::TimeLastDataPacketSent],
-            my_tun.timers[TimerName::TimeCurrent]
-        );
+        assert_eq!(my_tun.timers[TimerName::TimeLastDataPacketSent], now);
     }
 
     #[test]
@@ -1663,9 +1663,12 @@ mod tests {
         let resp = create_handshake_response(&mut their_tun, &init);
         let _ = parse_handshake_resp(&mut my_tun, &resp);
 
-        let mut buf = vec![0u8; 2048];
-        let _ = my_tun.update_timers(&mut buf);
+        // A non-zero reference time makes "stayed at zero" a real assertion
+        // under both the real and the mocked clock.
+        my_tun.timers[TimerName::TimeCurrent] = Duration::from_secs(42);
         my_tun.timers[TimerName::TimeLastDataPacketSent] = Duration::ZERO;
+
+        let mut buf = vec![0u8; 2048];
         match my_tun.encapsulate(&[], &mut buf) {
             TunnResult::WriteToNetwork(packet) => assert_eq!(packet.len(), KEEPALIVE_SZ),
             other => panic!("expected WriteToNetwork, got {:?}", other),
