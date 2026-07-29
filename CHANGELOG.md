@@ -19,6 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - C FFI: a zeroed `amnezia_config` was rejected instead of yielding standard WireGuard behavior, because the all-zero H1-H4 fields were read as four overlapping ranges
 - Range generation no longer overflows for a range covering the whole `u32` space
+- Junk packet sizes are drawn from the half-open range `[Jmin, Jmax)`, matching amneziawg-go's `min + fastrandn(max - min)`. Previously `Jmax` itself could be produced.
+- `Amnezia3Config::validate` now rejects inverted content-padding and timing ranges, which a public struct literal could construct while bypassing `U32Range::new`
 
 ## [0.7.1] - 2026-05-01
 

@@ -560,13 +560,22 @@ impl JunkConfig {
 
     /// Generate junk packets as a `Vec` of random byte buffers.
     /// Returns an empty vec if junk is disabled.
+    ///
+    /// Sizes are drawn from `[min_size, max_size)` — half-open, matching
+    /// amneziawg-go's `min + fastrandn(max - min)`. When `min_size` equals
+    /// `max_size` every packet is exactly that size, as in Go where
+    /// `fastrandn(0)` yields 0.
     pub fn generate_junk_packets(&self, rng: &mut dyn RandomSource) -> Vec<Vec<u8>> {
         if self.count == 0 {
             return Vec::new();
         }
         let mut packets = Vec::with_capacity(self.count as usize);
         for _ in 0..self.count {
-            let size = rng.gen_range_u16(self.min_size, self.max_size) as usize;
+            let size = if self.max_size <= self.min_size {
+                self.min_size
+            } else {
+                rng.gen_range_u16(self.min_size, self.max_size - 1)
+            } as usize;
             let mut buf = vec![0u8; size];
             rng.fill_bytes(&mut buf);
             packets.push(buf);
@@ -1727,12 +1736,30 @@ mod tests {
         let packets = config.generate_junk_packets(&mut rng);
         assert_eq!(packets.len(), 3);
         for pkt in &packets {
+            // Half-open [64, 128), matching amneziawg-go's JunkPackets.
             assert!(
-                pkt.len() >= 64 && pkt.len() <= 128,
+                pkt.len() >= 64 && pkt.len() < 128,
                 "size {} out of range",
                 pkt.len()
             );
         }
+    }
+
+    #[test]
+    fn junk_size_upper_bound_is_exclusive() {
+        // amneziawg-go draws `min + fastrandn(max - min)`, so `max` itself is
+        // never produced. With a two-value span every packet must be `min`
+        // or `min + 1`, and over many draws both must appear.
+        let config = JunkConfig::new(10, 64, 66).unwrap();
+        let mut sizes = std::collections::HashSet::new();
+        for seed in 0..32u8 {
+            let mut rng = DetRng::new(seed);
+            for pkt in config.generate_junk_packets(&mut rng) {
+                assert!(pkt.len() == 64 || pkt.len() == 65, "size {}", pkt.len());
+                sizes.insert(pkt.len());
+            }
+        }
+        assert_eq!(sizes.len(), 2, "both sizes in [64, 66) should occur");
     }
 
     #[test]
