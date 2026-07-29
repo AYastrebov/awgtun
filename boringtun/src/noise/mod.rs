@@ -1574,6 +1574,216 @@ mod tests {
         ));
     }
 
+    fn create_ipv6_udp_packet() -> Vec<u8> {
+        let header = etherparse::PacketBuilder::ipv6(
+            [0x20, 1, 0xd, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            [0x20, 1, 0xd, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+            5,
+        )
+        .udp(5678, 23);
+        let payload = [0, 1, 2, 3];
+        let mut packet = Vec::<u8>::with_capacity(header.size(payload.len()));
+        header.write(&mut packet, &payload).expect("valid packet");
+        packet
+    }
+
+    #[test]
+    fn awg3_cookie_reply_is_padded_and_header_protected() {
+        // A zero-limit rate limiter reports "under load" on the first packet,
+        // which is the only path that emits a cookie reply.
+        let key = [0x42u8; 32];
+        let my_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let my_public_key = x25519_dalek::PublicKey::from(&my_secret_key);
+        let their_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let their_public_key = x25519_dalek::PublicKey::from(&their_secret_key);
+
+        let mut my_tun = Tunn::new_with_amnezia3(
+            my_secret_key,
+            their_public_key,
+            None,
+            None,
+            1,
+            None,
+            awg3_test_config(key),
+        )
+        .expect("valid awg3 config");
+        let mut their_tun = Tunn::new_with_amnezia3(
+            their_secret_key,
+            my_public_key,
+            None,
+            None,
+            2,
+            Some(Arc::new(RateLimiter::new(&their_public_key, 0))),
+            awg3_test_config(key),
+        )
+        .expect("valid awg3 config");
+
+        let init = create_handshake_init(&mut my_tun);
+        let mut dst = vec![0u8; 2048];
+        let cookie = match their_tun.decapsulate(
+            Some(std::net::IpAddr::from([1, 2, 3, 4])),
+            &init,
+            &mut dst,
+        ) {
+            TunnResult::WriteToNetwork(packet) => packet.to_vec(),
+            other => panic!("expected a cookie reply, got {:?}", other),
+        };
+
+        // S3 (16) + the 64-byte reply, with the reply header-protected.
+        assert_eq!(cookie.len(), 16 + COOKIE_REPLY_SZ);
+        let decrypted = go_style_decrypt(&key, &cookie, 16, COOKIE_REPLY_SZ);
+        let plain_type = u32::from_le_bytes(decrypted[..4].try_into().expect("4 bytes"));
+        assert!((300..=399).contains(&plain_type), "H3 type {}", plain_type);
+        assert_ne!(&decrypted[..4], &cookie[16..20]);
+
+        // The initiator consumes it and can then produce a cookie-bearing init.
+        let mut my_dst = vec![0u8; 2048];
+        assert!(matches!(
+            my_tun.decapsulate(None, &cookie, &mut my_dst),
+            TunnResult::Done
+        ));
+        assert!(my_tun.handshake.has_cookie());
+    }
+
+    #[test]
+    fn awg3_without_header_protection_interoperates_with_awg2() {
+        // The spec's compatibility claim: a 3.0 config with the 3.0 features
+        // off is wire-identical to the equivalent 2.0 config.
+        let headers = HeaderConfig::new(
+            HeaderRange::new(100, 199).expect("valid range"),
+            HeaderRange::new(200, 299).expect("valid range"),
+            HeaderRange::new(300, 399).expect("valid range"),
+            HeaderRange::new(400, 499).expect("valid range"),
+        )
+        .expect("valid headers");
+        let paddings = PaddingConfig::new(8, 8, 8, 8).expect("valid paddings");
+
+        let v2 = Amnezia2Config {
+            junk: JunkConfig::disabled(),
+            paddings,
+            headers: headers.clone(),
+            init_packets: InitPacketConfig::default(),
+        };
+        let mut v3 = Amnezia3Config::from_amnezia2(v2.clone());
+        v3.timing_ranges = crate::amnezia::TimingRanges {
+            rekey_timeout: U32Range::new(3, 9).expect("valid range"),
+            ..Default::default()
+        };
+        assert_eq!(v3.header_protection_key, None);
+
+        let my_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let my_public_key = x25519_dalek::PublicKey::from(&my_secret_key);
+        let their_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let their_public_key = x25519_dalek::PublicKey::from(&their_secret_key);
+
+        // 3.0 initiator, 2.0 responder.
+        let mut my_tun =
+            Tunn::new_with_amnezia3(my_secret_key, their_public_key, None, None, 1, None, v3)
+                .expect("valid awg3 config");
+        let mut their_tun =
+            Tunn::new_with_amnezia(their_secret_key, my_public_key, None, None, 2, None, v2)
+                .expect("valid awg2 config");
+
+        let init = create_handshake_init(&mut my_tun);
+        assert_eq!(init.len(), 8 + HANDSHAKE_INIT_SZ);
+        let resp = create_handshake_response(&mut their_tun, &init);
+        let keepalive = parse_handshake_resp(&mut my_tun, &resp);
+        parse_keepalive(&mut their_tun, &keepalive);
+
+        // Data flows both ways across the version boundary.
+        send_ipv4_packet(&mut my_tun, &mut their_tun);
+        send_ipv4_packet(&mut their_tun, &mut my_tun);
+    }
+
+    /// Send one IPv4 packet through `sender` and assert `receiver` recovers it.
+    fn send_ipv4_packet(sender: &mut Tunn, receiver: &mut Tunn) {
+        let ip = create_ipv4_udp_packet();
+        let mut enc = vec![0u8; 2048];
+        let wire = match sender.encapsulate(&ip, &mut enc) {
+            TunnResult::WriteToNetwork(packet) => packet.to_vec(),
+            other => panic!("expected WriteToNetwork, got {:?}", other),
+        };
+        let mut dec = vec![0u8; 2048];
+        match receiver.decapsulate(None, &wire, &mut dec) {
+            TunnResult::WriteToTunnelV4(packet, _) => assert_eq!(packet, &ip[..]),
+            other => panic!("expected WriteToTunnelV4, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn awg3_data_flows_in_both_directions() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_awg3();
+        complete_awg3_handshake(&mut my_tun, &mut their_tun);
+
+        // Responder to initiator, the direction the other AWG 3.0 tests skip.
+        send_ipv4_packet(&mut their_tun, &mut my_tun);
+        send_ipv4_packet(&mut my_tun, &mut their_tun);
+    }
+
+    #[test]
+    fn awg3_content_padding_trims_from_ipv6_packets() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_awg3_cpa(24, 24);
+        complete_awg3_handshake(&mut my_tun, &mut their_tun);
+
+        // IPv6 trimming reads a different length field at a different offset
+        // than IPv4, so it needs its own coverage.
+        let ip = create_ipv6_udp_packet();
+        let mut enc = vec![0u8; 2048];
+        let wire_len = match my_tun.encapsulate(&ip, &mut enc) {
+            TunnResult::WriteToNetwork(packet) => packet.len(),
+            other => panic!("expected WriteToNetwork, got {:?}", other),
+        };
+        assert_eq!(wire_len, 16 + 16 + ip.len() + 24 + 16);
+
+        let mut dec = vec![0u8; 2048];
+        match their_tun.decapsulate(None, &enc[..wire_len], &mut dec) {
+            TunnResult::WriteToTunnelV6(packet, _) => assert_eq!(packet, &ip[..]),
+            other => panic!("expected WriteToTunnelV6, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn awg3_content_padding_wraps_packets_larger_than_the_mtu() {
+        // packet_size > mtu takes the modulo branch; without it the clamp would
+        // underflow. mtu 100, payload 250 -> last unit 50, space 50.
+        let (mut my_tun, mut their_tun) = create_two_tuns_awg3_cpa(80, 80);
+        my_tun.mtu = 100;
+        complete_awg3_handshake(&mut my_tun, &mut their_tun);
+
+        let mut ip = ipv4_packet();
+        ip.resize(250, 0);
+        ip[2..4].copy_from_slice(&250u16.to_be_bytes());
+
+        let mut enc = vec![0u8; 2048];
+        let wire_len = match my_tun.encapsulate(&ip, &mut enc) {
+            TunnResult::WriteToNetwork(packet) => packet.len(),
+            other => panic!("expected WriteToNetwork, got {:?}", other),
+        };
+        assert_eq!(wire_len, 16 + 16 + 250 + 50 + 16);
+
+        let mut dec = vec![0u8; 2048];
+        match their_tun.decapsulate(None, &enc[..wire_len], &mut dec) {
+            TunnResult::WriteToTunnelV4(packet, _) => assert_eq!(packet, &ip[..]),
+            other => panic!("expected WriteToTunnelV4, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn awg3_zero_mtu_disables_the_segment_clamp() {
+        // amneziawg-go skips the clamp when the device MTU is 0; so do we.
+        let (mut my_tun, mut their_tun) = create_two_tuns_awg3_cpa(300, 300);
+        my_tun.mtu = 0;
+        complete_awg3_handshake(&mut my_tun, &mut their_tun);
+
+        let ip = ipv4_packet();
+        let mut enc = vec![0u8; 2048];
+        let wire_len = match my_tun.encapsulate(&ip, &mut enc) {
+            TunnResult::WriteToNetwork(packet) => packet.len(),
+            other => panic!("expected WriteToNetwork, got {:?}", other),
+        };
+        assert_eq!(wire_len, 16 + 16 + ip.len() + 300 + 16);
+    }
+
     #[test]
     fn awg3_keepalive_has_s4_prefix() {
         let (mut my_tun, mut their_tun) = create_two_tuns_awg3();
