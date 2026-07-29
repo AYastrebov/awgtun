@@ -267,6 +267,9 @@ With AmneziaWG padding active, output buffers must be larger:
 - Handshake initiation: `148 + S1` bytes
 - Handshake response: `92 + S2` bytes
 - Transport data: `payload.len() + 32 + S4` bytes, plus the upper bound of the content padding range when it is configured
+- `update_timers()` / `wireguard_tick()`: the larger of a handshake initiation (`148 + S1`) and a keepalive (`32 + S4` plus the content padding bound)
+
+Content padding makes the keepalive case dominate: with `mtu = 1420`, `S4 = 16` and a padding range topping out at 500, a keepalive is 548 bytes — well past the 164 a handshake initiation needs. Size the tick buffer for the keepalive case whenever content padding is enabled, or `format_packet_data` will panic.
 
 ## C FFI API
 
@@ -348,6 +351,7 @@ size_t wireguard_poll_outgoing_packet(
 | Handshake give-up bound | Attempt count | Time (`timeout * attempts`) | Equivalent for default ranges |
 | Retransmit timer jitter | 0-334 ms (`RekeyTimeoutJitterMaxMs`) | None | **Differs** |
 | Persistent keepalive re-arm | Every authenticated packet traversal | On fire only | **Differs** |
+| IP total-length lower bound | Rejects `< 20` (IPv4 header) | Only an upper bound is checked | **Differs** |
 | Minimum spacing between initiations | `Lo(rekey_timeout)` | Structural (`is_in_progress`) | Functionally equivalent |
 
 ### Architectural Differences
@@ -409,4 +413,6 @@ With header protection enabled the incoming datagram cannot be decrypted in plac
 
 8. **No retransmit jitter**: amneziawg-go adds a random 0-334 ms (`RekeyTimeoutJitterMaxMs`) to the handshake retransmit and new-handshake timers, as stock wireguard-go does. boringtun has never added this jitter and AWG 3.0 does not change that. The `rekey_timeout` range supplies coarser randomization at second granularity, so retransmit timing is still randomized — just quantized to whole seconds rather than milliseconds.
 
-9. **Persistent keepalive re-arms on fire, not on traffic**: in amneziawg-go, `timersAnyAuthenticatedPacketTraversal` re-arms the persistent-keepalive timer with a fresh range pick after *every* authenticated packet sent or received, so a new interval is drawn constantly and keepalives only fire when the link is idle. boringtun's timer is not reset by other traffic — it fires on a fixed cadence from the last keepalive — so a new interval is drawn only when one fires. This follows from pre-existing boringtun timer behavior rather than the AWG 3.0 work; aligning it would change standard WireGuard behavior too.
+9. **No lower bound on the decapsulated IP total-length field**: amneziawg-go drops a packet whose declared length is below the IP header size (`int(length) < ipv4.HeaderLen`); `validate_decapsulated_packet` checks only that the declared length does not exceed the buffer. A peer that declares a total length under 20 therefore yields a truncated slice to the caller rather than being dropped. Reaching this requires an already-authenticated peer — the payload has passed AEAD verification — so it is a hostile-peer concern, not a network-attacker one. It predates the AWG work and is inherited from upstream boringtun.
+
+10. **Persistent keepalive re-arms on fire, not on traffic**: in amneziawg-go, `timersAnyAuthenticatedPacketTraversal` re-arms the persistent-keepalive timer with a fresh range pick after *every* authenticated packet sent or received, so a new interval is drawn constantly and keepalives only fire when the link is idle. boringtun's timer is not reset by other traffic — it fires on a fixed cadence from the last keepalive — so a new interval is drawn only when one fires. This follows from pre-existing boringtun timer behavior rather than the AWG 3.0 work; aligning it would change standard WireGuard behavior too.
