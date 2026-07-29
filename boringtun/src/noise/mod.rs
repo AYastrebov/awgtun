@@ -863,6 +863,16 @@ impl Tunn {
             ),
         ];
 
+        // Every candidate shares the same nonce — the first 12 bytes of the
+        // datagram — so the type keystream is derived once, as in
+        // amneziawg-go's `typeHash`.
+        let type_mask = match self.header_protection {
+            Some(hp) if src.len() >= crate::amnezia::HEADER_PROTECTION_NONCE_SIZE => {
+                Some(hp.type_mask(src))
+            }
+            _ => None,
+        };
+
         for &(padding, header_range, expected_size, exact) in &checks {
             let size_ok = if exact {
                 src.len() == padding + expected_size
@@ -871,13 +881,15 @@ impl Tunn {
             };
 
             if size_ok && padding + 4 <= src.len() {
-                let type_bytes: [u8; 4] = src[padding..padding + 4]
+                let mut type_bytes: [u8; 4] = src[padding..padding + 4]
                     .try_into()
                     .expect("bounds checked: padding + 4 <= src.len()");
-                let header = match self.header_protection {
-                    Some(hp) => hp.peek_type(&src[..padding], type_bytes),
-                    None => u32::from_le_bytes(type_bytes),
-                };
+                if let Some(mask) = type_mask {
+                    for (byte, mask_byte) in type_bytes.iter_mut().zip(mask.iter()) {
+                        *byte ^= mask_byte;
+                    }
+                }
+                let header = u32::from_le_bytes(type_bytes);
                 if header_range.contains(header) {
                     let protected_len = if exact {
                         expected_size

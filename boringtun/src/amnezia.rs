@@ -1145,6 +1145,16 @@ impl HeaderProtection {
         self.apply(prefix, &mut buf);
         u32::from_le_bytes(buf)
     }
+
+    /// Keystream bytes `0..4` for `prefix`. Every candidate message type in a
+    /// datagram shares the same nonce, so a receiver derives this mask once and
+    /// XORs it against each candidate instead of rebuilding the cipher.
+    /// Mirrors amneziawg-go's `typeHash`.
+    pub fn type_mask(&self, prefix: &[u8]) -> [u8; 4] {
+        let mut mask = [0u8; 4];
+        self.apply(prefix, &mut mask);
+        mask
+    }
 }
 
 // ---------------------------------------------------------------------------
