@@ -416,15 +416,43 @@ impl Tunn {
         // Strip AmneziaWG padding before parsing; with AWG 3.0 header
         // protection, decrypt the protected region first.
         let (padding, protected_len) = self.determine_padding(datagram).unwrap_or((0, 0));
-        let mut decrypted;
+        let payload = &datagram[padding..];
+
+        // Transport packets protect only the 16-byte header, so the message is
+        // never contiguous after decryption. Decrypt the header on the stack and
+        // assemble the packet directly — `verify_packet` neither MACs nor rate
+        // limits transport packets, and `determine_padding` already matched the
+        // type against H4 and checked the minimum size.
+        if let Some(hp) = self.header_protection {
+            if protected_len == TRANSPORT_HEADER_SZ {
+                let mut header = [0u8; TRANSPORT_HEADER_SZ];
+                header.copy_from_slice(&payload[..TRANSPORT_HEADER_SZ]);
+                hp.apply(&datagram[..padding], &mut header);
+                let packet = Packet::PacketData(PacketData {
+                    receiver_idx: u32::from_le_bytes(
+                        header[4..8].try_into().expect("fixed 16-byte header"),
+                    ),
+                    counter: u64::from_le_bytes(
+                        header[8..16].try_into().expect("fixed 16-byte header"),
+                    ),
+                    encrypted_encapsulated_packet: &payload[TRANSPORT_HEADER_SZ..],
+                });
+                return self.handle_verified_packet(packet, dst);
+            }
+        }
+
+        // Handshake, response and cookie messages are protected in full and have
+        // a fixed size bounded by `HANDSHAKE_INIT_SZ`, so a stack buffer holds
+        // the decrypted message without allocating.
+        let mut decrypted = [0u8; HANDSHAKE_INIT_SZ];
         let stripped: &[u8] = match self.header_protection {
             Some(hp) if protected_len > 0 => {
-                decrypted = datagram[padding..].to_vec();
-                let protected = protected_len.min(decrypted.len());
+                let protected = protected_len.min(payload.len());
+                decrypted[..protected].copy_from_slice(&payload[..protected]);
                 hp.apply(&datagram[..padding], &mut decrypted[..protected]);
-                &decrypted
+                &decrypted[..protected]
             }
-            _ => &datagram[padding..],
+            _ => payload,
         };
 
         let mut cookie = [0u8; COOKIE_REPLY_SZ];
