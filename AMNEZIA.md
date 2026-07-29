@@ -41,8 +41,8 @@ AmneziaWG 3.0 adds three more layers on top, described in [AmneziaWG 3.0](#amnez
 | S3 | u8 | 0-64 | Cookie padding bytes |
 | S4 | u8 | 0-32 | Transport padding bytes |
 | Jc | u8 | 0-10 | Junk packet count (0 = disabled) |
-| Jmin | u16 | 64-1024 | Minimum junk size |
-| Jmax | u16 | 64-1024 | Maximum junk size |
+| Jmin | u16 | 64-1024 | Minimum junk size (inclusive) |
+| Jmax | u16 | 64-1024 | Maximum junk size (exclusive, as in amneziawg-go) |
 | I1-I5 | CPS string | See below | Init packet chain specs |
 
 ### CPS Chain Format
@@ -332,6 +332,7 @@ size_t wireguard_poll_outgoing_packet(
 | S4 on keepalive | Applied (`elem.padding` set for every element) | Applied | Exact |
 | "Data sent" classification | `len(packet) != MessageKeepaliveSize` | `packet.len() != 32` | Exact |
 | I-packets/junk on retry | Every attempt | Every attempt | Exact |
+| Junk size distribution | `min + fastrandn(max - min)`, half-open | Half-open `[Jmin, Jmax)` | Exact |
 | Header byte order | Little-endian u32 | Little-endian u32 | Exact |
 | Packet classification | `DeterminePacketTypeAndPadding` | `determine_padding()` | Functionally equivalent |
 | CPS tags | b, t, r, rc, rd, d, ds, dz | Same set | Exact |
@@ -345,6 +346,8 @@ size_t wireguard_poll_outgoing_packet(
 | Timing range pick rules | Per-arm (see table above) | Same | Exact |
 | Content padded to multiple of 16 | Yes, when CPA is unset | **No** (never has been) | **Differs** |
 | Handshake give-up bound | Attempt count | Time (`timeout * attempts`) | Equivalent for default ranges |
+| Retransmit timer jitter | 0-334 ms (`RekeyTimeoutJitterMaxMs`) | None | **Differs** |
+| Persistent keepalive re-arm | Every authenticated packet traversal | On fire only | **Differs** |
 | Minimum spacing between initiations | `Lo(rekey_timeout)` | Structural (`is_in_progress`) | Functionally equivalent |
 
 ### Architectural Differences
@@ -403,3 +406,7 @@ With header protection enabled the incoming datagram cannot be decrypted in plac
 6. **No 16-byte content alignment**: boringtun has never padded transport content to a multiple of 16, and AWG 3.0 does not change that. amneziawg-go does so whenever content padding is unset, so wire sizes differ from the Go implementation in that configuration — an observable fingerprint difference, though not an interop failure. With content padding configured, upstream skips the alignment too and the implementations agree.
 
 7. **Timing randomization is per-tunnel**: amneziawg-go stores timing ranges on the device and the persistent-keepalive range on the peer. Here everything lives on `Tunn`, so each tunnel picks independently.
+
+8. **No retransmit jitter**: amneziawg-go adds a random 0-334 ms (`RekeyTimeoutJitterMaxMs`) to the handshake retransmit and new-handshake timers, as stock wireguard-go does. boringtun has never added this jitter and AWG 3.0 does not change that. The `rekey_timeout` range supplies coarser randomization at second granularity, so retransmit timing is still randomized — just quantized to whole seconds rather than milliseconds.
+
+9. **Persistent keepalive re-arms on fire, not on traffic**: in amneziawg-go, `timersAnyAuthenticatedPacketTraversal` re-arms the persistent-keepalive timer with a fresh range pick after *every* authenticated packet sent or received, so a new interval is drawn constantly and keepalives only fire when the link is idle. boringtun's timer is not reset by other traffic — it fires on a fixed cadence from the last keepalive — so a new interval is drawn only when one fires. This follows from pre-existing boringtun timer behavior rather than the AWG 3.0 work; aligning it would change standard WireGuard behavior too.
