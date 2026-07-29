@@ -1,11 +1,12 @@
-# AmneziaWG 2.0 Implementation Details
+# AmneziaWG Implementation Details
 
-This document describes the AmneziaWG 2.0 protocol implementation in this boringtun fork, how it maps to the [amneziawg-go](https://github.com/amnezia-vpn/amneziawg-go) reference, and where the two implementations differ.
+This document describes the AmneziaWG 2.0 and 3.0 protocol implementation in this boringtun fork, how it maps to the [amneziawg-go](https://github.com/amnezia-vpn/amneziawg-go) reference, and where the two implementations differ.
 
 ## Table of Contents
 
 - [Protocol Overview](#protocol-overview)
 - [Configuration Parameters](#configuration-parameters)
+- [AmneziaWG 3.0](#amneziawg-30)
 - [Packet Layout](#packet-layout)
 - [Implementation Architecture](#implementation-architecture)
 - [File-by-File Changes](#file-by-file-changes)
@@ -24,6 +25,8 @@ AmneziaWG 2.0 adds four obfuscation layers on top of standard WireGuard:
 4. **Init packets (I1-I5):** Send CPS (Custom Packet Signature) datagrams before handshake for protocol camouflage.
 
 All four layers are independent and can be enabled selectively. When all parameters are zero/default, the tunnel behaves as standard WireGuard.
+
+AmneziaWG 3.0 adds three more layers on top, described in [AmneziaWG 3.0](#amneziawg-30): header protection, content padding, and randomized timings. There is no wire-level version negotiation — behavior is entirely config-driven, and a 3.0 tunnel with the 3.0 parameters unset is byte-identical to a 2.0 tunnel.
 
 ## Configuration Parameters
 
@@ -65,6 +68,60 @@ For I1-I5 init packets, source data is always empty (`<d>`, `<ds>`, `<dz>` produ
 - When any AWG feature is active, header values must not be 1, 2, 3, or 4 (standard WireGuard types).
 - If I1 is absent, I2-I5 must also be absent. No gaps allowed (I1, I3 without I2 is invalid).
 - Jmin must not exceed Jmax.
+
+## AmneziaWG 3.0
+
+Reference: amneziawg-go @ `d57d98d`. Configure with `Amnezia3Config` and `Tunn::new_with_amnezia3`.
+
+### Header protection
+
+Raw, unauthenticated ChaCha20 (32-byte key, 12-byte nonce, block counter 0) over the low-entropy header fields of every datagram. The nonce is the **first 12 bytes of the random padding prefix**, which is why enabling header protection requires S1-S4 to all be at least 12.
+
+Note that the AmneziaWG README says the minimum is 8; the code (`uapi.go`, `HeaderCipherNonceSize`) enforces 12. We follow the code.
+
+| Message | Encrypted span |
+|---------|----------------|
+| Handshake initiation | 148 bytes (whole message) |
+| Handshake response | 92 bytes (whole message) |
+| Cookie reply | 64 bytes (whole message) |
+| Transport | first 16 bytes (type, receiver index, counter) — the AEAD ciphertext is untouched |
+
+Ordering matters: MAC1/MAC2 are computed over the plaintext message, then the message including its MACs is encrypted. On the wire the MACs are not recognizable to a DPI system. The receiver reverses this before any MAC check, so the Noise core is unchanged.
+
+I1-I5 signature packets and Jc junk packets are never header-protected.
+
+On receive, the 4-byte type field of each candidate message type is decrypted and tested against the corresponding H range. All candidates share one nonce, so the mask is derived once per datagram (`typeHash` in the Go reference).
+
+An all-zero key means "disabled", matching `HeaderProtectionCipher`'s `key.IsZero()` check. The Rust API models this as `Option<[u8; 32]>` and the FFI accepts either NULL or an all-zero key.
+
+### Content padding (`content_padding_addition`)
+
+A random number of zero bytes, picked per packet from the configured range, appended to the transport content **inside** the AEAD envelope. Because the padding is authenticated, no length field is needed: the receiver trims it using the IP total-length field and needs no configuration of its own.
+
+The addition is clamped to the space left in the last MTU segment: `add = min(add, mtu - packet_size % mtu)`. `Tunn` has no MTU concept of its own, so the MTU used for clamping is an `Amnezia3Config` field (default 1420, matching the Go device default).
+
+Keepalives are padded too. Since amneziawg-go classifies an outbound packet as "data sent" by comparing its wire size against the unpadded 32-byte keepalive, a padded keepalive counts as data and arms the new-handshake timer. This fork replicates that, and it applies to a non-zero S4 as well as to content padding.
+
+A padded keepalive decrypts to all zeros, which is neither IPv4 nor IPv6. Such payloads are dropped silently and counted as data received, as in the Go sequential receiver.
+
+### Randomized timings
+
+The WireGuard timing constants become inclusive ranges; an unset (all-zero) range falls back to the classic constant, so a default `TimingRanges` preserves stock behavior exactly.
+
+| WireGuard constant | Range | Pick rule |
+|---|---|---|
+| `REKEY_TIMEOUT` (5 s), retransmit | `rekey_timeout` | fresh pick per initiation, retries included |
+| `KEEPALIVE_TIMEOUT` (10 s) | `keepalive_timeout` | fresh pick per check |
+| `KEEPALIVE_TIMEOUT + REKEY_TIMEOUT`, new-handshake | keepalive + rekey | `Hi`(keepalive) + pick(rekey) |
+| `REKEY_AFTER_TIME` (120 s), initiator rekey | `rekey_after_time` | fresh pick per check |
+| `REJECT_AFTER_TIME - KEEPALIVE_TIMEOUT - REKEY_TIMEOUT`, receiver rekey | reject / keepalive / rekey | pick(reject) - `Lo`(keepalive) - `Lo`(rekey) |
+| `REJECT_AFTER_TIME` (180 s), keypair expiry | `reject_after_time` | `Hi` |
+| `MaxTimerHandshakes` (18) | `max_handshake_attempts` | pick per new handshake |
+| Persistent keepalive | `persistent_keepalive` | fresh pick on every fire |
+
+amneziawg-go gives up on a handshake after a **count** of attempts; boringtun bounds retries by time (`REKEY_ATTEMPT_TIME`). The two are expressed here as `rekey_timeout * max_handshake_attempts`, which for default ranges is exactly the classic 90 s.
+
+Go also uses `Lo(rekey_timeout)` as the minimum spacing between initiations (`rekeyMinTimeout`). boringtun has no equivalent — it suppresses duplicate initiations structurally, via `is_in_progress()`.
 
 ## Packet Layout
 
@@ -173,6 +230,22 @@ let config = Amnezia2Config {
 let tunnel = Tunn::new_with_amnezia(
     private_key, peer_public, None, Some(25), index, None, config,
 )?; // Returns Result<Tunn, ConfigError>
+
+// AmneziaWG 3.0: the 2.0 blocks plus header protection, content padding
+// and randomized timings.
+let mut config = Amnezia3Config::from_amnezia2(config);
+config.header_protection_key = Some(header_key); // requires S1-S4 >= 12
+config.content_padding_addition = Some(U32Range::new(1, 64)?);
+config.timing_ranges = TimingRanges {
+    rekey_timeout: U32Range::new(3, 9)?,
+    keepalive_timeout: U32Range::new(8, 15)?,
+    ..TimingRanges::default()   // unset ranges keep the WireGuard constants
+};
+config.mtu = 1420;              // used only to clamp content padding
+
+let tunnel = Tunn::new_with_amnezia3(
+    private_key, peer_public, None, Some(25), index, None, config,
+)?;
 ```
 
 ### Sending Pre-Handshake Packets
@@ -193,7 +266,7 @@ With AmneziaWG padding active, output buffers must be larger:
 
 - Handshake initiation: `148 + S1` bytes
 - Handshake response: `92 + S2` bytes
-- Transport data: `payload.len() + 32 + S4` bytes
+- Transport data: `payload.len() + 32 + S4` bytes, plus the upper bound of the content padding range when it is configured
 
 ## C FFI API
 
@@ -210,16 +283,37 @@ typedef struct {
     uint16_t jmin, jmax;        // Junk size range
     const char *i1, *i2, *i3, *i4, *i5;  // CPS chains (NULL to skip)
 } amnezia_config;
+
+typedef struct {
+    amnezia_config base;                 // all 2.0 parameters
+    const uint8_t *header_protection_key; // 32 bytes; NULL or all-zero = off
+    uint32_t content_padding_min, content_padding_max;
+    uint32_t rekey_after_time_min, rekey_after_time_max;            // seconds
+    uint32_t rekey_timeout_min, rekey_timeout_max;                  // seconds
+    uint32_t reject_after_time_min, reject_after_time_max;          // seconds
+    uint32_t keepalive_timeout_min, keepalive_timeout_max;          // seconds
+    uint32_t max_handshake_attempts_min, max_handshake_attempts_max; // count
+    uint32_t persistent_keepalive_min, persistent_keepalive_max;    // seconds
+    uint32_t mtu;                        // 0 selects the default (1420)
+} amnezia3_config;
 ```
+
+Every `*_min`/`*_max` pair is inclusive; a pair of zeros means "unset" and falls back to the WireGuard default. Zeroing the whole struct yields standard WireGuard behavior. The declarations live in `boringtun/src/wireguard_ffi.h`.
 
 ### Functions
 
 ```c
-// Create tunnel with AWG config (NULL config = standard WireGuard)
+// Create tunnel with AWG 2.0 config (NULL config = standard WireGuard)
 void* new_tunnel_amnezia(
     const char *private_key, const char *public_key,
     const char *preshared_key, uint16_t keep_alive,
     uint32_t index, const amnezia_config *config);
+
+// Create tunnel with AWG 3.0 config (NULL config = standard WireGuard)
+void* new_tunnel_amnezia3(
+    const char *private_key, const char *public_key,
+    const char *preshared_key, uint16_t keep_alive,
+    uint32_t index, const amnezia3_config *config);
 
 // Drain pre-handshake packets (call in loop until returns 0)
 size_t wireguard_poll_outgoing_packet(
@@ -235,12 +329,23 @@ size_t wireguard_poll_outgoing_packet(
 | Dynamic header before MAC | Yes | Yes | Exact |
 | Padding after MAC | Always prepended | Always prepended | Exact |
 | Send order (I→Junk→Init) | Atomic `SendBuffers` | Separate queue + drain | Functionally equivalent |
-| S4 skip for keepalive | `len != keepaliveSize` | `src.is_empty()` | Equivalent |
+| S4 on keepalive | Applied (`elem.padding` set for every element) | Applied | Exact |
+| "Data sent" classification | `len(packet) != MessageKeepaliveSize` | `packet.len() != 32` | Exact |
 | I-packets/junk on retry | Every attempt | Every attempt | Exact |
 | Header byte order | Little-endian u32 | Little-endian u32 | Exact |
 | Packet classification | `DeterminePacketTypeAndPadding` | `determine_padding()` | Functionally equivalent |
 | CPS tags | b, t, r, rc, rd, d, ds, dz | Same set | Exact |
 | Transport header for keepalive | Same as data (H4) | Same as data (H4) | Exact |
+| Header protection primitive | Raw ChaCha20, nonce = prefix[..12] | Same | Exact |
+| Header protection spans | 148 / 92 / 64 / 16 | Same | Exact |
+| MACs before encryption | Yes | Yes | Exact |
+| All-zero header key = off | Yes | Yes (`Option`/NULL/all-zero) | Exact |
+| Content padding inside AEAD | Yes, clamped to MTU segment | Same | Exact |
+| Non-IP payload on receive | Dropped, counted as data received | Same | Exact |
+| Timing range pick rules | Per-arm (see table above) | Same | Exact |
+| Content padded to multiple of 16 | Yes, when CPA is unset | **No** (never has been) | **Differs** |
+| Handshake give-up bound | Attempt count | Time (`timeout * attempts`) | Equivalent for default ranges |
+| Minimum spacing between initiations | `Lo(rekey_timeout)` | Structural (`is_in_progress`) | Functionally equivalent |
 
 ### Architectural Differences
 
@@ -275,6 +380,8 @@ if let TunnResult::WriteToNetwork(init) = result {
 
 The Go implementation strips padding by copying data in-place (`copy(packet, packet[padding:])`). Our implementation uses a zero-copy slice (`&datagram[padding..]`), which is more efficient.
 
+With header protection enabled the incoming datagram cannot be decrypted in place, since `decapsulate` takes `&[u8]`. Neither path allocates: handshake, response and cookie messages have a fixed size bounded by 148 bytes and decrypt into a stack buffer, while a transport packet's 16-byte header decrypts into a stack array and `PacketData` is assembled from it plus the untouched ciphertext slice.
+
 ### What amneziawg-go Has That We Don't
 
 - **Server/responder mode**: We only implement client-side AWG. The Go version supports both.
@@ -291,4 +398,8 @@ The Go implementation strips padding by copying data in-place (`copy(packet, pac
 
 4. **No runtime config changes**: AWG parameters are fixed at tunnel creation. Changing them requires creating a new tunnel.
 
-5. **AmneziaWG 2.0 only**: Legacy AmneziaWG 1.0/1.5 fields (`j1`, `j2`, `j3`, `itime`) are explicitly rejected.
+5. **Legacy fields rejected**: AmneziaWG 1.0/1.5 fields (`j1`, `j2`, `j3`, `itime`) are explicitly rejected.
+
+6. **No 16-byte content alignment**: boringtun has never padded transport content to a multiple of 16, and AWG 3.0 does not change that. amneziawg-go does so whenever content padding is unset, so wire sizes differ from the Go implementation in that configuration — an observable fingerprint difference, though not an interop failure. With content padding configured, upstream skips the alignment too and the implementations agree.
+
+7. **Timing randomization is per-tunnel**: amneziawg-go stores timing ranges on the device and the persistent-keepalive range on the peer. Here everything lives on `Tunn`, so each tunnel picks independently.

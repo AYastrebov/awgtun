@@ -5,6 +5,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- AmneziaWG 3.0: ChaCha20 header protection, content padding inside the AEAD envelope, and randomized WireGuard timings, at parity with amneziawg-go `d57d98d`
+- `Amnezia3Config` and `Tunn::new_with_amnezia3`; `Tunn::new` and `Tunn::new_with_amnezia` are unchanged and now delegate to it
+- C FFI: `amnezia3_config` and `new_tunnel_amnezia3`
+- `wireguard_ffi.h`: declarations for the AmneziaWG 2.0 surface (`amnezia_config`, `new_tunnel_amnezia`, `wireguard_poll_outgoing_packet`), which were missing entirely, alongside the new 3.0 ones
+
+### Changed
+- Keepalives now carry the S4 padding prefix, matching amneziawg-go. This changes the wire size of keepalives for existing AmneziaWG 2.0 configurations with a non-zero S4.
+- An outbound packet counts as "data sent" when its wire size differs from the unpadded 32-byte keepalive, rather than when its payload is non-empty — again matching amneziawg-go. A non-zero S4 therefore arms the new-handshake timer on keepalives.
+- Transport payloads that are neither IPv4 nor IPv6 are dropped silently and counted as data received instead of returning `InvalidPacket`
+
+### Fixed
+- C FFI: a zeroed `amnezia_config` was rejected instead of yielding standard WireGuard behavior, because the all-zero H1-H4 fields were read as four overlapping ranges
+- Range generation no longer overflows for a range covering the whole `u32` space
+
 ## [0.7.1] - 2026-05-01
 
 ### Security
