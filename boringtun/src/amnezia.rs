@@ -28,16 +28,20 @@ const STANDARD_WIREGUARD_HEADERS: [u32; 4] = [1, 2, 3, 4];
 pub trait RandomSource {
     fn fill_bytes(&mut self, out: &mut [u8]);
 
-    /// Generate a random `u32` in `[start, end]` (inclusive).
+    /// Generate a random `u32` in `[start, end]` (inclusive). An inverted
+    /// range (`start > end`) yields `start`.
     fn gen_range_u32(&mut self, start: u32, end: u32) -> u32 {
-        if start == end {
+        if start >= end {
             return start;
         }
-        let range = end - start + 1;
         let mut buf = [0u8; 4];
         self.fill_bytes(&mut buf);
         let raw = u32::from_le_bytes(buf);
-        start + (raw % range)
+        match (end - start).checked_add(1) {
+            Some(range) => start + (raw % range),
+            // Full `u32` span: every value is already in range.
+            None => raw,
+        }
     }
 
     /// Generate a random `u16` in `[start, end]` (inclusive).
@@ -1707,6 +1711,18 @@ mod tests {
             assert!((120..=240).contains(&v));
         }
         assert_eq!(U32Range::single(7).generate(&mut rng), 7);
+    }
+
+    #[test]
+    fn gen_range_u32_handles_full_and_inverted_spans() {
+        let mut rng = DetRng::new(0x11);
+        // A full-width span must not overflow the `end - start + 1` count.
+        for _ in 0..8 {
+            let _ = rng.gen_range_u32(0, u32::MAX);
+        }
+        assert!(rng.gen_range_u32(u32::MAX - 1, u32::MAX) >= u32::MAX - 1);
+        // An inverted span degenerates to its start.
+        assert_eq!(rng.gen_range_u32(50, 10), 50);
     }
 
     #[test]
