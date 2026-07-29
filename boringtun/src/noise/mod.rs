@@ -1341,6 +1341,53 @@ mod tests {
         assert_ne!(&decrypted[116..132], &init[16 + 116..16 + 132]);
     }
 
+    fn awg3_tun_with_keepalive(keep_alive: Option<u16>, range: crate::amnezia::U32Range) -> Tunn {
+        let my_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let their_public_key =
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::random_from_rng(OsRng));
+        let mut config = awg3_test_config([0x42; 32]);
+        config.timing_ranges = crate::amnezia::TimingRanges {
+            persistent_keepalive: range,
+            ..Default::default()
+        };
+        Tunn::new_with_amnezia3(
+            my_secret_key,
+            their_public_key,
+            None,
+            keep_alive,
+            1,
+            None,
+            config,
+        )
+        .expect("valid awg3 config")
+    }
+
+    #[test]
+    fn persistent_keepalive_reports_the_armed_range_interval() {
+        // A configured range takes precedence over the fixed interval and is
+        // reported instead of it.
+        let tun = awg3_tun_with_keepalive(Some(25), U32Range::new(40, 50).expect("valid range"));
+        let reported = tun.persistent_keepalive().expect("keepalive is enabled");
+        assert!(
+            (40..=50).contains(&reported),
+            "reported {} outside the configured range",
+            reported
+        );
+
+        // With no range the fixed interval is reported, as before.
+        let tun = awg3_tun_with_keepalive(Some(25), U32Range::zero());
+        assert_eq!(tun.persistent_keepalive(), Some(25));
+
+        // Neither configured means disabled.
+        let tun = awg3_tun_with_keepalive(None, U32Range::zero());
+        assert_eq!(tun.persistent_keepalive(), None);
+
+        // A range alone is enough — previously this reported None while
+        // keepalives were actively being sent.
+        let tun = awg3_tun_with_keepalive(None, U32Range::new(15, 15).expect("valid range"));
+        assert_eq!(tun.persistent_keepalive(), Some(15));
+    }
+
     #[test]
     fn awg3_keepalive_has_s4_prefix() {
         let (mut my_tun, mut their_tun) = create_two_tuns_awg3();

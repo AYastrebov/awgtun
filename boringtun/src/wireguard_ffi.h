@@ -129,7 +129,10 @@ struct amnezia3_config {
     uint32_t keepalive_timeout_max;
     uint32_t max_handshake_attempts_min; // count
     uint32_t max_handshake_attempts_max;
-    uint32_t persistent_keepalive_min;  // seconds
+    // Persistent keepalive range, in seconds. When set it takes precedence
+    // over the keep_alive argument of new_tunnel_amnezia3, and a fresh
+    // interval is drawn from it every time a keepalive fires.
+    uint32_t persistent_keepalive_min;
     uint32_t persistent_keepalive_max;
     uint32_t mtu;                       // 0 selects the default (1420)
 };
@@ -178,6 +181,9 @@ struct wireguard_result wireguard_read(const struct wireguard_tunnel *tunnel,
                                        uint8_t *dst,
                                        uint32_t dst_size);
 
+// dst must hold whichever is larger: a handshake initiation (148 + s1 bytes)
+// or a keepalive (32 + s4 bytes plus content_padding_max when content padding
+// is configured). With content padding enabled the keepalive case dominates.
 struct wireguard_result wireguard_tick(const struct wireguard_tunnel *tunnel,
                                        uint8_t *dst,
                                        uint32_t dst_size);

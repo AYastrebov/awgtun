@@ -239,6 +239,21 @@ impl Tunn {
         }
     }
 
+    /// Advance the timer state machine, emitting a handshake initiation or a
+    /// keepalive into `dst` when one is due. Call periodically (~100 ms).
+    ///
+    /// # Panics
+    /// Panics if `dst` is too small for the packet it needs to emit. It must
+    /// hold the larger of:
+    ///
+    /// - a handshake initiation: `148 + S1` bytes, and
+    /// - a keepalive: `32 + S4` bytes, plus the upper bound of the AWG 3.0
+    ///   content padding range when one is configured.
+    ///
+    /// Content padding makes the second term dominate: with `mtu = 1420`,
+    /// `S4 = 16` and a content padding range topping out at 500, a keepalive is
+    /// 548 bytes, well past the 164 a handshake initiation needs. Size `dst`
+    /// for the keepalive case whenever content padding is enabled.
     pub fn update_timers<'a>(&mut self, dst: &'a mut [u8]) -> TunnResult<'a> {
         let mut handshake_initiation_required = false;
         let mut keepalive_required = false;
@@ -447,9 +462,23 @@ impl Tunn {
         }
     }
 
+    /// The persistent keepalive interval in seconds, or `None` when disabled.
+    ///
+    /// With an AWG 3.0 `persistent_keepalive` range configured, the range takes
+    /// precedence over the fixed interval passed to the constructor, and this
+    /// reports the interval **currently armed** — a fresh value is drawn from
+    /// the range every time a keepalive fires, so the result changes over the
+    /// tunnel's lifetime. A range whose lower bound is 0 can therefore report
+    /// `Some(0)`; use the configured range, not this getter, to decide whether
+    /// keepalives are enabled.
     pub fn persistent_keepalive(&self) -> Option<u16> {
-        let keepalive = self.timers.persistent_keepalive;
+        let range = self.timers.timing_ranges.persistent_keepalive;
+        if !range.is_zero() {
+            let secs = self.timers.persistent_keepalive_next.as_secs();
+            return Some(secs.min(u64::from(u16::MAX)) as u16);
+        }
 
+        let keepalive = self.timers.persistent_keepalive;
         if keepalive > 0 {
             Some(keepalive as u16)
         } else {

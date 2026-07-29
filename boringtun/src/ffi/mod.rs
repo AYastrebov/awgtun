@@ -582,6 +582,9 @@ pub struct amnezia3_config {
     pub keepalive_timeout_max: u32,
     pub max_handshake_attempts_min: u32,
     pub max_handshake_attempts_max: u32,
+    /// Persistent keepalive range. When set, it takes precedence over the
+    /// `keep_alive` argument passed to `new_tunnel_amnezia3`, and a fresh
+    /// interval is drawn from it every time a keepalive fires.
     pub persistent_keepalive_min: u32,
     pub persistent_keepalive_max: u32,
     /// Outer MTU used to clamp content padding. 0 selects the default (1420).
@@ -769,6 +772,13 @@ pub unsafe extern "C" fn wireguard_read(
 
 /// This is a state keeping function, that need to be called periodically.
 /// Recommended interval: 100ms.
+///
+/// `dst` must hold whichever is larger: a handshake initiation (`148 + s1`
+/// bytes) or a keepalive (`32 + s4` bytes plus `content_padding_max` when
+/// content padding is configured). With content padding enabled the keepalive
+/// case dominates — a 500-byte padding bound needs 548 bytes here, far past the
+/// 164 that `wireguard_force_handshake` requires. Passing a smaller buffer
+/// aborts the process via the FFI panic hook.
 #[no_mangle]
 pub unsafe extern "C" fn wireguard_tick(
     tunnel: *const Mutex<Tunn>,
