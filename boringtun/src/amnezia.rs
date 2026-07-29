@@ -1037,6 +1037,18 @@ impl U32Range {
         self.lo == 0 && self.hi == 0
     }
 
+    /// Check the invariant `hi >= lo`. The constructors enforce it, but the
+    /// fields are public, so aggregate configs re-check before use.
+    pub fn validate(&self, field: &'static str) -> Result<(), ConfigError> {
+        if self.hi < self.lo {
+            return Err(ConfigError::InvalidRange {
+                value: format!("{}={}-{}", field, self.lo, self.hi),
+                reason: "range end is smaller than start",
+            });
+        }
+        Ok(())
+    }
+
     /// Pick a random value from `[lo, hi]` (inclusive).
     pub fn generate(&self, rng: &mut dyn RandomSource) -> u32 {
         rng.gen_range_u32(self.lo, self.hi)
@@ -1098,6 +1110,17 @@ pub struct TimingRanges {
 }
 
 impl TimingRanges {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        self.rekey_after_time.validate("rekey_after_time")?;
+        self.rekey_timeout.validate("rekey_timeout")?;
+        self.reject_after_time.validate("reject_after_time")?;
+        self.keepalive_timeout.validate("keepalive_timeout")?;
+        self.max_handshake_attempts
+            .validate("max_handshake_attempts")?;
+        self.persistent_keepalive.validate("persistent_keepalive")?;
+        Ok(())
+    }
+
     pub fn is_zero(&self) -> bool {
         self.rekey_after_time.is_zero()
             && self.rekey_timeout.is_zero()
@@ -1223,6 +1246,11 @@ impl Amnezia3Config {
         } else {
             self.headers.validate()?;
         }
+
+        if let Some(range) = self.content_padding_addition {
+            range.validate("content_padding_addition")?;
+        }
+        self.timing_ranges.validate()?;
 
         if self.header_protection_key.is_some() {
             for (field, value) in [
@@ -1868,6 +1896,27 @@ mod tests {
         config.paddings = PaddingConfig::new(0, 0, 0, 0).expect("valid paddings");
         // zero paddings + awg headers → not wireguard-compatible, still valid
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn amnezia3_rejects_inverted_ranges() {
+        // U32Range's fields are public, so a struct literal can bypass `new`.
+        let mut config = awg3_base_config();
+        config.content_padding_addition = Some(U32Range { lo: 64, hi: 8 });
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::InvalidRange { .. })
+        ));
+
+        let mut config = awg3_base_config();
+        config.timing_ranges = TimingRanges {
+            keepalive_timeout: U32Range { lo: 30, hi: 10 },
+            ..TimingRanges::default()
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::InvalidRange { .. })
+        ));
     }
 
     #[test]

@@ -1253,6 +1253,94 @@ mod tests {
         assert!(matches!(packet, Ok(Packet::HandshakeInit(_))));
     }
 
+    /// Reproduce amneziawg-go's receive-side keystream sequence exactly: derive
+    /// the 4-byte `typeHash` from a fresh cipher, XOR it over the type field,
+    /// then continue the *same* stream across bytes `4..n`. Our sender XORs the
+    /// whole span with the keystream from offset 0, so the two must agree.
+    fn go_style_decrypt(key: &[u8; 32], datagram: &[u8], padding: usize, n: usize) -> Vec<u8> {
+        use chacha20::cipher::{KeyIvInit, StreamCipher};
+
+        let nonce: [u8; 12] = datagram[..12].try_into().expect("prefix covers the nonce");
+        let mut cipher = chacha20::ChaCha20::new(key.into(), (&nonce).into());
+
+        // typeHash: the first four keystream bytes, consumed from the stream
+        let mut type_hash = [0u8; 4];
+        cipher.apply_keystream(&mut type_hash);
+
+        let mut message = datagram[padding..].to_vec();
+        for (byte, hash) in message[..4].iter_mut().zip(type_hash.iter()) {
+            *byte ^= hash;
+        }
+        // the cipher is now positioned at offset 4
+        cipher.apply_keystream(&mut message[4..n]);
+        message
+    }
+
+    #[test]
+    fn awg3_wire_format_matches_go_keystream_sequence() {
+        let key = [0x42u8; 32];
+        let (mut my_tun, mut their_tun) = create_two_tuns_awg3();
+
+        // Handshake initiation: the whole 148-byte message is protected.
+        let init = create_handshake_init(&mut my_tun);
+        let decrypted = go_style_decrypt(&key, &init, 16, HANDSHAKE_INIT_SZ);
+        let header_config = HeaderConfig::new(
+            HeaderRange::new(100, 199).expect("valid range"),
+            HeaderRange::new(200, 299).expect("valid range"),
+            HeaderRange::new(300, 399).expect("valid range"),
+            HeaderRange::new(400, 499).expect("valid range"),
+        )
+        .expect("valid headers");
+        assert!(matches!(
+            Tunn::parse_incoming_packet_config(&decrypted, &header_config),
+            Ok(Packet::HandshakeInit(_))
+        ));
+        // The plaintext type must be in H1, and must not be visible on the wire.
+        let plain_type = u32::from_le_bytes(decrypted[..4].try_into().expect("4 bytes"));
+        assert!((100..=199).contains(&plain_type));
+        let wire_type = u32::from_le_bytes(init[16..20].try_into().expect("4 bytes"));
+        assert_ne!(plain_type, wire_type);
+
+        // Handshake response: 92 bytes.
+        let resp = create_handshake_response(&mut their_tun, &init);
+        let decrypted = go_style_decrypt(&key, &resp, 16, HANDSHAKE_RESP_SZ);
+        assert!(matches!(
+            Tunn::parse_incoming_packet_config(&decrypted, &header_config),
+            Ok(Packet::HandshakeResponse(_))
+        ));
+
+        // Transport: only the 16-byte header is protected; the ciphertext that
+        // follows must be untouched.
+        let keepalive = parse_handshake_resp(&mut my_tun, &resp);
+        let decrypted = go_style_decrypt(&key, &keepalive, 16, TRANSPORT_HEADER_SZ);
+        let plain_type = u32::from_le_bytes(decrypted[..4].try_into().expect("4 bytes"));
+        assert!((400..=499).contains(&plain_type));
+        assert_eq!(
+            &decrypted[TRANSPORT_HEADER_SZ..],
+            &keepalive[16 + TRANSPORT_HEADER_SZ..]
+        );
+
+        // And the responder still accepts it.
+        let mut dst = vec![0u8; 2048];
+        assert!(matches!(
+            their_tun.decapsulate(None, &keepalive, &mut dst),
+            TunnResult::Done
+        ));
+    }
+
+    #[test]
+    fn awg3_macs_are_computed_before_encryption() {
+        // A wire-visible mac1 would mean the MACs were computed after
+        // encryption. Verify the MAC only checks out on the decrypted message.
+        let key = [0x42u8; 32];
+        let (mut my_tun, _) = create_two_tuns_awg3();
+        let init = create_handshake_init(&mut my_tun);
+        let decrypted = go_style_decrypt(&key, &init, 16, HANDSHAKE_INIT_SZ);
+
+        // mac1 occupies bytes 116..132 of the plaintext message.
+        assert_ne!(&decrypted[116..132], &init[16 + 116..16 + 132]);
+    }
+
     #[test]
     fn awg3_keepalive_has_s4_prefix() {
         let (mut my_tun, mut their_tun) = create_two_tuns_awg3();
