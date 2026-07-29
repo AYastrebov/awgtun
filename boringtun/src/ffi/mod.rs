@@ -8,8 +8,8 @@
 //! C bindings for the BoringTun library
 use super::noise::{Tunn, TunnResult};
 use crate::amnezia::{
-    Amnezia2Config, CpsChain, HeaderConfig, HeaderRange, InitPacketConfig, JunkConfig,
-    PaddingConfig,
+    Amnezia2Config, Amnezia3Config, CpsChain, HeaderConfig, HeaderRange, InitPacketConfig,
+    JunkConfig, PaddingConfig, TimingRanges, U32Range, HEADER_PROTECTION_KEY_SIZE,
 };
 use crate::x25519::{PublicKey, StaticSecret};
 use base64::{decode, encode};
@@ -360,6 +360,143 @@ unsafe fn parse_optional_cps(ptr: *const c_char) -> Result<Option<CpsChain>, ()>
     CpsChain::parse(s).map(Some).map_err(|_| ())
 }
 
+/// Build an [`Amnezia2Config`] from the C representation.
+///
+/// # Safety
+/// `cfg.i1`-`cfg.i5` must each be NULL or a valid null-terminated C string.
+unsafe fn amnezia2_from_c(cfg: &amnezia_config) -> Result<Amnezia2Config, ()> {
+    let header_bounds = [
+        cfg.h1_start,
+        cfg.h1_end,
+        cfg.h2_start,
+        cfg.h2_end,
+        cfg.h3_start,
+        cfg.h3_end,
+        cfg.h4_start,
+        cfg.h4_end,
+    ];
+    // Leaving every H field zero means "standard WireGuard headers"; taking the
+    // values literally would produce four identical, overlapping ranges.
+    let headers = if header_bounds.iter().all(|bound| *bound == 0) {
+        HeaderConfig::wireguard_compatible()
+    } else {
+        HeaderConfig::new(
+            HeaderRange {
+                start: cfg.h1_start,
+                end: cfg.h1_end,
+            },
+            HeaderRange {
+                start: cfg.h2_start,
+                end: cfg.h2_end,
+            },
+            HeaderRange {
+                start: cfg.h3_start,
+                end: cfg.h3_end,
+            },
+            HeaderRange {
+                start: cfg.h4_start,
+                end: cfg.h4_end,
+            },
+        )
+        .map_err(|_| ())?
+    };
+
+    let paddings = PaddingConfig::new(cfg.s1, cfg.s2, cfg.s3, cfg.s4).map_err(|_| ())?;
+
+    let junk = if cfg.jc == 0 {
+        JunkConfig::disabled()
+    } else {
+        JunkConfig::new(cfg.jc, cfg.jmin, cfg.jmax).map_err(|_| ())?
+    };
+
+    Ok(Amnezia2Config {
+        headers,
+        paddings,
+        junk,
+        init_packets: InitPacketConfig {
+            i1: parse_optional_cps(cfg.i1)?,
+            i2: parse_optional_cps(cfg.i2)?,
+            i3: parse_optional_cps(cfg.i3)?,
+            i4: parse_optional_cps(cfg.i4)?,
+            i5: parse_optional_cps(cfg.i5)?,
+        },
+    })
+}
+
+/// The keys and keepalive shared by every `new_tunnel*` entry point.
+struct TunnelIdentity {
+    private_key: StaticSecret,
+    public_key: PublicKey,
+    preshared_key: Option<[u8; 32]>,
+    keep_alive: Option<u16>,
+}
+
+/// Parse the base64 key arguments common to all constructors.
+///
+/// # Safety
+/// `static_private` and `server_static_public` must be valid null-terminated C
+/// strings; `preshared_key` must be NULL or one.
+unsafe fn parse_tunnel_identity(
+    static_private: *const c_char,
+    server_static_public: *const c_char,
+    preshared_key: *const c_char,
+    keep_alive: u16,
+) -> Result<TunnelIdentity, ()> {
+    if static_private.is_null() || server_static_public.is_null() {
+        return Err(());
+    }
+
+    let private_key = CStr::from_ptr(static_private)
+        .to_str()
+        .map_err(|_| ())?
+        .parse::<KeyBytes>()
+        .map(|key| StaticSecret::from(key.0))
+        .map_err(|_| ())?;
+
+    let public_key = CStr::from_ptr(server_static_public)
+        .to_str()
+        .map_err(|_| ())?
+        .parse::<KeyBytes>()
+        .map(|key| PublicKey::from(key.0))
+        .map_err(|_| ())?;
+
+    let preshared_key = if preshared_key.is_null() {
+        None
+    } else {
+        Some(
+            CStr::from_ptr(preshared_key)
+                .to_str()
+                .map_err(|_| ())?
+                .parse::<KeyBytes>()
+                .map(|key| key.0)
+                .map_err(|_| ())?,
+        )
+    };
+
+    Ok(TunnelIdentity {
+        private_key,
+        public_key,
+        preshared_key,
+        keep_alive: if keep_alive == 0 {
+            None
+        } else {
+            Some(keep_alive)
+        },
+    })
+}
+
+/// Install the FFI panic hook: unwinding across the boundary is UB, so turn a
+/// panic into a segfault instead.
+fn install_panic_hook() {
+    PANIC_HOOK.call_once(|| {
+        panic::set_hook(Box::new(move |_| {
+            // SAFETY: raising SIGSEGV is the intended way to abort here — it is
+            // always sound to call and never returns to Rust code.
+            unsafe { raise(SIGSEGV) };
+        }));
+    });
+}
+
 /// Allocate a new tunnel with AmneziaWG 2.0 configuration.
 /// Returns NULL on failure (invalid keys or invalid amnezia config).
 /// Keys must be valid base64 encoded 32-byte keys.
@@ -373,100 +510,186 @@ pub unsafe extern "C" fn new_tunnel_amnezia(
     config: *const amnezia_config,
 ) -> *mut Mutex<Tunn> {
     if config.is_null() {
-        return new_tunnel(static_private, server_static_public, preshared_key, keep_alive, index);
+        return new_tunnel(
+            static_private,
+            server_static_public,
+            preshared_key,
+            keep_alive,
+            index,
+        );
     }
-    let cfg = &*config;
 
-    // Parse header ranges
-    let headers = match HeaderConfig::new(
-        HeaderRange { start: cfg.h1_start, end: cfg.h1_end },
-        HeaderRange { start: cfg.h2_start, end: cfg.h2_end },
-        HeaderRange { start: cfg.h3_start, end: cfg.h3_end },
-        HeaderRange { start: cfg.h4_start, end: cfg.h4_end },
-    ) {
-        Ok(h) => h,
-        Err(_) => return null_mut(),
+    let amnezia = match amnezia2_from_c(&*config) {
+        Ok(amnezia) => amnezia,
+        Err(()) => return null_mut(),
     };
 
-    let paddings = match PaddingConfig::new(cfg.s1, cfg.s2, cfg.s3, cfg.s4) {
-        Ok(p) => p,
-        Err(_) => return null_mut(),
-    };
-
-    let junk = if cfg.jc == 0 {
-        JunkConfig::disabled()
-    } else {
-        match JunkConfig::new(cfg.jc, cfg.jmin, cfg.jmax) {
-            Ok(j) => j,
-            Err(_) => return null_mut(),
-        }
-    };
-
-    let i1 = match parse_optional_cps(cfg.i1) { Ok(v) => v, Err(_) => return null_mut() };
-    let i2 = match parse_optional_cps(cfg.i2) { Ok(v) => v, Err(_) => return null_mut() };
-    let i3 = match parse_optional_cps(cfg.i3) { Ok(v) => v, Err(_) => return null_mut() };
-    let i4 = match parse_optional_cps(cfg.i4) { Ok(v) => v, Err(_) => return null_mut() };
-    let i5 = match parse_optional_cps(cfg.i5) { Ok(v) => v, Err(_) => return null_mut() };
-
-    let amnezia = Amnezia2Config {
-        headers,
-        paddings,
-        junk,
-        init_packets: InitPacketConfig { i1, i2, i3, i4, i5 },
-    };
-
-    // Parse keys (same as new_tunnel)
-    let c_str = CStr::from_ptr(static_private);
-    let static_private = match c_str.to_str() {
-        Err(_) => return ptr::null_mut(),
-        Ok(string) => string,
-    };
-
-    let c_str = CStr::from_ptr(server_static_public);
-    let server_static_public = match c_str.to_str() {
-        Err(_) => return ptr::null_mut(),
-        Ok(string) => string,
-    };
-
-    let preshared_key = if preshared_key.is_null() {
-        None
-    } else {
-        let c_str = CStr::from_ptr(preshared_key);
-        if let Ok(string) = c_str.to_str() {
-            if let Ok(key) = string.parse::<KeyBytes>() {
-                Some(key.0)
-            } else {
-                return null_mut();
-            }
-        } else {
-            return null_mut();
-        }
-    };
-
-    let private_key = match static_private.parse::<KeyBytes>() {
-        Err(_) => return ptr::null_mut(),
-        Ok(key) => StaticSecret::from(key.0),
-    };
-
-    let public_key = match server_static_public.parse::<KeyBytes>() {
-        Err(_) => return ptr::null_mut(),
-        Ok(key) => PublicKey::from(key.0),
-    };
-
-    let keep_alive = if keep_alive == 0 { None } else { Some(keep_alive) };
+    let identity =
+        match parse_tunnel_identity(static_private, server_static_public, preshared_key, keep_alive)
+        {
+            Ok(identity) => identity,
+            Err(()) => return null_mut(),
+        };
 
     let tunnel = match Tunn::new_with_amnezia(
-        private_key, public_key, preshared_key, keep_alive, index, None, amnezia,
+        identity.private_key,
+        identity.public_key,
+        identity.preshared_key,
+        identity.keep_alive,
+        index,
+        None,
+        amnezia,
     ) {
         Ok(t) => t,
         Err(_) => return null_mut(),
     };
 
-    PANIC_HOOK.call_once(|| {
-        panic::set_hook(Box::new(move |_| {
-            raise(SIGSEGV);
-        }));
-    });
+    install_panic_hook();
+
+    Box::into_raw(Box::new(Mutex::new(tunnel)))
+}
+
+/// AmneziaWG 3.0 configuration for the C FFI.
+///
+/// Extends [`amnezia_config`] with header protection, content padding and
+/// randomized timings. Zeroing the whole struct yields standard WireGuard
+/// behavior.
+///
+/// Every `*_min`/`*_max` pair is an inclusive range; a pair of zeros means
+/// "unset" and falls back to the WireGuard default for that parameter.
+#[repr(C)]
+pub struct amnezia3_config {
+    /// All AmneziaWG 2.0 parameters (H1-H4, S1-S4, Jc/Jmin/Jmax, I1-I5).
+    pub base: amnezia_config,
+    /// Pointer to a 32-byte header protection key, or NULL to disable header
+    /// protection. An all-zero key also disables it, matching amneziawg-go.
+    /// When enabled, S1-S4 must all be at least 12.
+    pub header_protection_key: *const u8,
+    /// Extra zero bytes appended to transport content inside the AEAD envelope.
+    pub content_padding_min: u32,
+    pub content_padding_max: u32,
+    /// Randomized timing ranges, in seconds (attempts is a count).
+    pub rekey_after_time_min: u32,
+    pub rekey_after_time_max: u32,
+    pub rekey_timeout_min: u32,
+    pub rekey_timeout_max: u32,
+    pub reject_after_time_min: u32,
+    pub reject_after_time_max: u32,
+    pub keepalive_timeout_min: u32,
+    pub keepalive_timeout_max: u32,
+    pub max_handshake_attempts_min: u32,
+    pub max_handshake_attempts_max: u32,
+    pub persistent_keepalive_min: u32,
+    pub persistent_keepalive_max: u32,
+    /// Outer MTU used to clamp content padding. 0 selects the default (1420).
+    pub mtu: u32,
+}
+
+/// Build an inclusive range from a C min/max pair. A zero pair means "unset".
+fn range_from_c(min: u32, max: u32) -> Result<U32Range, ()> {
+    U32Range::new(min, max).map_err(|_| ())
+}
+
+/// Read an optional 32-byte header protection key. NULL or all-zero disables
+/// header protection, matching amneziawg-go's `HeaderProtectionCipher`.
+///
+/// # Safety
+/// `ptr` must be NULL or point to at least 32 readable bytes.
+unsafe fn header_protection_key_from_c(ptr: *const u8) -> Option<[u8; HEADER_PROTECTION_KEY_SIZE]> {
+    if ptr.is_null() {
+        return None;
+    }
+    let mut key = [0u8; HEADER_PROTECTION_KEY_SIZE];
+    key.copy_from_slice(slice::from_raw_parts(ptr, HEADER_PROTECTION_KEY_SIZE));
+    if key.iter().all(|byte| *byte == 0) {
+        return None;
+    }
+    Some(key)
+}
+
+/// Allocate a new tunnel with AmneziaWG 3.0 configuration.
+/// Returns NULL on failure (invalid keys or invalid amnezia config).
+/// Keys must be valid base64 encoded 32-byte keys.
+#[no_mangle]
+pub unsafe extern "C" fn new_tunnel_amnezia3(
+    static_private: *const c_char,
+    server_static_public: *const c_char,
+    preshared_key: *const c_char,
+    keep_alive: u16,
+    index: u32,
+    config: *const amnezia3_config,
+) -> *mut Mutex<Tunn> {
+    if config.is_null() {
+        return new_tunnel(
+            static_private,
+            server_static_public,
+            preshared_key,
+            keep_alive,
+            index,
+        );
+    }
+    let cfg = &*config;
+
+    let base = match amnezia2_from_c(&cfg.base) {
+        Ok(base) => base,
+        Err(()) => return null_mut(),
+    };
+
+    let content_padding = match range_from_c(cfg.content_padding_min, cfg.content_padding_max) {
+        Ok(range) if range.is_zero() => None,
+        Ok(range) => Some(range),
+        Err(()) => return null_mut(),
+    };
+
+    let timing_ranges = match (|| {
+        Ok(TimingRanges {
+            rekey_after_time: range_from_c(cfg.rekey_after_time_min, cfg.rekey_after_time_max)?,
+            rekey_timeout: range_from_c(cfg.rekey_timeout_min, cfg.rekey_timeout_max)?,
+            reject_after_time: range_from_c(cfg.reject_after_time_min, cfg.reject_after_time_max)?,
+            keepalive_timeout: range_from_c(cfg.keepalive_timeout_min, cfg.keepalive_timeout_max)?,
+            max_handshake_attempts: range_from_c(
+                cfg.max_handshake_attempts_min,
+                cfg.max_handshake_attempts_max,
+            )?,
+            persistent_keepalive: range_from_c(
+                cfg.persistent_keepalive_min,
+                cfg.persistent_keepalive_max,
+            )?,
+        })
+    })() {
+        Ok(ranges) => ranges,
+        Err(()) => return null_mut(),
+    };
+
+    let mut amnezia = Amnezia3Config::from_amnezia2(base);
+    amnezia.header_protection_key = header_protection_key_from_c(cfg.header_protection_key);
+    amnezia.content_padding_addition = content_padding;
+    amnezia.timing_ranges = timing_ranges;
+    if cfg.mtu != 0 {
+        amnezia.mtu = cfg.mtu;
+    }
+
+    let identity =
+        match parse_tunnel_identity(static_private, server_static_public, preshared_key, keep_alive)
+        {
+            Ok(identity) => identity,
+            Err(()) => return null_mut(),
+        };
+
+    let tunnel = match Tunn::new_with_amnezia3(
+        identity.private_key,
+        identity.public_key,
+        identity.preshared_key,
+        identity.keep_alive,
+        index,
+        None,
+        amnezia,
+    ) {
+        Ok(t) => t,
+        Err(_) => return null_mut(),
+    };
+
+    install_panic_hook();
 
     Box::into_raw(Box::new(Mutex::new(tunnel)))
 }
@@ -581,5 +804,165 @@ pub unsafe extern "C" fn wireguard_stats(tunnel: *const Mutex<Tunn>) -> stats {
         estimated_loss,
         estimated_rtt: estimated_rtt.map(|r| r as i32).unwrap_or(-1),
         reserved: [0u8; 56],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::CString;
+
+    fn keypair() -> (CString, CString) {
+        let secret = StaticSecret::random_from_rng(OsRng);
+        let public = PublicKey::from(&secret);
+        (
+            CString::new(encode(secret.to_bytes())).expect("no interior nul"),
+            CString::new(encode(public.as_bytes())).expect("no interior nul"),
+        )
+    }
+
+    fn zeroed_config() -> amnezia3_config {
+        amnezia3_config {
+            base: amnezia_config {
+                h1_start: 0,
+                h1_end: 0,
+                h2_start: 0,
+                h2_end: 0,
+                h3_start: 0,
+                h3_end: 0,
+                h4_start: 0,
+                h4_end: 0,
+                s1: 0,
+                s2: 0,
+                s3: 0,
+                s4: 0,
+                jc: 0,
+                jmin: 0,
+                jmax: 0,
+                i1: ptr::null(),
+                i2: ptr::null(),
+                i3: ptr::null(),
+                i4: ptr::null(),
+                i5: ptr::null(),
+            },
+            header_protection_key: ptr::null(),
+            content_padding_min: 0,
+            content_padding_max: 0,
+            rekey_after_time_min: 0,
+            rekey_after_time_max: 0,
+            rekey_timeout_min: 0,
+            rekey_timeout_max: 0,
+            reject_after_time_min: 0,
+            reject_after_time_max: 0,
+            keepalive_timeout_min: 0,
+            keepalive_timeout_max: 0,
+            max_handshake_attempts_min: 0,
+            max_handshake_attempts_max: 0,
+            persistent_keepalive_min: 0,
+            persistent_keepalive_max: 0,
+            mtu: 0,
+        }
+    }
+
+    unsafe fn build(config: &amnezia3_config) -> *mut Mutex<Tunn> {
+        let (my_secret, _) = keypair();
+        let (_, their_public) = keypair();
+        new_tunnel_amnezia3(
+            my_secret.as_ptr(),
+            their_public.as_ptr(),
+            ptr::null(),
+            0,
+            1,
+            config,
+        )
+    }
+
+    #[test]
+    fn amnezia3_zeroed_config_builds_a_wireguard_tunnel() {
+        unsafe {
+            let tunnel = build(&zeroed_config());
+            assert!(!tunnel.is_null());
+            tunnel_free(tunnel);
+        }
+    }
+
+    #[test]
+    fn amnezia3_full_config_builds() {
+        let key = [0x42u8; HEADER_PROTECTION_KEY_SIZE];
+        let mut config = zeroed_config();
+        config.base.h1_start = 100;
+        config.base.h1_end = 199;
+        config.base.h2_start = 200;
+        config.base.h2_end = 299;
+        config.base.h3_start = 300;
+        config.base.h3_end = 399;
+        config.base.h4_start = 400;
+        config.base.h4_end = 499;
+        config.base.s1 = 16;
+        config.base.s2 = 16;
+        config.base.s3 = 16;
+        config.base.s4 = 16;
+        config.header_protection_key = key.as_ptr();
+        config.content_padding_min = 1;
+        config.content_padding_max = 32;
+        config.rekey_timeout_min = 3;
+        config.rekey_timeout_max = 9;
+        config.mtu = 1400;
+
+        unsafe {
+            let tunnel = build(&config);
+            assert!(!tunnel.is_null());
+            tunnel_free(tunnel);
+        }
+    }
+
+    #[test]
+    fn amnezia3_all_zero_key_disables_header_protection() {
+        // An all-zero key means "off" in amneziawg-go, so the S1-S4 >= 12 rule
+        // must not apply — this config would otherwise be rejected.
+        let key = [0u8; HEADER_PROTECTION_KEY_SIZE];
+        let mut config = zeroed_config();
+        config.header_protection_key = key.as_ptr();
+        config.base.h1_start = 100;
+        config.base.h1_end = 199;
+        config.base.h2_start = 200;
+        config.base.h2_end = 299;
+        config.base.h3_start = 300;
+        config.base.h3_end = 399;
+        config.base.h4_start = 400;
+        config.base.h4_end = 499;
+        config.base.s4 = 1;
+
+        unsafe {
+            let tunnel = build(&config);
+            assert!(!tunnel.is_null());
+            tunnel_free(tunnel);
+        }
+    }
+
+    #[test]
+    fn amnezia3_rejects_short_padding_with_header_protection() {
+        let key = [0x42u8; HEADER_PROTECTION_KEY_SIZE];
+        let mut config = zeroed_config();
+        config.header_protection_key = key.as_ptr();
+        config.base.s1 = 11;
+        config.base.s2 = 16;
+        config.base.s3 = 16;
+        config.base.s4 = 16;
+
+        unsafe {
+            assert!(build(&config).is_null());
+        }
+    }
+
+    #[test]
+    fn amnezia3_rejects_inverted_ranges() {
+        let mut config = zeroed_config();
+        config.rekey_timeout_min = 9;
+        config.rekey_timeout_max = 3;
+
+        unsafe {
+            assert!(build(&config).is_null());
+        }
     }
 }
