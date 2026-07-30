@@ -74,6 +74,21 @@ impl Peer {
         self.tunnel.update_timers(dst)
     }
 
+    /// Take the AmneziaWG datagrams queued ahead of a handshake initiation:
+    /// the I1-I5 init packets followed by `Jc` junk packets.
+    ///
+    /// These must be sent *before* the handshake initiation that queued them,
+    /// so callers drain this after any call that can start a handshake and
+    /// send the result first. Returns an empty vector for a standard WireGuard
+    /// peer, which is the common case.
+    pub fn drain_outgoing(&mut self) -> Vec<Vec<u8>> {
+        let mut packets = Vec::new();
+        while let Some(packet) = self.tunnel.poll_outgoing_packet() {
+            packets.push(packet);
+        }
+        packets
+    }
+
     pub fn endpoint(&self) -> parking_lot::RwLockReadGuard<'_, Endpoint> {
         self.endpoint.read()
     }

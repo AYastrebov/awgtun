@@ -578,21 +578,32 @@ impl Device {
                         None => continue,
                     };
 
-                    match p.update_timers(&mut t.dst_buf[..]) {
+                    let result = p.update_timers(&mut t.dst_buf[..]);
+
+                    // A handshake initiation queues the AmneziaWG I-packets and
+                    // junk that must precede it on the wire, so drain before
+                    // sending whatever `update_timers` produced.
+                    let queued = if matches!(result, TunnResult::WriteToNetwork(_)) {
+                        p.drain_outgoing()
+                    } else {
+                        Vec::new()
+                    };
+
+                    match result {
                         TunnResult::Done => {}
                         TunnResult::Err(WireGuardError::ConnectionExpired) => {
                             p.shutdown_endpoint(); // close open udp socket
                         }
                         TunnResult::Err(e) => tracing::error!(message = "Timer error", error = ?e),
                         TunnResult::WriteToNetwork(packet) => {
-                            match endpoint_addr {
-                                SocketAddr::V4(_) => {
-                                    udp4.send_to(packet, &endpoint_addr.into()).ok()
-                                }
-                                SocketAddr::V6(_) => {
-                                    udp6.send_to(packet, &endpoint_addr.into()).ok()
-                                }
+                            let udp = match endpoint_addr {
+                                SocketAddr::V4(_) => udp4,
+                                SocketAddr::V6(_) => udp6,
                             };
+                            for datagram in &queued {
+                                udp.send_to(datagram, &endpoint_addr.into()).ok();
+                            }
+                            udp.send_to(packet, &endpoint_addr.into()).ok();
                         }
                         _ => panic!("Unexpected result from update_timers"),
                     };
@@ -711,6 +722,11 @@ impl Device {
 
                     // We found a peer, use it to decapsulate the message+
                     let mut flush = false; // Are there packets to send from the queue?
+                                           // No drain here: `handle_verified_packet` only ever answers
+                                           // an inbound message, and a handshake initiation — the only
+                                           // thing that queues I-packets and junk — is started from
+                                           // `encapsulate` and `update_timers`. The flush loop below
+                                           // reaches `encapsulate`, so it drains.
                     match p
                         .tunnel
                         .handle_verified_packet(parsed_packet, &mut t.dst_buf[..])
@@ -734,11 +750,26 @@ impl Device {
                     };
 
                     if flush {
-                        // Flush pending queue
-                        while let TunnResult::WriteToNetwork(packet) =
-                            p.tunnel.decapsulate(None, &[], &mut t.dst_buf[..])
-                        {
-                            let _: Result<_, _> = udp.send_to(packet, &addr);
+                        // Flush pending queue. This re-enters `encapsulate`,
+                        // which starts a handshake when the queued packet has
+                        // no session — so drain the AmneziaWG I-packets and
+                        // junk it queues and send them ahead of the initiation.
+                        loop {
+                            let result = p.tunnel.decapsulate(None, &[], &mut t.dst_buf[..]);
+                            let queued = if matches!(result, TunnResult::WriteToNetwork(_)) {
+                                p.drain_outgoing()
+                            } else {
+                                Vec::new()
+                            };
+                            match result {
+                                TunnResult::WriteToNetwork(packet) => {
+                                    for datagram in &queued {
+                                        let _: Result<_, _> = udp.send_to(datagram, &addr);
+                                    }
+                                    let _: Result<_, _> = udp.send_to(packet, &addr);
+                                }
+                                _ => break,
+                            }
                         }
                     }
 
@@ -811,11 +842,26 @@ impl Device {
                     };
 
                     if flush {
-                        // Flush pending queue
-                        while let TunnResult::WriteToNetwork(packet) =
-                            p.tunnel.decapsulate(None, &[], &mut t.dst_buf[..])
-                        {
-                            let _: Result<_, _> = udp.send(packet);
+                        // Flush pending queue. As in the anonymous handler,
+                        // this re-enters `encapsulate` and can start a
+                        // handshake, so drain the queued AmneziaWG datagrams
+                        // and send them ahead of the initiation.
+                        loop {
+                            let result = p.tunnel.decapsulate(None, &[], &mut t.dst_buf[..]);
+                            let queued = if matches!(result, TunnResult::WriteToNetwork(_)) {
+                                p.drain_outgoing()
+                            } else {
+                                Vec::new()
+                            };
+                            match result {
+                                TunnResult::WriteToNetwork(packet) => {
+                                    for datagram in &queued {
+                                        let _: Result<_, _> = udp.send(datagram);
+                                    }
+                                    let _: Result<_, _> = udp.send(packet);
+                                }
+                                _ => break,
+                            }
                         }
                     }
 
@@ -873,7 +919,18 @@ impl Device {
                         None => continue,
                     };
 
-                    match peer.tunnel.encapsulate(src, &mut t.dst_buf[..]) {
+                    let result = peer.tunnel.encapsulate(src, &mut t.dst_buf[..]);
+
+                    // Encapsulating the first packet for an idle peer starts a
+                    // handshake, which queues the AmneziaWG I-packets and junk
+                    // that must precede it on the wire.
+                    let queued = if matches!(result, TunnResult::WriteToNetwork(_)) {
+                        peer.drain_outgoing()
+                    } else {
+                        Vec::new()
+                    };
+
+                    match result {
                         TunnResult::Done => {}
                         TunnResult::Err(e) => {
                             tracing::error!(message = "Encapsulate error", error = ?e)
@@ -882,10 +939,19 @@ impl Device {
                             let mut endpoint = peer.endpoint_mut();
                             if let Some(conn) = endpoint.conn.as_mut() {
                                 // Prefer to send using the connected socket
+                                for datagram in &queued {
+                                    let _: Result<_, _> = conn.write(datagram);
+                                }
                                 let _: Result<_, _> = conn.write(packet);
                             } else if let Some(addr @ SocketAddr::V4(_)) = endpoint.addr {
+                                for datagram in &queued {
+                                    let _: Result<_, _> = udp4.send_to(datagram, &addr.into());
+                                }
                                 let _: Result<_, _> = udp4.send_to(packet, &addr.into());
                             } else if let Some(addr @ SocketAddr::V6(_)) = endpoint.addr {
+                                for datagram in &queued {
+                                    let _: Result<_, _> = udp6.send_to(datagram, &addr.into());
+                                }
                                 let _: Result<_, _> = udp6.send_to(packet, &addr.into());
                             } else {
                                 tracing::error!("No endpoint");
