@@ -81,6 +81,9 @@ noise/timers.rs     — network_outgoing.clear() on reset, 3.0 randomized timing
 ffi/mod.rs          — C FFI: amnezia_config/amnezia3_config, new_tunnel_amnezia{,3}
 wireguard_ffi.h     — C declarations for both AWG surfaces
 jni.rs              — Android: new_tunnel_amnezia3, poll_outgoing_packet, tunnel_free
+device/mod.rs       — Device-scoped AWG config, classify-before-peer on receive,
+                      junk/I-packet drain sites
+device/api.rs       — AWG keys over the UAPI socket (set=1 / get=1)
 ```
 
 ## Task: Rebase on Upstream Master
@@ -149,6 +152,17 @@ Common failure modes and how to diagnose:
 1. Verify `queue_pre_handshake_packets()` is called in `format_handshake_initiation()`
 2. Check caller drains `poll_outgoing_packet()` before sending init
 3. Verify I-packet CPS chains are configured and `active_chains()` yields them
+
+On the `device` path there are **four** drain sites, because a handshake
+initiation is started from exactly two places, `encapsulate` and `update_timers`:
+
+- `register_timers`, after `update_timers`
+- `register_iface_handler`, after `encapsulate`
+- the flush loops in `register_udp_handler` and `register_conn_handler`, which
+  re-enter `encapsulate` through `send_queued_packet`
+
+Not after `handle_verified_packet` — it only answers inbound messages and never
+initiates, so a drain there would be dead code.
 
 ### Buffer too small panics
 - `encapsulate()` needs `src.len() + 32 + S4` bytes, plus the content padding

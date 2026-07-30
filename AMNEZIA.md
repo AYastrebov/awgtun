@@ -13,6 +13,7 @@ This document describes the AmneziaWG 2.0 and 3.0 protocol implementation in thi
 - [Rust API](#rust-api)
 - [C FFI API](#c-ffi-api)
 - [JNI API (Android)](#jni-api-android)
+- [Device and UAPI (boringtun-cli)](#device-and-uapi-boringtun-cli)
 - [Comparison with amneziawg-go](#comparison-with-amneziawg-go)
 - [Known Limitations](#known-limitations)
 
@@ -200,7 +201,9 @@ The Noise handshake code (`handshake.rs`, `session.rs`) only gained a `msg_type:
 | `noise/session.rs` | `format_packet_data()` accepts `msg_type: u32`. Dynamic transport header. |
 | `noise/rate_limiter.rs` | `verify_packet()` accepts `&HeaderConfig`. `format_cookie_reply()` accepts `msg_type: u32`. Dynamic cookie header generation. |
 | `noise/timers.rs` | `clear_all()` also clears `network_outgoing` queue. |
-| `device/mod.rs` | Passes `&HeaderConfig::default()` to `verify_packet()`. |
+| `device/mod.rs` | Device-scoped `Amnezia3Config`. Peers built with `new_with_amnezia3()`. Inbound datagrams stripped and header-decrypted before `verify_packet()`. Cookie replies padded and protected. Junk/I-packets drained at the four sites that can start a handshake. |
+| `device/api.rs` | AmneziaWG interface keys collected into a block for `Amnezia3Config::parse` on `set=1`; `to_uapi_block()` emitted on `get=1`. Per-peer `persistent_keepalive_interval` accepts an AWG 3.0 range. |
+| `device/peer.rs` | `drain_outgoing()` helper; keeps the configured keepalive range for `get=1`. |
 | `ffi/mod.rs` | `amnezia_config` C struct, `new_tunnel_amnezia()`, `wireguard_poll_outgoing_packet()`. |
 | `lib.rs` | `pub mod amnezia;` |
 
@@ -396,6 +399,92 @@ used afterwards; passing 0 is a no-op.
 > shipping its own package must either keep that class name or patch the export
 > prefix in `boringtun/src/jni.rs`.
 
+## Device and UAPI (boringtun-cli)
+
+With the `device` feature, `boringtun-cli` is a full AmneziaWG endpoint. It is
+configured over the usual WireGuard UAPI socket at
+`/var/run/wireguard/<iface>.sock`, so the amneziawg-tools `awg` binary drives it
+directly.
+
+### Configuration
+
+The AmneziaWG parameters are **interface-level**, listed in the `[Interface]`
+section alongside `PrivateKey` and `ListenPort`:
+
+```ini
+[Interface]
+PrivateKey = <base64>
+ListenPort = 51820
+Jc = 3
+Jmin = 64
+Jmax = 256
+S1 = 16
+S2 = 16
+S3 = 16
+S4 = 16
+H1 = 1000-1099
+H2 = 2000-2099
+H3 = 3000-3099
+H4 = 4000-4099
+I1 = <b 0xc0ffee><r 32>
+HeaderProtectionKey = <64 hex characters>
+ContentPaddingAddition = 1-32
+RekeyTimeout = 3-6
+KeepaliveTimeout = 8-12
+
+[Peer]
+PublicKey = <base64>
+Endpoint = 203.0.113.1:51820
+AllowedIPs = 0.0.0.0/0
+PersistentKeepalive = 25
+```
+
+Over the UAPI wire these become the lowercase `key=value` names that
+`Amnezia3Config::parse` accepts — the same format the JNI surface takes. See
+[JNI API (Android)](#jni-api-android) for the full key list.
+
+### Bringing up a tunnel
+
+```bash
+# Start the device (creates /var/run/wireguard/awg0.sock)
+sudo boringtun-cli awg0
+
+# Push the configuration
+sudo awg setconf awg0 /etc/amnezia/awg0.conf
+
+# Address and route as usual
+sudo ip addr add 10.0.0.2/24 dev awg0
+sudo ip link set up dev awg0
+
+# Confirm the handshake
+sudo awg show awg0
+```
+
+A completed handshake with a real AmneziaWG server, and traffic flowing over it,
+is the check that no unit test can stand in for.
+
+### Two divergences from WireGuard's UAPI
+
+**AmneziaWG parameters are replace-all per `set=1`.** WireGuard's UAPI is
+incremental — each key patches current state. The AmneziaWG keys in an interface
+section are instead collected and parsed as one block, so a key absent from a
+non-empty block returns to its default. This is what lets the cross-field rules
+(overlapping header ranges, S1–S4 ≥ 12 under header protection) be validated
+atomically, and it means a rejected configuration leaves the device untouched. A
+`set=1` carrying *no* AmneziaWG keys leaves the existing configuration alone, so
+peer-only updates are safe.
+
+**`mtu` is ignored on this path.** The key exists only because `Tunn` has no
+concept of an MTU, which matters for the FFI and JNI surfaces. A device does
+know its interface MTU, and it is authoritative, so content padding is clamped
+against the live value.
+
+### Changing parameters on a live interface
+
+Not supported. `update_peer` refuses to modify an existing peer — a pre-existing
+boringtun limitation, unrelated to AmneziaWG — and the parameters are baked into
+each peer's `Tunn` at construction. Take the interface down and bring it back up.
+
 ## Comparison with amneziawg-go
 
 ### Protocol Fidelity
@@ -465,14 +554,16 @@ With header protection enabled the incoming datagram cannot be decrypted in plac
 ### What amneziawg-go Has That We Don't
 
 - **Server/responder mode**: We only implement client-side AWG. The Go version supports both.
-- **UAPI configuration**: The Go version accepts AWG parameters via the WireGuard UAPI interface. We use typed Rust constructors.
-- **Runtime config changes**: The Go version can update AWG parameters via UAPI at runtime. Our config is set at tunnel creation.
+- **Runtime config changes**: The Go version can update AWG parameters via UAPI at runtime. Ours are fixed when the tunnel is constructed, so changing them means recreating it.
+
+UAPI configuration is no longer on this list — see
+[Device and UAPI](#device-and-uapi-boringtun-cli).
 
 ## Known Limitations
 
 1. **Client-only**: This fork supports outbound AmneziaWG connections only. Server/inbound mode is not implemented.
 
-2. **No interop test suite yet**: Protocol correctness is verified by unit tests and code review against amneziawg-go. Automated interop tests against the Go server (Phase 8 of the implementation plan) are not yet implemented.
+2. **No cross-implementation interop test**: protocol correctness is verified by unit tests, a differential test against an independent reimplementation of the Go keystream sequence, and integration tests between two boringtun devices. Nothing here has yet exchanged a packet with amneziawg-go itself, so a shared misreading of the Go source would not be caught. The manual recipe in [Device and UAPI](#device-and-uapi-boringtun-cli) is the way to close that gap today; an automated Docker-based test against the Go implementation is not yet written.
 
 3. **Buffer size responsibility**: With padding active, callers must allocate larger output buffers than standard WireGuard. The `encapsulate()` and `format_handshake_initiation()` docs specify the required sizes.
 

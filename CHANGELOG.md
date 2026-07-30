@@ -12,6 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Amnezia3Config::parse` reads a UAPI-style `key=value` configuration block, covering the AmneziaWG 2.0 and 3.0 keys under their upstream names
 - JNI: `new_tunnel_amnezia3` (configured from that block), `wireguard_poll_outgoing_packet` and `tunnel_free`, so Android consumers can run AmneziaWG without binding the C FFI directly
 - `wireguard_ffi.h`: declarations for the AmneziaWG 2.0 surface (`amnezia_config`, `new_tunnel_amnezia`, `wireguard_poll_outgoing_packet`), which were missing entirely, alongside the new 3.0 ones
+- `device`: AmneziaWG support, making `boringtun-cli` a full AmneziaWG endpoint. Parameters are set with `set=1` and reported by `get=1`, so amneziawg-tools' `awg setconf`/`showconf` drive it directly.
+- `Amnezia3Config::to_uapi_block`, the inverse of `parse`, emitting only non-default fields
+- `PacketClassifier`, which strips the padding prefix and decrypts the protected header without a `Tunn`. A device has to classify a datagram before it knows which peer it belongs to, as amneziawg-go does on its own `Device`.
 
 ### Changed
 - Keepalives now carry the S4 padding prefix, matching amneziawg-go. This changes the wire size of keepalives for existing AmneziaWG 2.0 configurations with a non-zero S4.
@@ -20,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - JNI: tunnels created through the bindings could not be released — there was no `tunnel_free` binding, so every tunnel leaked
+- `device`: `set=1` split each line on every `=` rather than the first, rejecting any value containing one
 - C FFI: a zeroed `amnezia_config` was rejected instead of yielding standard WireGuard behavior, because the all-zero H1-H4 fields were read as four overlapping ranges
 - Range generation no longer overflows for a range covering the whole `u32` space
 - Junk packet sizes are drawn from the half-open range `[Jmin, Jmax)`, matching amneziawg-go's `min + fastrandn(max - min)`. Previously `Jmax` itself could be produced.

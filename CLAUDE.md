@@ -62,7 +62,9 @@ Files modified from upstream boringtun (keep these in mind during rebases):
 | `noise/timers.rs` | Clear network_outgoing queue on reset, AWG 3.0 randomized timings |
 | `ffi/mod.rs` | `amnezia_config`/`amnezia3_config`, `new_tunnel_amnezia`/`new_tunnel_amnezia3` |
 | `wireguard_ffi.h` | AWG 2.0 and 3.0 declarations |
-| `device/mod.rs` | Pass default HeaderConfig to verify_packet |
+| `device/mod.rs` | Device-scoped AWG config, AWG-aware receive, junk/I-packet drain sites |
+| `device/api.rs` | AWG keys over the UAPI socket (`set=1`/`get=1`) |
+| `device/peer.rs` | `drain_outgoing`, per-peer keepalive range |
 
 ## Key API
 

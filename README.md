@@ -108,6 +108,18 @@ val handle = BoringTunJNI.new_tunnel_amnezia3(
 
 Drain `wireguard_poll_outgoing_packet` after creating the tunnel and after every write/tick, and release it with `tunnel_free`. See [`AMNEZIA.md`](AMNEZIA.md#jni-api-android).
 
+### Device and CLI
+
+With the `device` feature, `boringtun-cli` is a full AmneziaWG endpoint, configured over the usual WireGuard UAPI socket — so amneziawg-tools' `awg` binary drives it directly:
+
+```bash
+sudo boringtun-cli awg0
+sudo awg setconf awg0 /etc/amnezia/awg0.conf
+sudo awg show awg0
+```
+
+The AmneziaWG parameters go in the `[Interface]` section. See [`AMNEZIA.md`](AMNEZIA.md#device-and-uapi-boringtun-cli) for the key list and the two places this diverges from WireGuard's UAPI semantics.
+
 ### Further reading
 
 - [`AMNEZIA.md`](AMNEZIA.md) — wire format, implementation details, and comparison with amneziawg-go
