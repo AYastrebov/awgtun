@@ -645,7 +645,16 @@ With header protection enabled the incoming datagram cannot be decrypted in plac
 
 ### What amneziawg-go Has That We Don't
 
-- **Server/responder mode**: We only implement client-side AWG. The Go version supports both.
+- **Batched I/O**: amneziawg-go inherits wireguard-go's `IdealBatchSize = 128`
+  reads and writes plus GSO on Linux (`conn/gso_linux.go`), so it amortizes one
+  syscall over up to 128 packets. The `device` here does one `recv_from` per
+  datagram. At high packet rates this dominates everything else on this page.
+- **Ordering**: Go runs `RoutineSequentialSender`/`RoutineSequentialReceiver` to
+  keep a peer's packets in order across its worker pool. Each thread here runs an
+  independent event loop, so datagrams can be reordered between threads.
+  WireGuard tolerates it — that is what the replay window is for — but it is a
+  deliberate difference, inherited from upstream boringtun.
+- **Live reconfiguration**: covered below.
 - **Runtime config changes**: The Go version's peers read the device
   configuration live, so a UAPI update takes effect on the next packet. A `Tunn`
   captures its configuration at construction, so a `Device` implements the same

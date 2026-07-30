@@ -44,6 +44,10 @@ pub trait RandomSource {
 }
 
 /// Production random source backed by the OS CSPRNG.
+///
+/// Every draw is a `getrandom` syscall, which costs on the order of 190 ns.
+/// That is the right price for bytes that go on the wire as ciphertext-grade
+/// filler, and too high for a value drawn on every packet — see [`FastRandom`].
 #[derive(Debug, Clone, Copy)]
 pub struct OsRandom;
 
@@ -51,6 +55,171 @@ impl RandomSource for OsRandom {
     fn fill_bytes(&mut self, out: &mut [u8]) {
         use rand_core::{OsRng, RngCore};
         OsRng.fill_bytes(out);
+    }
+}
+
+/// Buffered ChaCha20 keystream, seeded from the OS and kept per thread.
+///
+/// About eighteen times cheaper per draw than [`OsRandom`], because it
+/// amortizes one `getrandom` syscall over a buffer instead of making one per
+/// value. This is the same design as Go's `crypto/rand`, which is why
+/// amneziawg-go's `rand.Read` costs 36 ns where a raw syscall costs ~160.
+///
+/// # When to use which
+///
+/// Use this for everything that goes on the wire as random-looking material:
+/// the S1-S4 padding prefix, junk packet contents, CPS `<r>` bytes, the message
+/// type inside its H1-H4 range, content padding lengths, timer jitter.
+///
+/// Keep [`OsRandom`] for long-lived secrets — cookie and MAC keys, anything a
+/// peer's security depends on beyond a single packet. There is no throughput
+/// argument for those (they are drawn once), so the conservative choice is free.
+///
+/// # Why a CSPRNG is enough for the padding prefix
+///
+/// The first 12 bytes of the prefix are the header protection nonce, so a
+/// repeat would reuse a ChaCha20 keystream and leak the XOR of two headers.
+/// That is a real hazard, and it is *not* one the OS RNG protects against any
+/// better: with either source the nonces are uniform over 96 bits, so a
+/// collision is a birthday event around 2^48 packets. A CSPRNG's output is
+/// computationally indistinguishable from uniform, so the bound is the same up
+/// to a negligible term.
+///
+/// What genuinely differs is state duplication, which the OS RNG cannot suffer
+/// and a userspace buffer can — see the fork handling below.
+#[derive(Debug, Clone, Copy)]
+pub struct FastRandom;
+
+/// Incremented by a `pthread_atfork` child handler.
+///
+/// A buffered userspace RNG has one failure mode a `getrandom` syscall does
+/// not: `fork` copies the buffer, so parent and child hand out identical bytes
+/// from it. For padding that is keystream reuse, and it is not hypothetical
+/// here — `boringtun-cli` forks to daemonize, and any FFI or JNI embedder may
+/// fork for its own reasons.
+///
+/// Each thread records the generation it seeded at and throws its buffer away
+/// when the value moves, so a child never repeats a byte its parent might also
+/// emit. The check is one relaxed atomic load per draw; the handler itself only
+/// touches an atomic, which keeps it async-signal-safe as `pthread_atfork`
+/// requires.
+static FORK_GENERATION: portable_atomic::AtomicUsize = portable_atomic::AtomicUsize::new(0);
+
+#[cfg(unix)]
+extern "C" fn note_fork() {
+    FORK_GENERATION.fetch_add(1, portable_atomic::Ordering::Relaxed);
+}
+
+/// Keystream drawn per refill. Large enough to amortize the ChaCha20 setup over
+/// many draws, small enough to stay off the hot part of the cache.
+const FAST_RNG_BUFFER_SIZE: usize = 256;
+
+/// Reseed from the OS after this many bytes. ChaCha20 could safely emit vastly
+/// more from one key, so this is hygiene rather than necessity: it bounds how
+/// much output a leaked thread-local state could explain, at a cost of one
+/// syscall per megabyte.
+const FAST_RNG_RESEED_INTERVAL: usize = 1 << 20;
+
+struct FastRngState {
+    key: [u8; 32],
+    /// Nonce counter. ChaCha20 with a 12-byte nonce addresses 256 GiB per key,
+    /// far beyond the reseed interval, so this cannot wrap between reseeds.
+    block: u64,
+    buffer: [u8; FAST_RNG_BUFFER_SIZE],
+    /// Bytes of `buffer` already handed out.
+    used: usize,
+    since_reseed: usize,
+    /// Value of [`FORK_GENERATION`] this state was seeded at.
+    generation: usize,
+}
+
+impl FastRngState {
+    fn new() -> Self {
+        // Registered once per process. The handler must survive for the life of
+        // the process, so there is nothing to unregister.
+        #[cfg(unix)]
+        {
+            static REGISTER: std::sync::Once = std::sync::Once::new();
+            REGISTER.call_once(|| {
+                // Safety: `note_fork` only performs a relaxed atomic increment,
+                // which is async-signal-safe, as `pthread_atfork` child
+                // handlers must be.
+                unsafe {
+                    libc::pthread_atfork(None, None, Some(note_fork));
+                }
+            });
+        }
+
+        let mut state = FastRngState {
+            key: [0u8; 32],
+            block: 0,
+            buffer: [0u8; FAST_RNG_BUFFER_SIZE],
+            used: FAST_RNG_BUFFER_SIZE,
+            since_reseed: FAST_RNG_RESEED_INTERVAL,
+            generation: 0,
+        };
+        state.reseed();
+        state
+    }
+
+    fn reseed(&mut self) {
+        use rand_core::{OsRng, RngCore};
+        OsRng.fill_bytes(&mut self.key);
+        self.block = 0;
+        self.since_reseed = 0;
+        self.generation = FORK_GENERATION.load(portable_atomic::Ordering::Relaxed);
+        // Anything still buffered predates the new key, so drop it.
+        self.used = FAST_RNG_BUFFER_SIZE;
+    }
+
+    fn refill(&mut self) {
+        use chacha20::cipher::{KeyIvInit, StreamCipher};
+
+        if self.since_reseed >= FAST_RNG_RESEED_INTERVAL {
+            self.reseed();
+        }
+
+        let mut nonce = [0u8; 12];
+        nonce[..8].copy_from_slice(&self.block.to_le_bytes());
+        self.block += 1;
+
+        self.buffer = [0u8; FAST_RNG_BUFFER_SIZE];
+        let mut cipher = chacha20::ChaCha20::new((&self.key).into(), (&nonce).into());
+        cipher.apply_keystream(&mut self.buffer);
+
+        self.used = 0;
+        self.since_reseed += FAST_RNG_BUFFER_SIZE;
+    }
+
+    fn fill(&mut self, out: &mut [u8]) {
+        // Checked per draw rather than per refill: a fork copies whatever is
+        // still unconsumed in the buffer, so a child that only reseeded when the
+        // buffer ran dry would first hand out bytes its parent can also emit.
+        if self.generation != FORK_GENERATION.load(portable_atomic::Ordering::Relaxed) {
+            self.reseed();
+        }
+
+        let mut written = 0;
+        while written < out.len() {
+            if self.used == FAST_RNG_BUFFER_SIZE {
+                self.refill();
+            }
+            let take = (out.len() - written).min(FAST_RNG_BUFFER_SIZE - self.used);
+            out[written..written + take].copy_from_slice(&self.buffer[self.used..self.used + take]);
+            self.used += take;
+            written += take;
+        }
+    }
+}
+
+thread_local! {
+    static FAST_RNG: std::cell::RefCell<FastRngState> =
+        std::cell::RefCell::new(FastRngState::new());
+}
+
+impl RandomSource for FastRandom {
+    fn fill_bytes(&mut self, out: &mut [u8]) {
+        FAST_RNG.with(|state| state.borrow_mut().fill(out));
     }
 }
 
@@ -391,7 +560,6 @@ impl HeaderConfig {
         }
         Ok(())
     }
-
 }
 
 impl Default for HeaderConfig {
@@ -614,7 +782,7 @@ impl CpsTag {
                     0
                 } else {
                     // Standard base64 output length (with padding)
-                    ((data_len + 2) / 3) * 4
+                    data_len.div_ceil(3) * 4
                 }
             }
             CpsTag::DataSize { len } => *len,
@@ -1137,14 +1305,23 @@ impl HeaderProtection {
         u32::from_le_bytes(buf)
     }
 
-    /// Keystream bytes `0..4` for `prefix`. Every candidate message type in a
-    /// datagram shares the same nonce, so a receiver derives this mask once and
-    /// XORs it against each candidate instead of rebuilding the cipher.
-    /// Mirrors amneziawg-go's `typeHash`.
-    pub fn type_mask(&self, prefix: &[u8]) -> [u8; 4] {
-        let mut mask = [0u8; 4];
+    /// The first `N` keystream bytes for `prefix`.
+    ///
+    /// Everything a receiver decrypts in one datagram shares that datagram's
+    /// nonce, so the keystream is derived once and XORed wherever it is needed
+    /// rather than rebuilding the cipher per use. Drawing 16 bytes covers both
+    /// the 4-byte type check and the whole transport header, which is what lets
+    /// the receive path classify and decrypt with a single ChaCha20 setup;
+    /// amneziawg-go's `typeHash` is the 4-byte case of this.
+    pub fn keystream<const N: usize>(&self, prefix: &[u8]) -> [u8; N] {
+        let mut mask = [0u8; N];
         self.apply(prefix, &mut mask);
         mask
+    }
+
+    /// Keystream bytes `0..4`, the mask over a message type field.
+    pub fn type_mask(&self, prefix: &[u8]) -> [u8; 4] {
+        self.keystream::<4>(prefix)
     }
 }
 
@@ -1656,19 +1833,111 @@ mod tests {
     /// I-packets while leaving the headers alone is ordinary AmneziaWG. This
     /// used to reject exactly that, which made `s1=16 s2=16 s3=16 s4=16` — a
     /// perfectly valid obfuscation profile — unconfigurable.
+    /// The buffered RNG must produce fresh output, not a repeating buffer.
+    #[test]
+    fn fast_random_does_not_repeat_within_a_thread() {
+        // More than one buffer's worth, so the refill path is exercised.
+        let mut first = vec![0u8; FAST_RNG_BUFFER_SIZE * 3];
+        let mut second = vec![0u8; FAST_RNG_BUFFER_SIZE * 3];
+        FastRandom.fill_bytes(&mut first);
+        FastRandom.fill_bytes(&mut second);
+        assert_ne!(first, second, "consecutive draws must differ");
+
+        // No buffer-sized block should repeat within a single draw either,
+        // which is what a counter that failed to advance would look like.
+        let block = &first[..FAST_RNG_BUFFER_SIZE];
+        assert_ne!(
+            block,
+            &first[FAST_RNG_BUFFER_SIZE..FAST_RNG_BUFFER_SIZE * 2]
+        );
+        assert_ne!(block, &first[FAST_RNG_BUFFER_SIZE * 2..]);
+    }
+
+    /// A buffered userspace RNG's one failure mode the OS RNG does not have:
+    /// `fork` copies the buffer, so without the generation check the child
+    /// replays bytes the parent will also emit. For the S1-S4 prefix those
+    /// bytes are the header protection nonce, and a repeat is keystream reuse.
+    ///
+    /// This is not hypothetical — `boringtun-cli` forks to daemonize.
+    #[cfg(unix)]
+    #[test]
+    fn fork_does_not_duplicate_the_keystream() {
+        const N: usize = 64;
+
+        // Prime the buffer so the child inherits unconsumed bytes. Without the
+        // per-draw generation check it would hand those out verbatim.
+        let mut primer = [0u8; 16];
+        FastRandom.fill_bytes(&mut primer);
+
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe failed");
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+
+        if pid == 0 {
+            // Child. Only async-signal-safe work: the draw touches a
+            // thread-local and may call getrandom, and the write is a syscall.
+            let mut child_bytes = [0u8; N];
+            FastRandom.fill_bytes(&mut child_bytes);
+            unsafe {
+                libc::write(write_fd, child_bytes.as_ptr() as *const libc::c_void, N);
+                libc::_exit(0);
+            }
+        }
+
+        let mut parent_bytes = [0u8; N];
+        FastRandom.fill_bytes(&mut parent_bytes);
+
+        unsafe { libc::close(write_fd) };
+        let mut child_bytes = [0u8; N];
+        let mut read_total = 0;
+        while read_total < N {
+            let n = unsafe {
+                libc::read(
+                    read_fd,
+                    child_bytes.as_mut_ptr().add(read_total) as *mut libc::c_void,
+                    N - read_total,
+                )
+            };
+            assert!(n > 0, "short read from child");
+            read_total += n as usize;
+        }
+        unsafe {
+            libc::close(read_fd);
+            libc::waitpid(pid, std::ptr::null_mut(), 0);
+        }
+
+        assert_ne!(
+            parent_bytes.as_slice(),
+            child_bytes.as_slice(),
+            "parent and child emitted identical bytes after fork — the buffered \
+             state was inherited, which for an S1-S4 prefix is nonce reuse"
+        );
+    }
+
     #[test]
     fn accepts_standard_headers_alongside_other_awg_features() {
         let mut config = Amnezia2Config::default();
         config.paddings.s1 = 1;
-        config.validate().expect("padding with default headers is valid");
+        config
+            .validate()
+            .expect("padding with default headers is valid");
 
-        let mut config = Amnezia2Config::default();
-        config.paddings = PaddingConfig::new(16, 16, 16, 16).unwrap();
-        config.junk = JunkConfig::new(3, 64, 256).unwrap();
-        config.validate().expect("junk with default headers is valid");
+        let config = Amnezia2Config {
+            paddings: PaddingConfig::new(16, 16, 16, 16).unwrap(),
+            junk: JunkConfig::new(3, 64, 256).unwrap(),
+            ..Amnezia2Config::default()
+        };
+        config
+            .validate()
+            .expect("junk with default headers is valid");
 
-        let mut config = Amnezia3Config::default();
-        config.paddings = PaddingConfig::new(16, 16, 16, 16).unwrap();
+        let config = Amnezia3Config {
+            paddings: PaddingConfig::new(16, 16, 16, 16).unwrap(),
+            ..Amnezia3Config::default()
+        };
         config
             .validate()
             .expect("AWG 3.0 padding with default headers is valid");
@@ -1878,7 +2147,7 @@ mod tests {
         let out = c.generate_for_init(&mut rng);
         assert_eq!(out.len(), 3);
         for &b in &out {
-            assert!(b >= b'0' && b <= b'9', "byte {} is not a digit", b);
+            assert!(b.is_ascii_digit(), "byte {} is not a digit", b);
         }
     }
 
@@ -1928,7 +2197,7 @@ mod tests {
         let mut rng = DetRng::new(0);
         for _ in 0..50 {
             let v = range.generate(&mut rng);
-            assert!(v >= 100 && v <= 200, "value {} out of range", v);
+            assert!((100..=200).contains(&v), "value {} out of range", v);
         }
 
         let single = HeaderRange::single(42);

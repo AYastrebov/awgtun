@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 use super::errors::WireGuardError;
-use crate::amnezia::{OsRandom, RandomSource, TimingRanges};
+use crate::amnezia::{FastRandom, RandomSource, TimingRanges};
 use crate::noise::{Tunn, TunnResult};
 use std::mem;
 use std::ops::{Index, IndexMut};
@@ -105,7 +105,9 @@ impl Timers {
             rekey_timeout_current: REKEY_TIMEOUT,
             rekey_attempt_deadline: REKEY_ATTEMPT_TIME,
             persistent_keepalive_next: Duration::from_secs(u64::from(
-                timing_ranges.persistent_keepalive.pick_or(&mut OsRandom, 0),
+                timing_ranges
+                    .persistent_keepalive
+                    .pick_or(&mut FastRandom, 0),
             )),
             should_reset_rr: reset_rr,
         }
@@ -332,7 +334,7 @@ impl Tunn {
                         self.timers
                             .timing_ranges
                             .rekey_after_time
-                            .pick_or(&mut OsRandom, REKEY_AFTER_TIME_SECS),
+                            .pick_or(&mut FastRandom, REKEY_AFTER_TIME_SECS),
                     ));
                     if session_established < data_packet_sent
                         && now - session_established >= rekey_after_time
@@ -351,7 +353,7 @@ impl Tunn {
                         let ranges = &self.timers.timing_ranges;
                         let reject = ranges
                             .reject_after_time
-                            .pick_or(&mut OsRandom, REJECT_AFTER_TIME_SECS);
+                            .pick_or(&mut FastRandom, REJECT_AFTER_TIME_SECS);
                         let margin = ranges.keepalive_timeout.lo_or(KEEPALIVE_TIMEOUT_SECS)
                             + ranges.rekey_timeout.lo_or(REKEY_TIMEOUT_SECS);
                         Duration::from_secs(u64::from(reject.saturating_sub(margin)))
@@ -379,7 +381,7 @@ impl Tunn {
                         ranges.keepalive_timeout.hi_or(KEEPALIVE_TIMEOUT_SECS)
                             + ranges
                                 .rekey_timeout
-                                .pick_or(&mut OsRandom, REKEY_TIMEOUT_SECS),
+                                .pick_or(&mut FastRandom, REKEY_TIMEOUT_SECS),
                     ))
                 };
                 if data_packet_sent > aut_packet_received
@@ -398,7 +400,7 @@ impl Tunn {
                         self.timers
                             .timing_ranges
                             .keepalive_timeout
-                            .pick_or(&mut OsRandom, KEEPALIVE_TIMEOUT_SECS),
+                            .pick_or(&mut FastRandom, KEEPALIVE_TIMEOUT_SECS),
                     ));
                     if data_packet_received > aut_packet_sent
                         && now - aut_packet_sent >= keepalive_timeout
@@ -417,7 +419,7 @@ impl Tunn {
                             >= self.timers.persistent_keepalive_next
                         {
                             self.timers.persistent_keepalive_next = Duration::from_secs(u64::from(
-                                keepalive_range.generate(&mut OsRandom),
+                                keepalive_range.generate(&mut FastRandom),
                             ));
                             tracing::debug!("KEEPALIVE(PERSISTENT_KEEPALIVE)");
                             self.timer_tick(TimePersistentKeepalive);

@@ -35,12 +35,12 @@ use std::sync::Arc;
 use std::thread;
 use std::thread::JoinHandle;
 
-use crate::amnezia::{Amnezia3Config, U32Range};
+use crate::amnezia::{Amnezia3Config, FastRandom, RandomSource as _, U32Range};
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::parse_handshake_anon;
 use crate::noise::rate_limiter::RateLimiter;
 use crate::noise::{Packet, Tunn, TunnResult};
-use crate::noise::{PacketClassifier, COOKIE_REPLY_SZ};
+use crate::noise::{PacketClassifier, COOKIE_REPLY_SZ, TRANSPORT_HEADER_SZ};
 use crate::x25519;
 use allowed_ips::AllowedIps;
 use parking_lot::Mutex;
@@ -324,7 +324,7 @@ impl Device {
         }
 
         // Update an existing peer
-        if self.peers.get(&pub_key).is_some() {
+        if self.peers.contains_key(&pub_key) {
             // We already have a peer, we need to merge the existing config into the newly created one
             panic!("Modifying existing peers is not yet supported. Remove and add again instead.");
         }
@@ -752,16 +752,35 @@ impl Device {
                     // device owns its receive buffer, so the decryption is done
                     // in place. The nonce is the padding prefix, which is not
                     // part of the mutated span.
-                    let (padding, protected_len) = PacketClassifier::from_config(&d.amnezia)
-                        .classify(&t.src_buf[..packet_len])
+                    let classified = PacketClassifier::from_config(&d.amnezia)
+                        .classify(&t.src_buf[..packet_len]);
+                    let (padding, protected_len) = classified
+                        .map(|c| (c.padding, c.protected_len))
                         .unwrap_or((0, 0));
 
-                    if let Some(hp) = d.amnezia.header_protection() {
-                        let protected = protected_len.min(packet_len - padding);
-                        if protected > 0 {
-                            let (prefix, message) = t.src_buf[..packet_len].split_at_mut(padding);
-                            hp.apply(prefix, &mut message[..protected]);
+                    let protected = protected_len.min(packet_len - padding);
+                    match classified.and_then(|c| c.header_mask) {
+                        // A transport header is exactly the span `classify`
+                        // already derived the keystream for, so decrypt it with
+                        // an XOR instead of building the same cipher twice. This
+                        // is the per-packet case.
+                        Some(mask) if protected == TRANSPORT_HEADER_SZ => {
+                            let message = &mut t.src_buf[padding..packet_len];
+                            for (byte, mask_byte) in message.iter_mut().zip(mask.iter()) {
+                                *byte ^= mask_byte;
+                            }
                         }
+                        // A handshake message is protected past those 16 bytes.
+                        // Once per handshake, so the second cipher setup is not
+                        // worth avoiding.
+                        _ if protected > 0 => {
+                            if let Some(hp) = d.amnezia.header_protection() {
+                                let (prefix, message) =
+                                    t.src_buf[..packet_len].split_at_mut(padding);
+                                hp.apply(prefix, &mut message[..protected]);
+                            }
+                        }
+                        _ => {}
                     }
 
                     let packet = &t.src_buf[padding..packet_len];
@@ -781,7 +800,7 @@ impl Device {
                             let s3 = d.amnezia.paddings.s3 as usize;
                             let len = cookie_reply.len();
                             if s3 > 0 {
-                                OsRng.fill_bytes(&mut t.dst_buf[..s3]);
+                                FastRandom.fill_bytes(&mut t.dst_buf[..s3]);
                             }
                             t.dst_buf[s3..s3 + len].copy_from_slice(cookie_reply);
                             if let Some(hp) = d.amnezia.header_protection() {

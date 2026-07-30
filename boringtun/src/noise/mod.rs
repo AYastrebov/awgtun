@@ -10,8 +10,8 @@ mod timers;
 
 use crate::amnezia::RandomSource as _;
 use crate::amnezia::{
-    Amnezia2Config, Amnezia3Config, ConfigError, HeaderConfig, HeaderProtection, InitPacketConfig,
-    JunkConfig, OsRandom, PaddingConfig, U32Range,
+    Amnezia2Config, Amnezia3Config, ConfigError, FastRandom, HeaderConfig, HeaderProtection,
+    InitPacketConfig, JunkConfig, PaddingConfig, U32Range,
 };
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::Handshake;
@@ -95,17 +95,45 @@ pub struct Tunn {
     network_outgoing: VecDeque<Vec<u8>>,
 }
 
+/// The standard WireGuard message types. AmneziaWG replaces these constants
+/// with the H1-H4 ranges, so nothing outside tests reads them any more — they
+/// stay because they name what a dynamic header generalizes, and
+/// `HeaderConfig::wireguard_compatible` has to agree with them.
+#[allow(dead_code)]
 type MessageType = u32;
+#[allow(dead_code)]
 const HANDSHAKE_INIT: MessageType = 1;
+#[allow(dead_code)]
 const HANDSHAKE_RESP: MessageType = 2;
+#[allow(dead_code)]
 const COOKIE_REPLY: MessageType = 3;
+#[allow(dead_code)]
 const DATA: MessageType = 4;
+
+/// Compare two byte slices in constant time.
+///
+/// These compare MACs and a decrypted static public key against
+/// attacker-supplied bytes, so an early return would leak how much of the value
+/// the attacker guessed right — one byte at a time is enough to forge.
+///
+/// This used `ring::constant_time::verify_slices_are_equal`, which ring has
+/// deprecated with the note that it makes "no promises regarding side
+/// channels" and will be removed. That promise was the only reason to call it,
+/// so the guarantee now comes from `subtle`, which exists for exactly this and
+/// was already in the dependency tree.
+///
+/// Length is public — it comes from the wire format, not the secret — so the
+/// early length check `subtle` performs leaks nothing.
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    use subtle::ConstantTimeEq;
+    a.ct_eq(b).into()
+}
 
 const HANDSHAKE_INIT_SZ: usize = 148;
 const HANDSHAKE_RESP_SZ: usize = 92;
 pub(crate) const COOKIE_REPLY_SZ: usize = 64;
 const DATA_OVERHEAD_SZ: usize = 32;
-const TRANSPORT_HEADER_SZ: usize = 16; // type(4) + receiver(4) + counter(8)
+pub(crate) const TRANSPORT_HEADER_SZ: usize = 16; // type(4) + receiver(4) + counter(8)
 /// Wire size of an unpadded keepalive: transport header + AEAD tag.
 /// Matches amneziawg-go's `MessageKeepaliveSize`.
 const KEEPALIVE_SZ: usize = DATA_OVERHEAD_SZ;
@@ -156,11 +184,9 @@ impl<'a> PacketClassifier<'a> {
     /// the padding offset. With AWG 3.0 header protection enabled, the 4 type
     /// bytes are decrypted before the range check.
     ///
-    /// Returns `Some((padding, protected_len))` where `protected_len` is the
-    /// number of bytes after the padding covered by header protection (the full
-    /// message for handshake types, the 16-byte header for transport), or
-    /// `None` if no message type matches.
-    pub fn classify(&self, src: &[u8]) -> Option<(usize, usize)> {
+    /// Returns `None` if no message type matches. See [`Classified`] for what a
+    /// match carries.
+    pub fn classify(&self, src: &[u8]) -> Option<Classified> {
         let checks: [(usize, &crate::amnezia::HeaderRange, usize, bool); 4] = [
             (
                 self.paddings.s1 as usize,
@@ -188,12 +214,14 @@ impl<'a> PacketClassifier<'a> {
             ),
         ];
 
-        // Every candidate shares the same nonce — the first 12 bytes of the
-        // datagram — so the type keystream is derived once, as in
-        // amneziawg-go's `typeHash`.
-        let type_mask = match self.header_protection {
+        // Every candidate shares this datagram's nonce, so the keystream is
+        // derived once here and reused: for the type check below, and — for a
+        // transport packet, where the protected span is exactly these 16 bytes
+        // — by the caller, which would otherwise rebuild the same cipher with
+        // the same key and nonce to recompute the bytes we already have.
+        let header_mask = match self.header_protection {
             Some(hp) if src.len() >= crate::amnezia::HEADER_PROTECTION_NONCE_SIZE => {
-                Some(hp.type_mask(src))
+                Some(hp.keystream::<TRANSPORT_HEADER_SZ>(src))
             }
             _ => None,
         };
@@ -209,7 +237,7 @@ impl<'a> PacketClassifier<'a> {
                 let mut type_bytes: [u8; 4] = src[padding..padding + 4]
                     .try_into()
                     .expect("bounds checked: padding + 4 <= src.len()");
-                if let Some(mask) = type_mask {
+                if let Some(mask) = header_mask {
                     for (byte, mask_byte) in type_bytes.iter_mut().zip(mask.iter()) {
                         *byte ^= mask_byte;
                     }
@@ -221,12 +249,35 @@ impl<'a> PacketClassifier<'a> {
                     } else {
                         TRANSPORT_HEADER_SZ
                     };
-                    return Some((padding, protected_len));
+                    return Some(Classified {
+                        padding,
+                        protected_len,
+                        header_mask,
+                    });
                 }
             }
         }
         None
     }
+}
+
+/// What [`PacketClassifier::classify`] recovered about a datagram.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Classified {
+    /// Bytes of S1-S4 crypto padding to strip before the message.
+    pub padding: usize,
+    /// Bytes after the padding covered by header protection: the whole message
+    /// for the handshake types, the 16-byte header for transport.
+    pub protected_len: usize,
+    /// Keystream for this datagram, when header protection is enabled — enough
+    /// to cover a transport header. XOR it in rather than calling
+    /// [`HeaderProtection::apply`] again; the cipher setup is the expensive
+    /// part and it has already been paid.
+    ///
+    /// A handshake message is protected past these 16 bytes, so those paths
+    /// still call `apply`. They run once per handshake rather than once per
+    /// packet, so the second setup does not matter there.
+    pub header_mask: Option<[u8; TRANSPORT_HEADER_SZ]>,
 }
 
 #[derive(Debug)]
@@ -270,7 +321,7 @@ pub enum Packet<'a> {
 
 impl Tunn {
     #[inline(always)]
-    pub fn parse_incoming_packet(src: &[u8]) -> Result<Packet, WireGuardError> {
+    pub fn parse_incoming_packet(src: &[u8]) -> Result<Packet<'_>, WireGuardError> {
         Self::parse_incoming_packet_config(src, &HeaderConfig::default())
     }
 
@@ -511,7 +562,7 @@ impl Tunn {
             Some(range) => range,
             None => return 0,
         };
-        let mut add = range.generate(&mut OsRandom) as usize;
+        let mut add = range.generate(&mut FastRandom) as usize;
 
         let mtu = self.mtu as usize;
         if mtu != 0 {
@@ -545,7 +596,7 @@ impl Tunn {
         content_padding: usize,
         dst: &'a mut [u8],
     ) -> &'a mut [u8] {
-        let transport_type = self.header_config.transport.generate(&mut OsRandom);
+        let transport_type = self.header_config.transport.generate(&mut FastRandom);
         let s4 = self.padding_config.s4 as usize;
 
         // Write WG packet at offset s4, then fill the prefix with random padding
@@ -553,7 +604,7 @@ impl Tunn {
             session.format_packet_data(src, &mut dst[s4..], transport_type, content_padding);
         let packet_len = packet.len();
         if s4 > 0 {
-            OsRandom.fill_bytes(&mut dst[..s4]);
+            FastRandom.fill_bytes(&mut dst[..s4]);
         }
         if let Some(hp) = self.header_protection {
             let (prefix, message) = dst.split_at_mut(s4);
@@ -581,19 +632,26 @@ impl Tunn {
 
         // Strip AmneziaWG padding before parsing; with AWG 3.0 header
         // protection, decrypt the protected region first.
-        let (padding, protected_len) = self.determine_padding(datagram).unwrap_or((0, 0));
+        let classified = self.determine_padding(datagram);
+        let (padding, protected_len) = classified
+            .map(|c| (c.padding, c.protected_len))
+            .unwrap_or((0, 0));
         let payload = &datagram[padding..];
 
         // Transport packets protect only the 16-byte header, so the message is
         // never contiguous after decryption. Decrypt the header on the stack and
         // assemble the packet directly — `verify_packet` neither MACs nor rate
-        // limits transport packets, and `determine_padding` already matched the
-        // type against H4 and checked the minimum size.
-        if let Some(hp) = self.header_protection {
-            if protected_len == TRANSPORT_HEADER_SZ {
+        // limits transport packets, and classification already matched the type
+        // against H4 and checked the minimum size.
+        if protected_len == TRANSPORT_HEADER_SZ {
+            if let Some(mask) = classified.and_then(|c| c.header_mask) {
                 let mut header = [0u8; TRANSPORT_HEADER_SZ];
                 header.copy_from_slice(&payload[..TRANSPORT_HEADER_SZ]);
-                hp.apply(&datagram[..padding], &mut header);
+                // The keystream came back from `classify`, so this costs an XOR
+                // rather than a second ChaCha20 setup over the same nonce.
+                for (byte, mask_byte) in header.iter_mut().zip(mask.iter()) {
+                    *byte ^= mask_byte;
+                }
                 let packet = Packet::PacketData(PacketData {
                     receiver_idx: u32::from_le_bytes(
                         header[4..8].try_into().expect("fixed 16-byte header"),
@@ -633,7 +691,7 @@ impl Tunn {
                 // Add S3 padding to cookie reply
                 let s3 = self.padding_config.s3 as usize;
                 if s3 > 0 {
-                    OsRandom.fill_bytes(&mut dst[..s3]);
+                    FastRandom.fill_bytes(&mut dst[..s3]);
                 }
                 dst[s3..s3 + cookie.len()].copy_from_slice(cookie);
                 if let Some(hp) = self.header_protection {
@@ -673,7 +731,7 @@ impl Tunn {
             remote_idx = p.sender_idx
         );
 
-        let resp_type = self.header_config.response.generate(&mut OsRandom);
+        let resp_type = self.header_config.response.generate(&mut FastRandom);
         let s2 = self.padding_config.s2 as usize;
         let (packet, session) =
             self.handshake
@@ -685,7 +743,7 @@ impl Tunn {
 
         let packet_len = packet.len();
         if s2 > 0 {
-            OsRandom.fill_bytes(&mut dst[..s2]);
+            FastRandom.fill_bytes(&mut dst[..s2]);
         }
         if let Some(hp) = self.header_protection {
             let (prefix, message) = dst.split_at_mut(s2);
@@ -824,13 +882,13 @@ impl Tunn {
 
         let starting_new_handshake = !self.handshake.is_in_progress();
         self.timers
-            .roll_handshake_timings(&mut OsRandom, starting_new_handshake);
+            .roll_handshake_timings(&mut FastRandom, starting_new_handshake);
 
         // Queue I-packets and junk before the handshake initiation
         // (sent as separate UDP datagrams before the real init)
         self.queue_pre_handshake_packets();
 
-        let init_type = self.header_config.init.generate(&mut OsRandom);
+        let init_type = self.header_config.init.generate(&mut FastRandom);
         let s1 = self.padding_config.s1 as usize;
 
         match self
@@ -842,7 +900,7 @@ impl Tunn {
 
                 let packet_len = packet.len();
                 if s1 > 0 {
-                    OsRandom.fill_bytes(&mut dst[..s1]);
+                    FastRandom.fill_bytes(&mut dst[..s1]);
                 }
                 if let Some(hp) = self.header_protection {
                     let (prefix, message) = dst.split_at_mut(s1);
@@ -864,14 +922,14 @@ impl Tunn {
     fn queue_pre_handshake_packets(&mut self) {
         // I-packets first
         for chain in self.init_packet_config.active_chains() {
-            let packet = chain.generate_for_init(&mut OsRandom);
+            let packet = chain.generate_for_init(&mut FastRandom);
             if !packet.is_empty() {
                 self.network_outgoing.push_back(packet);
             }
         }
 
         // Then junk packets
-        let junk_packets = self.junk_config.generate_junk_packets(&mut OsRandom);
+        let junk_packets = self.junk_config.generate_junk_packets(&mut FastRandom);
         for junk in junk_packets {
             self.network_outgoing.push_back(junk);
         }
@@ -974,7 +1032,7 @@ impl Tunn {
     }
 
     /// See [`PacketClassifier::classify`].
-    fn determine_padding(&self, src: &[u8]) -> Option<(usize, usize)> {
+    fn determine_padding(&self, src: &[u8]) -> Option<Classified> {
         self.classifier().classify(src)
     }
 
@@ -1277,12 +1335,11 @@ mod tests {
             let (prefix, message) = datagram.split_at_mut(padding);
             hp.apply(prefix, &mut message[..expected_protected]);
 
-            assert_eq!(
-                classifier.classify(&datagram),
-                Some((padding, expected_protected)),
-                "message type {} should classify",
-                msg_type
-            );
+            let classified = classifier
+                .classify(&datagram)
+                .unwrap_or_else(|| panic!("message type {} should classify", msg_type));
+            assert_eq!(classified.padding, padding);
+            assert_eq!(classified.protected_len, expected_protected);
         }
     }
 
@@ -1307,6 +1364,48 @@ mod tests {
         assert_eq!(classifier.classify(&short), None);
     }
 
+    /// The keystream `classify` hands back must be the one `apply` would have
+    /// produced, because the receive path uses it to decrypt a transport header
+    /// instead of building a second cipher. If the two ever diverged, every
+    /// AWG 3.0 data packet would decrypt to garbage while handshakes — which
+    /// still go through `apply` — kept working, which is a miserable thing to
+    /// debug from the symptom.
+    #[test]
+    fn classified_header_mask_matches_a_second_apply() {
+        let config = awg3_test_config([0x42; 32]);
+        let hp = config.header_protection().expect("key is set");
+        let classifier = PacketClassifier::from_config(&config);
+
+        let padding = 16;
+        let mut datagram = vec![0u8; padding + DATA_OVERHEAD_SZ + 64];
+        for (i, byte) in datagram[..padding].iter_mut().enumerate() {
+            *byte = (i as u8).wrapping_mul(37).wrapping_add(11);
+        }
+        // A transport header with recognisable receiver index and counter.
+        datagram[padding..padding + 4].copy_from_slice(&400u32.to_le_bytes());
+        datagram[padding + 4..padding + 8].copy_from_slice(&0xdead_beefu32.to_le_bytes());
+        datagram[padding + 8..padding + 16]
+            .copy_from_slice(&0x0123_4567_89ab_cdefu64.to_le_bytes());
+        let plaintext_header = datagram[padding..padding + TRANSPORT_HEADER_SZ].to_vec();
+
+        let (prefix, message) = datagram.split_at_mut(padding);
+        hp.apply(prefix, &mut message[..TRANSPORT_HEADER_SZ]);
+
+        let classified = classifier
+            .classify(&datagram)
+            .expect("transport classifies");
+        let mask = classified.header_mask.expect("header protection is on");
+
+        let mut decrypted = datagram[padding..padding + TRANSPORT_HEADER_SZ].to_vec();
+        for (byte, mask_byte) in decrypted.iter_mut().zip(mask.iter()) {
+            *byte ^= mask_byte;
+        }
+        assert_eq!(
+            decrypted, plaintext_header,
+            "XORing the classifier's keystream must undo `apply`"
+        );
+    }
+
     /// Without header protection or padding the classifier must agree with
     /// standard WireGuard framing, which is what keeps `Tunn::new` unaffected.
     #[test]
@@ -1316,11 +1415,20 @@ mod tests {
 
         let mut init = vec![0u8; HANDSHAKE_INIT_SZ];
         init[..4].copy_from_slice(&HANDSHAKE_INIT.to_le_bytes());
-        assert_eq!(classifier.classify(&init), Some((0, HANDSHAKE_INIT_SZ)));
+        let classified = classifier.classify(&init).expect("init classifies");
+        assert_eq!(
+            (classified.padding, classified.protected_len),
+            (0, HANDSHAKE_INIT_SZ)
+        );
+        assert!(classified.header_mask.is_none(), "no key, so no keystream");
 
         let mut data = vec![0u8; DATA_OVERHEAD_SZ + 100];
         data[..4].copy_from_slice(&DATA.to_le_bytes());
-        assert_eq!(classifier.classify(&data), Some((0, TRANSPORT_HEADER_SZ)));
+        let classified = classifier.classify(&data).expect("data classifies");
+        assert_eq!(
+            (classified.padding, classified.protected_len),
+            (0, TRANSPORT_HEADER_SZ)
+        );
     }
 
     #[test]
@@ -1790,7 +1898,7 @@ mod tests {
         let v2 = Amnezia2Config {
             junk: JunkConfig::disabled(),
             paddings,
-            headers: headers.clone(),
+            headers,
             init_packets: InitPacketConfig::default(),
         };
         let mut v3 = Amnezia3Config::from_amnezia2(v2.clone());

@@ -1,5 +1,5 @@
 use super::handshake::{b2s_hash, b2s_keyed_mac_16, b2s_keyed_mac_16_2, b2s_mac_24};
-use crate::amnezia::{HeaderConfig, OsRandom};
+use crate::amnezia::{FastRandom, HeaderConfig};
 use crate::noise::handshake::{LABEL_COOKIE, LABEL_MAC1};
 use crate::noise::{HandshakeInit, HandshakeResponse, Packet, Tunn, TunnResult, WireGuardError};
 
@@ -16,7 +16,6 @@ use aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::{Key, XChaCha20Poly1305};
 use parking_lot::Mutex;
 use rand_core::{OsRng, RngCore};
-use ring::constant_time::verify_slices_are_equal;
 
 const COOKIE_REFRESH: u64 = 128; // Use 128 and not 120 so the compiler can optimize out the division
 const COOKIE_SIZE: usize = 16;
@@ -27,14 +26,17 @@ const RESET_PERIOD: u64 = 1;
 
 type Cookie = [u8; COOKIE_SIZE];
 
-/// There are two places where WireGuard requires "randomness" for cookies
-/// * The 24 byte nonce in the cookie massage - here the only goal is to avoid nonce reuse
-/// * A secret value that changes every two minutes
-/// Because the main goal of the cookie is simply for a party to prove ownership of an IP address
-/// we can relax the randomness definition a bit, in order to avoid locking, because using less
-/// resources is the main goal of any DoS prevention mechanism.
-/// In order to avoid locking and calls to rand we derive pseudo random values using the AEAD and
-/// some counters.
+/// There are two places where WireGuard requires "randomness" for cookies:
+///
+/// * The 24 byte nonce in the cookie message — here the only goal is to avoid
+///   nonce reuse.
+/// * A secret value that changes every two minutes.
+///
+/// Because the main goal of the cookie is simply for a party to prove ownership
+/// of an IP address we can relax the randomness definition a bit, in order to
+/// avoid locking, because using less resources is the main goal of any DoS
+/// prevention mechanism. In order to avoid locking and calls to rand we derive
+/// pseudo random values using the AEAD and some counters.
 pub struct RateLimiter {
     /// The key we use to derive the nonce
     nonce_key: [u8; 32],
@@ -168,8 +170,9 @@ impl RateLimiter {
             let (mac1, mac2) = macs.split_at(16);
 
             let computed_mac1 = b2s_keyed_mac_16(&self.mac1_key, msg);
-            verify_slices_are_equal(&computed_mac1[..16], mac1)
-                .map_err(|_| TunnResult::Err(WireGuardError::InvalidMac))?;
+            if !super::constant_time_eq(&computed_mac1[..16], mac1) {
+                return Err(TunnResult::Err(WireGuardError::InvalidMac));
+            }
 
             if self.is_under_load() {
                 let addr = match src_addr {
@@ -181,8 +184,8 @@ impl RateLimiter {
                 let cookie = self.current_cookie(addr);
                 let computed_mac2 = b2s_keyed_mac_16_2(&cookie, msg, mac1);
 
-                if verify_slices_are_equal(&computed_mac2[..16], mac2).is_err() {
-                    let cookie_msg_type = header_config.cookie.generate(&mut OsRandom);
+                if !super::constant_time_eq(&computed_mac2[..16], mac2) {
+                    let cookie_msg_type = header_config.cookie.generate(&mut FastRandom);
                     let cookie_packet = self
                         .format_cookie_reply(sender_idx, cookie, mac1, dst, cookie_msg_type)
                         .map_err(TunnResult::Err)?;
@@ -192,5 +195,201 @@ impl RateLimiter {
         }
 
         Ok(packet)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::amnezia::{Amnezia3Config, HeaderRange, PaddingConfig};
+    use crate::noise::{Packet, Tunn};
+    use rand_core::OsRng;
+    use std::convert::TryInto as _;
+
+    /// H3 is what a cookie reply's type is drawn from, so give each range a
+    /// distinct, easily recognised band.
+    fn awg_headers() -> HeaderConfig {
+        HeaderConfig::new(
+            HeaderRange::new(1000, 1099).unwrap(),
+            HeaderRange::new(2000, 2099).unwrap(),
+            HeaderRange::new(3000, 3099).unwrap(),
+            HeaderRange::new(4000, 4099).unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// A tunnel plus the responder's public key, and a genuine handshake
+    /// initiation from it — MACs included, which is what makes it a usable
+    /// input for `verify_packet`.
+    fn initiation(headers: HeaderConfig) -> (crate::x25519::PublicKey, Vec<u8>) {
+        let initiator_secret = crate::x25519::StaticSecret::random_from_rng(OsRng);
+        let responder_secret = crate::x25519::StaticSecret::random_from_rng(OsRng);
+        let responder_public = crate::x25519::PublicKey::from(&responder_secret);
+
+        let mut config = Amnezia3Config::wireguard_compatible();
+        config.headers = headers;
+        // No padding: `verify_packet` is given an already-stripped message.
+        config.paddings = PaddingConfig::default();
+
+        let mut initiator = Tunn::new_with_amnezia3(
+            initiator_secret,
+            responder_public,
+            None,
+            None,
+            1,
+            None,
+            config,
+        )
+        .unwrap();
+
+        let mut buf = vec![0u8; 2048];
+        let packet = match initiator.format_handshake_initiation(&mut buf, false) {
+            TunnResult::WriteToNetwork(packet) => packet.to_vec(),
+            other => panic!("expected an initiation, got {:?}", other),
+        };
+        (responder_public, packet)
+    }
+
+    /// The happy path: a genuine initiation carries a mac1 the responder can
+    /// recompute, so it verifies. Nothing else in the suite covers mac1 at all.
+    #[test]
+    fn accepts_a_genuine_initiation() {
+        let (responder_public, packet) = initiation(HeaderConfig::wireguard_compatible());
+        let limiter = RateLimiter::new(&responder_public, 100);
+        let mut dst = [0u8; super::super::COOKIE_REPLY_SZ];
+
+        let parsed = limiter
+            .verify_packet(
+                None,
+                &packet,
+                &mut dst,
+                &HeaderConfig::wireguard_compatible(),
+            )
+            .expect("a genuine initiation must verify");
+        assert!(matches!(parsed, Packet::HandshakeInit(_)));
+    }
+
+    /// mac1 is what stops an attacker from spending our CPU on Noise
+    /// operations for packets it cannot have authored. Flipping a single bit
+    /// anywhere in the MAC has to be rejected — which is also the behaviour the
+    /// constant-time comparison exists to protect.
+    #[test]
+    fn rejects_a_forged_mac1() {
+        let (responder_public, packet) = initiation(HeaderConfig::wireguard_compatible());
+        let limiter = RateLimiter::new(&responder_public, 100);
+        let mut dst = [0u8; super::super::COOKIE_REPLY_SZ];
+
+        // mac1 occupies the 16 bytes preceding the 16 mac2 bytes.
+        let mac1_start = packet.len() - 32;
+        for bit in [0usize, 7, 63, 127] {
+            let mut forged = packet.clone();
+            forged[mac1_start + bit / 8] ^= 1 << (bit % 8);
+            let result = limiter.verify_packet(
+                None,
+                &forged,
+                &mut dst,
+                &HeaderConfig::wireguard_compatible(),
+            );
+            assert!(
+                matches!(result, Err(TunnResult::Err(WireGuardError::InvalidMac))),
+                "flipping mac1 bit {} must be rejected",
+                bit
+            );
+        }
+    }
+
+    /// A rate limiter with a limit of zero is always under load, which is how
+    /// the cookie path is reached deterministically. Without a valid mac2 the
+    /// responder answers with a cookie reply rather than doing Noise work.
+    #[test]
+    fn issues_a_cookie_reply_when_under_load() {
+        let (responder_public, packet) = initiation(HeaderConfig::wireguard_compatible());
+        let limiter = RateLimiter::new(&responder_public, 0);
+        let mut dst = [0u8; super::super::COOKIE_REPLY_SZ];
+
+        let addr: IpAddr = "192.0.2.10".parse().unwrap();
+        match limiter.verify_packet(
+            Some(addr),
+            &packet,
+            &mut dst,
+            &HeaderConfig::wireguard_compatible(),
+        ) {
+            Err(TunnResult::WriteToNetwork(reply)) => {
+                assert_eq!(reply.len(), super::super::COOKIE_REPLY_SZ);
+                assert_eq!(
+                    u32::from_le_bytes(reply[..4].try_into().unwrap()),
+                    3,
+                    "a plain WireGuard cookie reply is type 3"
+                );
+            }
+            other => panic!("expected a cookie reply, got {:?}", other),
+        }
+    }
+
+    /// The AmneziaWG variant of the same path: the cookie reply's type must be
+    /// drawn from H3, not the standard 3, or a peer expecting obfuscated
+    /// headers cannot classify it and the cookie is lost.
+    #[test]
+    fn cookie_reply_uses_the_configured_h3_range() {
+        let headers = awg_headers();
+        let (responder_public, packet) = initiation(headers);
+        let limiter = RateLimiter::new(&responder_public, 0);
+        let addr: IpAddr = "192.0.2.10".parse().unwrap();
+
+        // Several draws, since the type is random within the range.
+        for _ in 0..16 {
+            let mut dst = [0u8; super::super::COOKIE_REPLY_SZ];
+            match limiter.verify_packet(Some(addr), &packet, &mut dst, &headers) {
+                Err(TunnResult::WriteToNetwork(reply)) => {
+                    let msg_type = u32::from_le_bytes(reply[..4].try_into().unwrap());
+                    assert!(
+                        headers.cookie.contains(msg_type),
+                        "cookie reply type {} is outside H3",
+                        msg_type
+                    );
+                }
+                other => panic!("expected a cookie reply, got {:?}", other),
+            }
+        }
+    }
+
+    /// Without a source address there is no cookie to bind to, so an
+    /// under-load responder drops the packet instead of answering.
+    #[test]
+    fn refuses_to_answer_under_load_without_a_source_address() {
+        let (responder_public, packet) = initiation(HeaderConfig::wireguard_compatible());
+        let limiter = RateLimiter::new(&responder_public, 0);
+        let mut dst = [0u8; super::super::COOKIE_REPLY_SZ];
+
+        let result = limiter.verify_packet(
+            None,
+            &packet,
+            &mut dst,
+            &HeaderConfig::wireguard_compatible(),
+        );
+        assert!(matches!(
+            result,
+            Err(TunnResult::Err(WireGuardError::UnderLoad))
+        ));
+    }
+
+    /// A short destination buffer must be reported, not written past.
+    #[test]
+    fn rejects_a_cookie_buffer_that_is_too_small() {
+        let (responder_public, packet) = initiation(HeaderConfig::wireguard_compatible());
+        let limiter = RateLimiter::new(&responder_public, 0);
+        let mut dst = [0u8; super::super::COOKIE_REPLY_SZ - 1];
+
+        let addr: IpAddr = "192.0.2.10".parse().unwrap();
+        let result = limiter.verify_packet(
+            Some(addr),
+            &packet,
+            &mut dst,
+            &HeaderConfig::wireguard_compatible(),
+        );
+        assert!(matches!(
+            result,
+            Err(TunnResult::Err(WireGuardError::DestinationBufferTooSmall))
+        ));
     }
 }

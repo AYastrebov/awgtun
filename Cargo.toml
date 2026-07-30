@@ -1,5 +1,10 @@
 [workspace]
 members = ["boringtun", "boringtun-cli"]
+# Edition 2021 implies resolver 2; state it so cargo does not warn and fall back
+# to resolver 1. Verified not to change the feature set the lib is built with,
+# which matters: CI runs the device integration tests via a bare
+# `cargo test -- --ignored`, relying on boringtun-cli to pull in `device`.
+resolver = "2"
 
 [profile.release]
 lto = true        # Enable full link-time optimization.
