@@ -10,11 +10,6 @@ use std::fmt;
 use std::num::ParseIntError;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const AWG2_MAX_HANDSHAKE_PADDING: u8 = 64;
-pub const AWG2_MAX_TRANSPORT_PADDING: u8 = 32;
-pub const AWG2_MAX_JUNK_COUNT: u8 = 10;
-pub const AWG2_MIN_JUNK_SIZE: u16 = 64;
-pub const AWG2_MAX_JUNK_SIZE: u16 = 1024;
 pub const AWG2_MAX_CPS_RANDOM_LEN: usize = 1000;
 
 const STANDARD_WIREGUARD_HEADERS: [u32; 4] = [1, 2, 3, 4];
@@ -75,21 +70,6 @@ pub enum ConfigError {
     StandardHeaderValue {
         header: HeaderKind,
         value: u32,
-    },
-    PaddingOutOfRange {
-        field: PaddingKind,
-        value: u8,
-        max: u8,
-    },
-    JunkCountOutOfRange {
-        value: u8,
-        max: u8,
-    },
-    JunkSizeOutOfRange {
-        field: JunkSizeKind,
-        value: u16,
-        min: u16,
-        max: u16,
     },
     JunkMinExceedsMax {
         min: u16,
@@ -152,22 +132,6 @@ impl fmt::Display for ConfigError {
                 f,
                 "{} header range includes standard WireGuard type {}",
                 header, value
-            ),
-            ConfigError::PaddingOutOfRange { field, value, max } => {
-                write!(f, "{} padding {} exceeds max {}", field, value, max)
-            }
-            ConfigError::JunkCountOutOfRange { value, max } => {
-                write!(f, "junk count {} exceeds max {}", value, max)
-            }
-            ConfigError::JunkSizeOutOfRange {
-                field,
-                value,
-                min,
-                max,
-            } => write!(
-                f,
-                "{} junk size {} is outside {}..={}",
-                field, value, min, max
             ),
             ConfigError::JunkMinExceedsMax { min, max } => {
                 write!(f, "junk min {} exceeds junk max {}", min, max)
@@ -510,19 +474,17 @@ impl PaddingConfig {
         Ok(config)
     }
 
+    /// No upper bound is enforced, matching amneziawg-go, which parses S1-S4
+    /// and applies no maximum. The only constraint upstream has is a minimum of
+    /// [`HEADER_PROTECTION_MIN_PADDING`] when header protection is enabled,
+    /// which [`Amnezia3Config::validate`] checks.
+    ///
+    /// The field type caps these at 255. amneziawg-go parses them as `uint16`,
+    /// so a configuration using S1-S4 above 255 is accepted there and rejected
+    /// here. Amnezia's own tooling stays well below that.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        validate_padding(PaddingKind::Init, self.s1, AWG2_MAX_HANDSHAKE_PADDING)?;
-        validate_padding(PaddingKind::Response, self.s2, AWG2_MAX_HANDSHAKE_PADDING)?;
-        validate_padding(PaddingKind::Cookie, self.s3, AWG2_MAX_HANDSHAKE_PADDING)?;
-        validate_padding(PaddingKind::Transport, self.s4, AWG2_MAX_TRANSPORT_PADDING)
+        Ok(())
     }
-}
-
-fn validate_padding(field: PaddingKind, value: u8, max: u8) -> Result<(), ConfigError> {
-    if value > max {
-        return Err(ConfigError::PaddingOutOfRange { field, value, max });
-    }
-    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -551,18 +513,19 @@ impl JunkConfig {
         Ok(config)
     }
 
+    /// amneziawg-go bounds none of these — `jc`, `jmin` and `jmax` are parsed
+    /// and stored with no range check at all — so neither do we, beyond the
+    /// field types. Enforcing the ranges from Amnezia's documentation rejected
+    /// configurations that real AmneziaWG servers issue.
+    ///
+    /// `min_size > max_size` is still refused. Upstream does not check it and
+    /// would underflow computing `max - min`; our junk generator clamps instead,
+    /// but the configuration is malformed either way and silently producing
+    /// fixed-size junk would defeat the point of the parameter.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.count == 0 {
             return Ok(());
         }
-        if self.count > AWG2_MAX_JUNK_COUNT {
-            return Err(ConfigError::JunkCountOutOfRange {
-                value: self.count,
-                max: AWG2_MAX_JUNK_COUNT,
-            });
-        }
-        validate_junk_size(JunkSizeKind::Min, self.min_size)?;
-        validate_junk_size(JunkSizeKind::Max, self.max_size)?;
         if self.min_size > self.max_size {
             return Err(ConfigError::JunkMinExceedsMax {
                 min: self.min_size,
@@ -607,18 +570,6 @@ impl JunkConfig {
         }
         packets
     }
-}
-
-fn validate_junk_size(field: JunkSizeKind, value: u16) -> Result<(), ConfigError> {
-    if !(AWG2_MIN_JUNK_SIZE..=AWG2_MAX_JUNK_SIZE).contains(&value) {
-        return Err(ConfigError::JunkSizeOutOfRange {
-            field,
-            value,
-            min: AWG2_MIN_JUNK_SIZE,
-            max: AWG2_MAX_JUNK_SIZE,
-        });
-    }
-    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1793,43 +1744,32 @@ mod tests {
         config.validate().unwrap();
     }
 
+    /// amneziawg-go applies no maximum to S1-S4, so neither do we. This used to
+    /// cap handshake padding at 64 and transport padding at 32, values taken
+    /// from Amnezia's documentation rather than the protocol, which rejected
+    /// configurations that real AmneziaWG servers issue.
     #[test]
-    fn validates_padding_limits() {
+    fn accepts_padding_the_reference_implementation_accepts() {
         PaddingConfig::new(64, 64, 64, 32).unwrap();
-        assert!(matches!(
-            PaddingConfig::new(65, 0, 0, 0),
-            Err(ConfigError::PaddingOutOfRange {
-                field: PaddingKind::Init,
-                value: 65,
-                max: AWG2_MAX_HANDSHAKE_PADDING
-            })
-        ));
-        assert!(matches!(
-            PaddingConfig::new(0, 0, 0, 33),
-            Err(ConfigError::PaddingOutOfRange {
-                field: PaddingKind::Transport,
-                value: 33,
-                max: AWG2_MAX_TRANSPORT_PADDING
-            })
-        ));
+        // The shape that a live server handed us and this used to refuse.
+        PaddingConfig::new(53, 65, 17, 16).unwrap();
+        // Bounded only by the field type.
+        PaddingConfig::new(255, 255, 255, 255).unwrap();
     }
 
     #[test]
     fn validates_junk_config() {
         JunkConfig::disabled().validate().unwrap();
         JunkConfig::new(10, 64, 1024).unwrap();
-        assert!(matches!(
-            JunkConfig::new(11, 64, 1024),
-            Err(ConfigError::JunkCountOutOfRange { value: 11, .. })
-        ));
-        assert!(matches!(
-            JunkConfig::new(1, 63, 1024),
-            Err(ConfigError::JunkSizeOutOfRange {
-                field: JunkSizeKind::Min,
-                value: 63,
-                ..
-            })
-        ));
+        // Values outside Amnezia's documented ranges are still valid protocol,
+        // and upstream bounds none of them.
+        JunkConfig::new(11, 64, 1024).unwrap();
+        JunkConfig::new(1, 63, 1024).unwrap();
+        JunkConfig::new(128, 8, 40000).unwrap();
+        // A real server config.
+        JunkConfig::new(8, 75, 123).unwrap();
+
+        // Still refused: the generator cannot draw from an inverted range.
         assert!(matches!(
             JunkConfig::new(1, 128, 64),
             Err(ConfigError::JunkMinExceedsMax { min: 128, max: 64 })
@@ -2359,6 +2299,59 @@ mod tests {
         // in canonical form. This catches silently dropped keys, which an
         // equality-only check would miss if `parse` also ignored them.
         assert_eq!(emitted, block);
+    }
+
+    /// The AmneziaWG parameters from a configuration issued by a live Amnezia
+    /// server, verbatim. This was rejected before the padding and junk limits
+    /// were relaxed to match amneziawg-go: `s2=65` exceeded a 64-byte cap taken
+    /// from Amnezia's documentation rather than from the protocol.
+    ///
+    /// Keys only — no private key, peer key or preshared key.
+    #[test]
+    fn amnezia3_parses_a_live_server_config() {
+        let config = Amnezia3Config::parse(
+            "jc=8\n\
+             jmin=75\n\
+             jmax=123\n\
+             s1=53\n\
+             s2=65\n\
+             s3=17\n\
+             s4=16\n\
+             h1=536738216-536746210\n\
+             h2=986857603-986864765\n\
+             h3=1208174813-1208176077\n\
+             h4=1766644631-1766654089\n\
+             content_padding_addition=0-64\n\
+             rekey_after_time=121-155\n\
+             rekey_timeout=5\n\
+             reject_after_time=185-201\n\
+             keepalive_timeout=12-26\n\
+             max_handshake_attempts=18\n\
+             i1=<b 0x160301><r 8>\n\
+             i2=<r 28>\n\
+             i3=<r 17><t>\n\
+             i4=<r 62>\n\
+             i5=<t><r 14>\n\
+             mtu=1420\n",
+        )
+        .expect("a live server's configuration must be accepted");
+
+        assert_eq!(config.paddings.s2, 65, "S2 above 64 must survive");
+        assert_eq!(config.junk.count, 8);
+        // Single values are ranges of one, not an error.
+        assert_eq!(config.timing_ranges.rekey_timeout, U32Range::single(5));
+        assert_eq!(
+            config.timing_ranges.max_handshake_attempts,
+            U32Range::single(18)
+        );
+        // A range starting at zero is still enabled; only an all-zero range is
+        // "unset".
+        assert_eq!(
+            config.content_padding_addition,
+            Some(U32Range { lo: 0, hi: 64 })
+        );
+        assert!(config.header_protection_key.is_none());
+        assert!(config.init_packets.i5.is_some());
     }
 
     /// A plain WireGuard device must not grow AmneziaWG lines in `get=1`.

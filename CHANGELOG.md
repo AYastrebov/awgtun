@@ -16,12 +16,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Amnezia3Config::to_uapi_block`, the inverse of `parse`, emitting only non-default fields
 - `PacketClassifier`, which strips the padding prefix and decrypts the protected header without a `Tunn`. A device has to classify a datagram before it knows which peer it belongs to, as amneziawg-go does on its own `Device`.
 
+### Removed
+- `AWG2_MAX_HANDSHAKE_PADDING`, `AWG2_MAX_TRANSPORT_PADDING`, `AWG2_MAX_JUNK_COUNT`, `AWG2_MIN_JUNK_SIZE`, `AWG2_MAX_JUNK_SIZE`, and the `ConfigError` variants `PaddingOutOfRange`, `JunkCountOutOfRange` and `JunkSizeOutOfRange`. The limits they expressed are not part of the protocol.
+
 ### Changed
 - Keepalives now carry the S4 padding prefix, matching amneziawg-go. This changes the wire size of keepalives for existing AmneziaWG 2.0 configurations with a non-zero S4.
 - An outbound packet counts as "data sent" when its wire size differs from the unpadded 32-byte keepalive, rather than when its payload is non-empty — again matching amneziawg-go. A non-zero S4 therefore arms the new-handshake timer on keepalives.
 - Transport payloads that are neither IPv4 nor IPv6 are dropped silently and counted as data received instead of returning `InvalidPacket`
 
 ### Fixed
+- Configurations from real AmneziaWG servers were rejected. S1-S4 were capped at 64 (32 for S4), `Jc` at 10 and junk sizes to 64-1024 — ranges taken from Amnezia's documentation rather than the protocol. amneziawg-go enforces no maximum on any of them, and a live server's `S2=65` made a handshake impossible. Only the checks upstream also makes are kept, plus `Jmin <= Jmax`, which upstream omits and would underflow on.
 - JNI: tunnels created through the bindings could not be released — there was no `tunnel_free` binding, so every tunnel leaked
 - `device`: `set=1` split each line on every `=` rather than the first, rejecting any value containing one
 - C FFI: a zeroed `amnezia_config` was rejected instead of yielding standard WireGuard behavior, because the all-zero H1-H4 fields were read as four overlapping ranges
