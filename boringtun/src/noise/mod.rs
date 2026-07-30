@@ -1280,7 +1280,8 @@ mod tests {
             assert_eq!(
                 classifier.classify(&datagram),
                 Some((padding, expected_protected)),
-                "message type {msg_type} should classify"
+                "message type {} should classify",
+                msg_type
             );
         }
     }

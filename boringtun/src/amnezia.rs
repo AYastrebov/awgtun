@@ -2382,7 +2382,7 @@ mod tests {
         assert!(!emitted.contains("rekey_timeout"));
         assert!(!emitted.contains("mtu="));
         // Single-value ranges emit without a redundant `a-a` form.
-        assert!(emitted.contains("h1=100\n"), "emitted: {emitted}");
+        assert!(emitted.contains("h1=100\n"), "emitted: {}", emitted);
         assert_eq!(
             Amnezia3Config::parse(&emitted).expect("emitted block re-parses"),
             config

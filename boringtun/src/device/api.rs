@@ -502,7 +502,7 @@ mod tests {
 
         let mut block = String::new();
         for (key, value) in keys {
-            assert!(is_amnezia_interface_key(key), "{key} should be routed");
+            assert!(is_amnezia_interface_key(key), "{} should be routed", key);
             let _ = writeln!(block, "{}={}", key, value);
         }
 
@@ -527,7 +527,7 @@ mod tests {
             "protocol_version",
             "persistent_keepalive_interval",
         ] {
-            assert!(!is_amnezia_interface_key(key), "{key} must not be routed");
+            assert!(!is_amnezia_interface_key(key), "{} must not be routed", key);
         }
     }
 }

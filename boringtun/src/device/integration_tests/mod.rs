@@ -846,4 +846,212 @@ mod tests {
             t.join().unwrap();
         }
     }
+
+    /// A full AmneziaWG 3.0 interface configuration: junk packets, an I1 init
+    /// packet, dynamic headers, crypto padding, header protection, content
+    /// padding and randomized timings. Every obfuscation layer is on, so a peer
+    /// that does not share it cannot parse a single datagram.
+    const AWG3_INTERFACE_CONF: &str = "jc=3\n\
+         jmin=64\n\
+         jmax=256\n\
+         s1=16\n\
+         s2=16\n\
+         s3=16\n\
+         s4=16\n\
+         h1=1000-1099\n\
+         h2=2000-2099\n\
+         h3=3000-3099\n\
+         h4=4000-4099\n\
+         i1=<b 0xc0ffee><r 32>\n\
+         header_protection_key=\
+         6b6579206b6579206b6579206b6579206b6579206b6579206b6579206b657920\n\
+         content_padding_addition=1-32\n\
+         rekey_timeout=3-6\n\
+         keepalive_timeout=8-12";
+
+    /// Configure one side of a local AmneziaWG pair and return its handle.
+    ///
+    /// `awg` is the interface-level AmneziaWG block, or an empty string for a
+    /// standard WireGuard device. The AmneziaWG keys are sent in the same
+    /// `set=1` as the interface keys, before any peer section, which is how
+    /// `awg setconf` sends a configuration.
+    fn init_local_peer(
+        key: StaticSecret,
+        port: u16,
+        peer_pub: &PublicKey,
+        peer_port: u16,
+        peer_ip: IpAddr,
+        awg: &str,
+        keepalive: Option<&str>,
+    ) -> WGHandle {
+        let wg = WGHandle::init(next_ip(), next_ip_v6());
+
+        let mut iface = format!(
+            "listen_port={}\nprivate_key={}",
+            port,
+            encode(key.to_bytes())
+        );
+        if !awg.is_empty() {
+            let _ = write!(iface, "\n{}", awg);
+        }
+        assert_eq!(
+            wg.wg_set(&iface),
+            "errno=0\n\n",
+            "interface config rejected"
+        );
+
+        let mut peer = format!(
+            "public_key={}\nendpoint=127.0.0.1:{}\nallowed_ip={}/32",
+            encode(peer_pub.as_bytes()),
+            peer_port,
+            peer_ip
+        );
+        if let Some(interval) = keepalive {
+            let _ = write!(peer, "\npersistent_keepalive_interval={}", interval);
+        }
+        assert_eq!(wg.wg_set(&peer), "errno=0\n\n", "peer config rejected");
+
+        wg
+    }
+
+    /// Poll `get=1` until the device reports a completed handshake.
+    fn wait_for_handshake(wg: &WGHandle, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if wg.wg_get().contains("last_handshake_time_sec=") {
+                return true;
+            }
+            thread::sleep(std::time::Duration::from_millis(100));
+        }
+        false
+    }
+
+    #[test]
+    #[ignore]
+    /// Two local devices sharing an AmneziaWG 3.0 configuration must complete a
+    /// handshake through the full device stack: the UAPI config, the drain of
+    /// junk and I-packets ahead of the initiation, and classification of padded,
+    /// header-protected datagrams on receive.
+    ///
+    /// A persistent keepalive on one side is what starts the handshake, since
+    /// two TUN interfaces on one host cannot route to each other without
+    /// network namespaces.
+    fn test_awg3_handshake_between_two_devices() {
+        let (port_a, port_b) = (next_port(), next_port());
+        let (key_a, key_b) = (
+            StaticSecret::random_from_rng(OsRng),
+            StaticSecret::random_from_rng(OsRng),
+        );
+        let (pub_a, pub_b) = (PublicKey::from(&key_a), PublicKey::from(&key_b));
+        let (ip_a, ip_b) = (next_ip(), next_ip());
+
+        let wg_b = init_local_peer(
+            key_b,
+            port_b,
+            &pub_a,
+            port_a,
+            ip_a,
+            AWG3_INTERFACE_CONF,
+            None,
+        );
+        let wg_a = init_local_peer(
+            key_a,
+            port_a,
+            &pub_b,
+            port_b,
+            ip_b,
+            AWG3_INTERFACE_CONF,
+            Some("1"),
+        );
+
+        assert!(
+            wait_for_handshake(&wg_a, std::time::Duration::from_secs(15)),
+            "initiator never completed an AmneziaWG handshake"
+        );
+        assert!(
+            wait_for_handshake(&wg_b, std::time::Duration::from_secs(5)),
+            "responder never completed an AmneziaWG handshake"
+        );
+
+        // Both sides moved bytes, so the datagrams were parsed rather than
+        // merely sent.
+        for (name, wg) in [("initiator", &wg_a), ("responder", &wg_b)] {
+            let status = wg.wg_get();
+            assert!(
+                !status.contains("rx_bytes=0\n"),
+                "{} received nothing: {}",
+                name,
+                status
+            );
+        }
+    }
+
+    #[test]
+    #[ignore]
+    /// The negative control for the test above: a peer that does not share the
+    /// AmneziaWG configuration must not be able to complete a handshake.
+    ///
+    /// Without this, a bug that silently ignored the AmneziaWG config would
+    /// still pass the positive test, because two plain WireGuard devices also
+    /// handshake happily.
+    fn test_awg3_does_not_interoperate_with_plain_wireguard() {
+        let (port_a, port_b) = (next_port(), next_port());
+        let (key_a, key_b) = (
+            StaticSecret::random_from_rng(OsRng),
+            StaticSecret::random_from_rng(OsRng),
+        );
+        let (pub_a, pub_b) = (PublicKey::from(&key_a), PublicKey::from(&key_b));
+        let (ip_a, ip_b) = (next_ip(), next_ip());
+
+        // The responder speaks standard WireGuard.
+        let wg_b = init_local_peer(key_b, port_b, &pub_a, port_a, ip_a, "", None);
+        let wg_a = init_local_peer(
+            key_a,
+            port_a,
+            &pub_b,
+            port_b,
+            ip_b,
+            AWG3_INTERFACE_CONF,
+            Some("1"),
+        );
+
+        assert!(
+            !wait_for_handshake(&wg_a, std::time::Duration::from_secs(6)),
+            "an AmneziaWG initiator handshook with a plain WireGuard peer, \
+             so the obfuscation is not reaching the wire"
+        );
+        assert!(
+            !wait_for_handshake(&wg_b, std::time::Duration::from_secs(1)),
+            "a plain WireGuard responder parsed an AmneziaWG datagram"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    /// `get=1` must report the AmneziaWG configuration back, so `awg showconf`
+    /// round-trips.
+    fn test_awg3_config_round_trips_through_the_api() {
+        let key = StaticSecret::random_from_rng(OsRng);
+        let wg = WGHandle::init(next_ip(), next_ip_v6());
+
+        assert_eq!(
+            wg.wg_set(&format!(
+                "listen_port={}\nprivate_key={}\n{}",
+                next_port(),
+                encode(key.to_bytes()),
+                AWG3_INTERFACE_CONF
+            )),
+            "errno=0\n\n"
+        );
+
+        let status = wg.wg_get();
+        for line in AWG3_INTERFACE_CONF.lines() {
+            assert!(
+                status.contains(line),
+                "get=1 dropped `{}`, full response:\n{}",
+                line,
+                status
+            );
+        }
+    }
 }
