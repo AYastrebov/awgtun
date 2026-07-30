@@ -936,6 +936,12 @@ mod tests {
     /// A persistent keepalive on one side is what starts the handshake, since
     /// two TUN interfaces on one host cannot route to each other without
     /// network namespaces.
+    ///
+    /// A completed handshake on *both* sides is the whole assertion, and it is
+    /// a strong one: each side had to classify the other's padded,
+    /// header-protected datagrams and authenticate them under a dynamic header.
+    /// There is deliberately no `rx_bytes` check — those counters track
+    /// decapsulated payload, and this pair passes none.
     fn test_awg3_handshake_between_two_devices() {
         let (port_a, port_b) = (next_port(), next_port());
         let (key_a, key_b) = (
@@ -973,17 +979,6 @@ mod tests {
             "responder never completed an AmneziaWG handshake"
         );
 
-        // Both sides moved bytes, so the datagrams were parsed rather than
-        // merely sent.
-        for (name, wg) in [("initiator", &wg_a), ("responder", &wg_b)] {
-            let status = wg.wg_get();
-            assert!(
-                !status.contains("rx_bytes=0\n"),
-                "{} received nothing: {}",
-                name,
-                status
-            );
-        }
     }
 
     #[test]
@@ -1053,5 +1048,95 @@ mod tests {
                 status
             );
         }
+    }
+
+    #[test]
+    #[ignore]
+    /// A `set=1` carrying one AmneziaWG key must change that key and leave the
+    /// rest alone, the way the WireGuard UAPI and amneziawg-go both behave.
+    ///
+    /// This used to replace the whole AmneziaWG configuration per `set=1`, so
+    /// `awg set <if> jc 5` silently wiped S1-S4, H1-H4 and the header
+    /// protection key.
+    ///
+    /// A peer is configured first, so the update also runs the peer rebuild
+    /// that a device-level change triggers.
+    fn test_awg3_config_updates_are_incremental() {
+        let key = StaticSecret::random_from_rng(OsRng);
+        let peer_key = PublicKey::from(&StaticSecret::random_from_rng(OsRng));
+        let peer_ip = next_ip();
+        let wg = WGHandle::init(next_ip(), next_ip_v6());
+
+        assert_eq!(
+            wg.wg_set(&format!(
+                "listen_port={}\nprivate_key={}\n{}",
+                next_port(),
+                encode(key.to_bytes()),
+                AWG3_INTERFACE_CONF
+            )),
+            "errno=0\n\n"
+        );
+        assert_eq!(
+            wg.wg_set(&format!(
+                "public_key={}\nendpoint=127.0.0.1:{}\nallowed_ip={}/32\n\
+                 persistent_keepalive_interval=25",
+                encode(peer_key.as_bytes()),
+                next_port(),
+                peer_ip
+            )),
+            "errno=0\n\n"
+        );
+
+        assert_eq!(wg.wg_set("jc=5"), "errno=0\n\n");
+
+        let status = wg.wg_get();
+        assert!(status.contains("jc=5\n"), "jc was not updated:\n{}", status);
+        for line in AWG3_INTERFACE_CONF.lines().filter(|l| *l != "jc=3") {
+            assert!(
+                status.contains(line),
+                "a one-key set=1 dropped `{}`, full response:\n{}",
+                line,
+                status
+            );
+        }
+
+        // The rebuild preserves the peer and its settings; only the session
+        // state behind it is new.
+        for line in [
+            format!("public_key={}", encode(peer_key.as_bytes())),
+            format!("allowed_ip={}/32", peer_ip),
+            "persistent_keepalive_interval=25".to_owned(),
+        ] {
+            assert!(
+                status.contains(&line),
+                "the peer rebuild lost `{}`, full response:\n{}",
+                line,
+                status
+            );
+        }
+    }
+
+    #[test]
+    #[ignore]
+    /// Obfuscation without custom headers is a valid AmneziaWG configuration:
+    /// amneziawg-go defaults H1-H4 to the standard WireGuard types and never
+    /// refuses them. This used to return EINVAL.
+    fn test_awg_padding_without_custom_headers_is_accepted() {
+        let key = StaticSecret::random_from_rng(OsRng);
+        let wg = WGHandle::init(next_ip(), next_ip_v6());
+
+        assert_eq!(
+            wg.wg_set(&format!(
+                "listen_port={}\nprivate_key={}\n\
+                 jc=3\njmin=64\njmax=256\ns1=16\ns2=16\ns3=16\ns4=16",
+                next_port(),
+                encode(key.to_bytes()),
+            )),
+            "errno=0\n\n",
+            "junk and padding with default headers must be accepted"
+        );
+
+        let status = wg.wg_get();
+        assert!(status.contains("s1=16\n"), "config not applied:\n{}", status);
     }
 }

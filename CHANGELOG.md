@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 - `AWG2_MAX_HANDSHAKE_PADDING`, `AWG2_MAX_TRANSPORT_PADDING`, `AWG2_MAX_JUNK_COUNT`, `AWG2_MIN_JUNK_SIZE`, `AWG2_MAX_JUNK_SIZE`, and the `ConfigError` variants `PaddingOutOfRange`, `JunkCountOutOfRange` and `JunkSizeOutOfRange`. The limits they expressed are not part of the protocol.
+- `HeaderConfig::validate_wireguard_compatible` and the `ConfigError` variants `StandardHeaderValue`, `InitPacketRequiresI1` and `InitPacketGap`. The rules they expressed are not part of the protocol either; `HeaderConfig::validate` now checks only for overlap, which is all amneziawg-go checks.
 
 ### Changed
 - Keepalives now carry the S4 padding prefix, matching amneziawg-go. This changes the wire size of keepalives for existing AmneziaWG 2.0 configurations with a non-zero S4.
@@ -25,7 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Transport payloads that are neither IPv4 nor IPv6 are dropped silently and counted as data received instead of returning `InvalidPacket`
 
 ### Fixed
-- Configurations from real AmneziaWG servers were rejected. S1-S4 were capped at 64 (32 for S4), `Jc` at 10 and junk sizes to 64-1024 — ranges taken from Amnezia's documentation rather than the protocol. amneziawg-go enforces no maximum on any of them, and a live server's `S2=65` made a handshake impossible. Only the checks upstream also makes are kept, plus `Jmin <= Jmax`, which upstream omits and would underflow on.
+- Configurations from real AmneziaWG servers were rejected. S1-S4 were capped at 64 (32 for S4), `Jc` at 10 and junk sizes to 64-1024 — ranges taken from Amnezia's documentation rather than the protocol. amneziawg-go enforces no maximum on any of them, and a live server whose `S2` exceeded 64 was unreachable as a result. Only the checks upstream also makes are kept, plus `Jmin <= Jmax`, which upstream omits and would underflow on.
 - JNI: tunnels created through the bindings could not be released — there was no `tunnel_free` binding, so every tunnel leaked
 - `device`: `set=1` split each line on every `=` rather than the first, rejecting any value containing one
 - C FFI: a zeroed `amnezia_config` was rejected instead of yielding standard WireGuard behavior, because the all-zero H1-H4 fields were read as four overlapping ranges
@@ -34,6 +35,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Amnezia3Config::validate` now rejects inverted content-padding and timing ranges, which a public struct literal could construct while bypassing `U32Range::new`
 - `Tunn::persistent_keepalive` reports the interval armed from an AWG 3.0 `persistent_keepalive` range instead of returning `None` while keepalives were being sent
 - Content padding is clamped to the space left in the caller's `dst` buffer, so enabling it no longer raises the buffer requirement of `encapsulate`/`update_timers` and cannot panic an existing caller. amneziawg-go gets this for free from its pooled 64 KiB buffers; a tight `dst` now yields less padding instead.
+- Configurations that enable junk, padding or I-packets while leaving H1-H4 at the WireGuard defaults were rejected. amneziawg-go defaults H1-H4 to the standard types 1-4 and never refuses them, so `s1=16 s2=16 s3=16 s4=16` — a valid obfuscation profile — was unconfigurable.
+- I1-I5 no longer have to be contiguous. amneziawg-go stores each chain independently and sends every configured one, so `i1` plus `i3` is valid there; requiring I1 and refusing gaps rejected it. `InitPacketConfig::active_chains` now yields every configured chain rather than stopping at the first gap, which would otherwise have dropped I-packets a peer expects.
+- `device`: AmneziaWG keys in `set=1` are now incremental, as they are in amneziawg-go and as the rest of the UAPI is. Setting one key replaced the whole AmneziaWG configuration, so `awg set <if> jc 5` wiped S1-S4, H1-H4 and the header protection key.
+- `device`: changing the AmneziaWG configuration rebuilds the peers' tunnels. A `Tunn` captures its parameters at construction, so inbound datagrams were classified with the new configuration while peers still sent with the old one.
+- `device`: `mtu` is no longer accepted over the UAPI socket. A device knows its interface MTU and uses it, so the key was reported by `get=1` without being honored.
 
 ## [0.7.1] - 2026-05-01
 

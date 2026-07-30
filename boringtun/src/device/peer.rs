@@ -191,6 +191,17 @@ impl Peer {
         self.preshared_key.as_ref()
     }
 
+    /// Replace this peer's tunnel, adopting the new receiving index.
+    ///
+    /// Used when the device's AmneziaWG configuration changes: a `Tunn`
+    /// captures that configuration at construction, so the peers have to be
+    /// rebuilt from it. The caller owns `peers_by_idx` and must re-key this
+    /// peer there, reading [`Peer::index`] before the swap.
+    pub fn set_tunnel(&mut self, tunnel: Tunn, index: u32) {
+        self.tunnel = tunnel;
+        self.index = index;
+    }
+
     pub fn index(&self) -> u32 {
         self.index
     }

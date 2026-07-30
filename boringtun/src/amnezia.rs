@@ -12,8 +12,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const AWG2_MAX_CPS_RANDOM_LEN: usize = 1000;
 
-const STANDARD_WIREGUARD_HEADERS: [u32; 4] = [1, 2, 3, 4];
-
 // ---------------------------------------------------------------------------
 // RandomSource — injectable RNG for deterministic testing
 // ---------------------------------------------------------------------------
@@ -67,10 +65,6 @@ pub enum ConfigError {
         first: HeaderKind,
         second: HeaderKind,
     },
-    StandardHeaderValue {
-        header: HeaderKind,
-        value: u32,
-    },
     JunkMinExceedsMax {
         min: u16,
         max: u16,
@@ -89,13 +83,6 @@ pub enum ConfigError {
         tag: &'static str,
         value: usize,
         max: usize,
-    },
-    InitPacketRequiresI1 {
-        field: InitPacketKind,
-    },
-    InitPacketGap {
-        missing: InitPacketKind,
-        present: InitPacketKind,
     },
     UnsupportedLegacyField {
         field: String,
@@ -128,11 +115,6 @@ impl fmt::Display for ConfigError {
             ConfigError::HeaderRangesOverlap { first, second } => {
                 write!(f, "{} and {} header ranges overlap", first, second)
             }
-            ConfigError::StandardHeaderValue { header, value } => write!(
-                f,
-                "{} header range includes standard WireGuard type {}",
-                header, value
-            ),
             ConfigError::JunkMinExceedsMax { min, max } => {
                 write!(f, "junk min {} exceeds junk max {}", min, max)
             }
@@ -149,12 +131,6 @@ impl fmt::Display for ConfigError {
             }
             ConfigError::CpsValueOutOfRange { tag, value, max } => {
                 write!(f, "<{}> length {} exceeds max {}", tag, value, max)
-            }
-            ConfigError::InitPacketRequiresI1 { field } => {
-                write!(f, "{} is set but I1 is absent", field)
-            }
-            ConfigError::InitPacketGap { missing, present } => {
-                write!(f, "{} is set after missing {}", present, missing)
             }
             ConfigError::UnsupportedLegacyField { field } => {
                 write!(f, "`{}` is not an AmneziaWG 2.0 field", field)
@@ -239,19 +215,6 @@ pub enum InitPacketKind {
     I3,
     I4,
     I5,
-}
-
-impl InitPacketKind {
-    fn from_index(index: usize) -> Self {
-        match index {
-            0 => InitPacketKind::I1,
-            1 => InitPacketKind::I2,
-            2 => InitPacketKind::I3,
-            3 => InitPacketKind::I4,
-            4 => InitPacketKind::I5,
-            _ => unreachable!("only five AmneziaWG init packet slots exist"),
-        }
-    }
 }
 
 impl fmt::Display for InitPacketKind {
@@ -394,12 +357,14 @@ impl HeaderConfig {
         Ok(config)
     }
 
+    /// Non-overlapping ranges are the only rule, matching amneziawg-go's
+    /// `mergeWithDevice`, which checks exactly that and nothing else.
+    ///
+    /// In particular a range may include the standard WireGuard types 1-4:
+    /// upstream *defaults* H1-H4 to them (`NewDevice`), so a configuration that
+    /// turns on junk, padding or I-packets while leaving the headers alone is
+    /// ordinary AmneziaWG and must be accepted.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        self.validate_no_overlap()?;
-        self.validate_no_standard_headers()
-    }
-
-    pub fn validate_wireguard_compatible(&self) -> Result<(), ConfigError> {
         self.validate_no_overlap()
     }
 
@@ -427,19 +392,6 @@ impl HeaderConfig {
         Ok(())
     }
 
-    fn validate_no_standard_headers(&self) -> Result<(), ConfigError> {
-        for (kind, range) in self.entries() {
-            for value in STANDARD_WIREGUARD_HEADERS {
-                if range.contains(value) {
-                    return Err(ConfigError::StandardHeaderValue {
-                        header: kind,
-                        value,
-                    });
-                }
-            }
-        }
-        Ok(())
-    }
 }
 
 impl Default for HeaderConfig {
@@ -933,40 +885,20 @@ pub struct InitPacketConfig {
 }
 
 impl InitPacketConfig {
+    /// Nothing to check: any subset of I1-I5 is a valid configuration.
+    ///
+    /// amneziawg-go stores each chain independently and its send path walks all
+    /// five slots, emitting every non-nil one (`SendHandshakeInitiation`), so
+    /// `i1` plus `i3` with no `i2` is legal there. This used to reject gaps,
+    /// which no protocol rule requires.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        let chains = self.chains();
-        if chains[0].is_none() {
-            for (index, chain) in chains.iter().enumerate().skip(1) {
-                if chain.is_some() {
-                    return Err(ConfigError::InitPacketRequiresI1 {
-                        field: InitPacketKind::from_index(index),
-                    });
-                }
-            }
-            return Ok(());
-        }
-
-        let mut seen_gap = None;
-        for (index, chain) in chains.iter().enumerate() {
-            match (seen_gap, chain.is_some()) {
-                (None, false) => seen_gap = Some(InitPacketKind::from_index(index)),
-                (Some(missing), true) => {
-                    return Err(ConfigError::InitPacketGap {
-                        missing,
-                        present: InitPacketKind::from_index(index),
-                    })
-                }
-                _ => {}
-            }
-        }
-
         Ok(())
     }
 
+    /// The configured chains in I1-I5 order, skipping unset slots — the same
+    /// order and the same "every non-nil one" rule as amneziawg-go.
     pub fn active_chains(&self) -> impl Iterator<Item = &CpsChain> {
-        IntoIterator::into_iter(self.chains())
-            .take_while(|chain| chain.is_some())
-            .flatten()
+        IntoIterator::into_iter(self.chains()).flatten()
     }
 
     fn chains(&self) -> [Option<&CpsChain>; 5] {
@@ -1264,16 +1196,7 @@ impl Amnezia3Config {
         self.junk.validate()?;
         self.paddings.validate()?;
         self.init_packets.validate()?;
-
-        if self.junk == JunkConfig::disabled()
-            && self.paddings == PaddingConfig::default()
-            && self.headers == HeaderConfig::wireguard_compatible()
-            && self.init_packets == InitPacketConfig::default()
-        {
-            self.headers.validate_wireguard_compatible()?;
-        } else {
-            self.headers.validate()?;
-        }
+        self.headers.validate()?;
 
         if let Some(range) = self.content_padding_addition {
             range.validate("content_padding_addition")?;
@@ -1304,8 +1227,16 @@ impl Amnezia3Config {
         self.header_protection_key.map(HeaderProtection::new)
     }
 
-    /// Parse a newline-separated `key=value` configuration block, the format
-    /// amneziawg-tools emits and AmneziaWG `.conf` files carry.
+    /// Parse a newline-separated `key=value` configuration block in the *UAPI*
+    /// spelling — the one amneziawg-tools writes to the socket, not the one an
+    /// AmneziaWG `.conf` file carries.
+    ///
+    /// The two differ, and a `.conf` will not parse as-is: it names fields in
+    /// CamelCase (`ContentPaddingAddition`, `HeaderProtectionKey`) and encodes
+    /// keys in base64, where UAPI uses snake_case and hex. Case is folded here,
+    /// so the AmneziaWG 2.0 names happen to survive (`Jc` -> `jc`), but the 3.0
+    /// names do not. Translate a `.conf` the way `awg setconf` does before
+    /// feeding it here.
     ///
     /// Recognized keys are the AmneziaWG 2.0 set (`jc`, `jmin`, `jmax`,
     /// `s1`-`s4`, `h1`-`h4`, `i1`-`i5`) plus the 3.0 set
@@ -1316,6 +1247,8 @@ impl Amnezia3Config {
     ///
     /// Blank lines and `#` comments are ignored. Unset keys keep their
     /// defaults, so an empty input yields a standard WireGuard configuration.
+    /// Repeated keys take the last value, which is what makes an incremental
+    /// overlay possible: serialize a config, append the changed lines, reparse.
     ///
     /// # Errors
     /// Returns [`ConfigError`] for a malformed line, an unknown or legacy key,
@@ -1601,12 +1534,7 @@ impl Amnezia2Config {
         self.junk.validate()?;
         self.paddings.validate()?;
         self.init_packets.validate()?;
-
-        if self.is_wireguard_compatible() {
-            self.headers.validate_wireguard_compatible()
-        } else {
-            self.headers.validate()
-        }
+        self.headers.validate()
     }
 
     pub fn validate_for_mtu(&self, effective_outer_mtu: usize) -> Result<(), ConfigError> {
@@ -1723,18 +1651,27 @@ mod tests {
         ));
     }
 
+    /// amneziawg-go defaults H1-H4 to the standard WireGuard types 1-4 and
+    /// never refuses them, so a configuration that turns on junk, padding or
+    /// I-packets while leaving the headers alone is ordinary AmneziaWG. This
+    /// used to reject exactly that, which made `s1=16 s2=16 s3=16 s4=16` — a
+    /// perfectly valid obfuscation profile — unconfigurable.
     #[test]
-    fn rejects_standard_headers_for_active_awg_config() {
+    fn accepts_standard_headers_alongside_other_awg_features() {
         let mut config = Amnezia2Config::default();
         config.paddings.s1 = 1;
-        let err = config.validate().unwrap_err();
-        assert!(matches!(
-            err,
-            ConfigError::StandardHeaderValue {
-                header: HeaderKind::Init,
-                value: 1
-            }
-        ));
+        config.validate().expect("padding with default headers is valid");
+
+        let mut config = Amnezia2Config::default();
+        config.paddings = PaddingConfig::new(16, 16, 16, 16).unwrap();
+        config.junk = JunkConfig::new(3, 64, 256).unwrap();
+        config.validate().expect("junk with default headers is valid");
+
+        let mut config = Amnezia3Config::default();
+        config.paddings = PaddingConfig::new(16, 16, 16, 16).unwrap();
+        config
+            .validate()
+            .expect("AWG 3.0 padding with default headers is valid");
     }
 
     #[test]
@@ -1835,8 +1772,11 @@ mod tests {
         assert!(CpsChain::parse("<ds 1>").is_err());
     }
 
+    /// amneziawg-go stores I1-I5 independently and sends every non-nil chain,
+    /// so any subset is valid and a gap is not an error. This used to require
+    /// I1 and refuse gaps.
     #[test]
-    fn validates_init_packet_chain_presence() {
+    fn accepts_any_subset_of_init_packet_chains() {
         let config = InitPacketConfig {
             i1: None,
             i2: Some(chain("<r 1>")),
@@ -1844,16 +1784,8 @@ mod tests {
             i4: None,
             i5: None,
         };
-        assert!(matches!(
-            config.validate(),
-            Err(ConfigError::InitPacketRequiresI1 {
-                field: InitPacketKind::I2
-            })
-        ));
-    }
+        config.validate().expect("I2 without I1 is valid");
 
-    #[test]
-    fn validates_init_packet_chain_gaps() {
         let config = InitPacketConfig {
             i1: Some(chain("<r 1>")),
             i2: None,
@@ -1861,17 +1793,14 @@ mod tests {
             i4: None,
             i5: None,
         };
-        assert!(matches!(
-            config.validate(),
-            Err(ConfigError::InitPacketGap {
-                missing: InitPacketKind::I2,
-                present: InitPacketKind::I3
-            })
-        ));
+        config.validate().expect("a gap at I2 is valid");
     }
 
+    /// Every configured chain is emitted, in I1-I5 order, gaps included — the
+    /// same rule as amneziawg-go's send path. Truncating at the first gap would
+    /// silently drop I-packets a peer expects on the wire.
     #[test]
-    fn iterates_active_init_packet_chain_until_first_gap() {
+    fn iterates_every_configured_init_packet_chain() {
         let config = InitPacketConfig {
             i1: Some(chain("<r 1>")),
             i2: Some(chain("<r 2>")),
@@ -1884,6 +1813,19 @@ mod tests {
             .map(|c| c.encoded_len_for_init())
             .collect::<Vec<_>>();
         assert_eq!(lengths, vec![1, 2]);
+
+        let config = InitPacketConfig {
+            i1: Some(chain("<r 1>")),
+            i2: None,
+            i3: Some(chain("<r 3>")),
+            i4: None,
+            i5: Some(chain("<r 5>")),
+        };
+        let lengths = config
+            .active_chains()
+            .map(|c| c.encoded_len_for_init())
+            .collect::<Vec<_>>();
+        assert_eq!(lengths, vec![1, 3, 5]);
     }
 
     #[test]
@@ -2301,26 +2243,33 @@ mod tests {
         assert_eq!(emitted, block);
     }
 
-    /// The AmneziaWG parameters from a configuration issued by a live Amnezia
-    /// server, verbatim. This was rejected before the padding and junk limits
-    /// were relaxed to match amneziawg-go: `s2=65` exceeded a 64-byte cap taken
-    /// from Amnezia's documentation rather than from the protocol.
+    /// A configuration in the shape a real Amnezia server issues: every AWG 3.0
+    /// key set at once, `S2` above 64, single-value timing ranges, and a
+    /// content-padding range starting at zero. This shape was rejected before
+    /// the padding and junk limits were relaxed to match amneziawg-go, because
+    /// `s2 > 64` tripped a cap taken from Amnezia's documentation rather than
+    /// from the protocol.
     ///
-    /// Keys only — no private key, peer key or preshared key.
+    /// The values here are synthetic on purpose. A deployment's H1-H4, S1-S4
+    /// and junk profile are what make its traffic *not* look like WireGuard, so
+    /// publishing a real server's set hands a censor an exact signature for it —
+    /// the type field matches H1-H4, the initiation is `148 + S1` bytes, the
+    /// response `92 + S2`. Reproduce a real config's *shape* when adding a
+    /// regression test; never its numbers.
     #[test]
-    fn amnezia3_parses_a_live_server_config() {
+    fn amnezia3_parses_a_fully_populated_server_config() {
         let config = Amnezia3Config::parse(
             "jc=8\n\
              jmin=75\n\
              jmax=123\n\
-             s1=53\n\
-             s2=65\n\
-             s3=17\n\
+             s1=40\n\
+             s2=97\n\
+             s3=20\n\
              s4=16\n\
-             h1=536738216-536746210\n\
-             h2=986857603-986864765\n\
-             h3=1208174813-1208176077\n\
-             h4=1766644631-1766654089\n\
+             h1=1000000-1000999\n\
+             h2=2000000-2000999\n\
+             h3=3000000-3000999\n\
+             h4=4000000-4000999\n\
              content_padding_addition=0-64\n\
              rekey_after_time=121-155\n\
              rekey_timeout=5\n\
@@ -2334,9 +2283,9 @@ mod tests {
              i5=<t><r 14>\n\
              mtu=1420\n",
         )
-        .expect("a live server's configuration must be accepted");
+        .expect("a fully populated server configuration must be accepted");
 
-        assert_eq!(config.paddings.s2, 65, "S2 above 64 must survive");
+        assert_eq!(config.paddings.s2, 97, "S2 above 64 must survive");
         assert_eq!(config.junk.count, 8);
         // Single values are ranges of one, not an error.
         assert_eq!(config.timing_ranges.rekey_timeout, U32Range::single(5));

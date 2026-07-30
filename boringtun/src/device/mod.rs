@@ -382,6 +382,84 @@ impl Device {
         tracing::info!("Peer added");
     }
 
+    /// Adopt a new device-scoped AmneziaWG configuration.
+    ///
+    /// A `Tunn` captures its configuration at construction, so a device-level
+    /// change has to be pushed into every existing peer, or the two halves of
+    /// the device disagree: inbound datagrams would be classified with the new
+    /// parameters while the peers still send with the old ones. amneziawg-go
+    /// needs no equivalent step because its peers read the device config live.
+    ///
+    /// Rebuilding resets sessions, which is not a loss: the parameters that
+    /// changed define the wire format, so any in-flight session was already
+    /// unusable by the peer that prompted the change.
+    pub(crate) fn set_amnezia_config(&mut self, amnezia: Amnezia3Config) {
+        if self.amnezia == amnezia {
+            return;
+        }
+        self.amnezia = amnezia;
+
+        let base = self.peer_amnezia_config();
+        let private_key = match self.key_pair.as_ref() {
+            Some((private_key, _)) => private_key.clone(),
+            // No key yet, so no peers either; they will be built from the new
+            // config when it is set.
+            None => return,
+        };
+
+        let peers: Vec<_> = self
+            .peers
+            .iter()
+            .map(|(pub_key, peer)| (*pub_key, Arc::clone(peer)))
+            .collect();
+
+        for (pub_key, peer) in peers {
+            let mut p = peer.lock();
+
+            let mut config = base.clone();
+            // Reapply the peer's own `persistent_keepalive_interval` range,
+            // which overrides that one field of the device config.
+            let keepalive_range = p.keepalive_range();
+            if let Some(range) = keepalive_range {
+                config.timing_ranges.persistent_keepalive = range;
+            }
+            // The fixed interval and the range are mutually exclusive at
+            // configuration time; reading the armed interval back would turn a
+            // range into a constant.
+            let keepalive = match keepalive_range {
+                Some(_) => None,
+                None => p.persistent_keepalive(),
+            };
+
+            let index = self.next_index();
+            let tunn = match Tunn::new_with_amnezia3(
+                private_key.clone(),
+                pub_key,
+                p.preshared_key().copied(),
+                keepalive,
+                index,
+                None,
+                config,
+            ) {
+                Ok(tunn) => tunn,
+                Err(e) => {
+                    // The config was validated before it got here, so this is
+                    // unreachable in practice. Leave the peer on its old tunnel
+                    // rather than drop it.
+                    tracing::error!(message = "Invalid AmneziaWG configuration", error = ?e);
+                    continue;
+                }
+            };
+
+            self.peers_by_idx.remove(&p.index());
+            p.set_tunnel(tunn, index);
+            drop(p);
+            self.peers_by_idx.insert(index, peer);
+        }
+
+        tracing::info!("AmneziaWG configuration updated, peers rebuilt");
+    }
+
     /// The device's AmneziaWG config as a peer's `Tunn` should see it.
     ///
     /// `Amnezia3Config::mtu` exists only because `Tunn` has no concept of an

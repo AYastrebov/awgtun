@@ -23,6 +23,33 @@ boringtun/              # Main library crate
 boringtun-cli/          # Optional CLI binary
 ```
 
+## A real server's parameters are secret
+
+Never commit a live AmneziaWG deployment's `H1`-`H4`, `S1`-`S4`, `Jc`/`Jmin`/`Jmax`
+or `I1`-`I5` values — not in tests, docs, commit messages or issues. Those
+parameters are what stop the server's traffic from looking like WireGuard, so
+publishing them hands a censor an exact signature for that deployment: match the
+type field against `H1`-`H4`, then look for a `148 + S1` byte initiation. Treat a
+`.conf` the way you would treat its private key.
+
+Regression tests should reproduce the *shape* of a real configuration — every key
+populated, `S2` above 64, single-value timing ranges — with synthetic numbers.
+
+## Skills
+
+`.claude/skills/` holds the skills that apply to this codebase. Invoke them by
+name with the Skill tool.
+
+| Skill | Use for |
+|-------|---------|
+| `amnezia-dev` | AmneziaWG protocol work, auditing against amneziawg-go, rebases, wire-format debugging |
+| `unsafe-checker` | The C FFI, JNI, TUN and epoll/kqueue syscalls, `MaybeUninit` buffers — 47 soundness rules |
+| `m07-concurrency` | The threaded device event loop, `Arc<Mutex<Peer>>`, `dev_lock`, atomics. No async anywhere in this project |
+| `m06-error-handling` | `ConfigError`/`WireGuardError` design, panic-vs-Result, failures crossing a foreign boundary |
+| `m10-performance` | The per-packet path and the criterion crypto benches |
+| `m01-ownership` | Lifetime errors on the borrowed packet buffers (`TunnResult<'a>`, `Packet<'a>`) |
+| `m02-resource` | Smart-pointer choice, file descriptors, FFI handle lifetime |
+
 ## Branch Strategy
 
 - `master` — tracks upstream cloudflare/boringtun
@@ -47,6 +74,19 @@ To run only AmneziaWG tests:
 ```bash
 ./target/debug/deps/boringtun-* amnezia --no-capture
 ```
+
+The device integration tests are `#[ignore]`d and need root and a TUN device:
+
+```bash
+cargo test -p boringtun --lib --features device --no-run
+sudo -E ./target/debug/deps/boringtun-* --ignored --test-threads 1 awg
+```
+
+**Never build them with `--all-features`.** That turns on `mock-instant`, which
+freezes the clock, so no timer ever fires, nothing is ever sent, and every
+device integration test fails in a way that looks like a protocol bug. CI's
+`cargo test -- --ignored` is fine — it picks up `device` through
+`boringtun-cli`'s dependency and leaves `mock-instant` off.
 
 ## AmneziaWG Integration Points
 

@@ -240,28 +240,34 @@ fn is_amnezia_interface_key(key: &str) -> bool {
             | "reject_after_time"
             | "keepalive_timeout"
             | "max_handshake_attempts"
-            | "mtu"
     )
 }
 
 /// Apply the AmneziaWG lines collected from the interface section.
 ///
-/// The block is parsed and validated as a whole rather than key by key, so
-/// cross-field rules (overlapping header ranges, S1-S4 >= 12 when header
-/// protection is on) are enforced atomically and a rejected config leaves the
-/// device untouched.
+/// Incremental, like the rest of the UAPI and like amneziawg-go's
+/// `ipcSetDevice`, which seeds itself from the live device (`fromDevice`),
+/// overlays the keys present in this operation, and merges the result back
+/// (`mergeWithDevice`). A key absent from the block keeps its current value, so
+/// `awg set <if> jc 5` changes the junk count and nothing else.
 ///
-/// This makes AmneziaWG parameters replace-all per `set=1`, unlike WireGuard's
-/// incremental UAPI: a key absent from the block returns to its default. That
-/// matches how `awg setconf` sends a configuration, and it avoids having to
-/// rebuild a live peer's tunnel, which is not supported.
+/// The overlay is done by re-serializing the current configuration and
+/// appending the new lines: `Amnezia3Config::parse` applies lines in order, so
+/// later ones win, and the merged block is then validated as a whole. That
+/// keeps the cross-field rules (non-overlapping header ranges, S1-S4 >= 12
+/// under header protection) atomic — a rejected config leaves the device
+/// untouched.
 fn apply_amnezia_block(device: &mut Device, block: &str) -> i32 {
     if block.is_empty() {
         return 0;
     }
-    match Amnezia3Config::parse(block) {
+
+    let mut merged = device.amnezia.to_uapi_block();
+    merged.push_str(block);
+
+    match Amnezia3Config::parse(&merged) {
         Ok(config) => {
-            device.amnezia = config;
+            device.set_amnezia_config(config);
             0
         }
         Err(e) => {
@@ -497,7 +503,6 @@ mod tests {
             ("reject_after_time", "170-200"),
             ("keepalive_timeout", "8-15"),
             ("max_handshake_attempts", "10-20"),
-            ("mtu", "1400"),
         ];
 
         let mut block = String::new();
@@ -526,8 +531,38 @@ mod tests {
             "remove",
             "protocol_version",
             "persistent_keepalive_interval",
+            // A device knows its own MTU and `peer_amnezia_config` uses it, so
+            // accepting the key here would report a value through `get=1` that
+            // nothing honors. It stays available to the FFI and JNI surfaces,
+            // which have no interface to ask.
+            "mtu",
         ] {
             assert!(!is_amnezia_interface_key(key), "{} must not be routed", key);
         }
+    }
+
+    /// The AmneziaWG block is incremental, as amneziawg-go's is: a `set=1` that
+    /// touches one key must not reset the others to their defaults.
+    #[test]
+    fn an_amnezia_block_overlays_the_current_configuration() {
+        let current = Amnezia3Config::parse(
+            "jc=3\njmin=64\njmax=256\ns1=16\ns2=16\ns3=16\ns4=16\n\
+             h1=1000-1099\nh2=2000-2099\nh3=3000-3099\nh4=4000-4099\n",
+        )
+        .expect("valid starting configuration");
+
+        // What `apply_amnezia_block` builds: the live config re-serialized,
+        // then the keys from this operation.
+        let mut merged = current.to_uapi_block();
+        merged.push_str("jc=5\n");
+        let updated = Amnezia3Config::parse(&merged).expect("the overlay is valid");
+
+        assert_eq!(updated.junk.count, 5, "the touched key changes");
+        assert_eq!(updated.junk.min_size, 64, "untouched junk fields survive");
+        assert_eq!(updated.paddings.s2, 16, "untouched padding survives");
+        assert_eq!(
+            updated.headers.init.start, 1000,
+            "untouched headers survive"
+        );
     }
 }

@@ -67,9 +67,21 @@ For I1-I5 init packets, source data is always empty (`<d>`, `<ds>`, `<dz>` produ
 ### Validation Rules
 
 - Header ranges must not overlap with each other.
-- When any AWG feature is active, header values must not be 1, 2, 3, or 4 (standard WireGuard types).
-- If I1 is absent, I2-I5 must also be absent. No gaps allowed (I1, I3 without I2 is invalid).
 - Jmin must not exceed Jmax.
+
+That is deliberately close to the whole list. amneziawg-go's `mergeWithDevice`
+checks only for overlapping headers, plus S1–S4 ≥ 12 when header protection is
+on; everything else it accepts. Being stricter here does not harden anything, it
+just makes real servers unreachable, so two rules that this fork used to invent
+are gone:
+
+- Header values **may** be 1, 2, 3 or 4. Upstream *defaults* H1–H4 to exactly
+  those, so junk or padding with the headers left alone is ordinary AmneziaWG.
+- Any subset of I1–I5 is valid, gaps included. Upstream sends every configured
+  chain in order and never requires I1.
+
+Jmin ≤ Jmax is the one rule kept that upstream lacks: it does not check, and
+would underflow computing `Jmax - Jmin`.
 
 ## AmneziaWG 3.0
 
@@ -333,8 +345,7 @@ size_t wireguard_poll_outgoing_packet(
 
 The `jni-bindings` feature exposes the tunnel to Android's `VpnService` through
 `com.cloudflare.app.boringtun.BoringTunJNI`. AmneziaWG is configured with a
-single UAPI-style `key=value` block rather than a long scalar signature — the
-same text an AmneziaWG `.conf` file carries:
+single UAPI-style `key=value` block rather than a long scalar signature:
 
 ```kotlin
 val config = """
@@ -366,6 +377,13 @@ WireGuard defaults, so an empty string yields a standard WireGuard tunnel. All
 keys are listed under [Configuration Parameters](#configuration-parameters) and
 [AmneziaWG 3.0](#amneziawg-30); `mtu` is a fork extension standing in for the
 device MTU, and an all-zero `header_protection_key` means "disabled".
+
+**This is the UAPI spelling, not the `.conf` one.** An AmneziaWG `.conf` names
+the 3.0 fields in CamelCase and encodes keys in base64
+(`HeaderProtectionKey = vIOc…`, `ContentPaddingAddition = 0-64`); the parser
+wants snake_case and hex. Case is folded, so the 2.0 names survive untouched
+(`Jc` → `jc`), but the 3.0 ones do not. Translate a `.conf` the way
+`awg setconf` does before passing it in.
 
 ### The drain contract
 
@@ -439,9 +457,11 @@ AllowedIPs = 0.0.0.0/0
 PersistentKeepalive = 25
 ```
 
-Over the UAPI wire these become the lowercase `key=value` names that
-`Amnezia3Config::parse` accepts — the same format the JNI surface takes. See
-[JNI API (Android)](#jni-api-android) for the full key list.
+`awg setconf` translates these to the snake_case `key=value` names that
+`Amnezia3Config::parse` accepts (`ContentPaddingAddition` →
+`content_padding_addition`), with keys in hex rather than base64 — the same
+format the JNI surface takes. See [JNI API (Android)](#jni-api-android) for the
+full key list.
 
 ### Bringing up a tunnel
 
@@ -463,44 +483,62 @@ sudo awg show awg0
 A completed handshake with a real AmneziaWG server, and traffic flowing over it,
 is the check that no unit test can stand in for.
 
-### Two divergences from WireGuard's UAPI
+### How `set=1` handles the AmneziaWG keys
 
-**AmneziaWG parameters are replace-all per `set=1`.** WireGuard's UAPI is
-incremental — each key patches current state. The AmneziaWG keys in an interface
-section are instead collected and parsed as one block, so a key absent from a
-non-empty block returns to its default. This is what lets the cross-field rules
-(overlapping header ranges, S1–S4 ≥ 12 under header protection) be validated
-atomically, and it means a rejected configuration leaves the device untouched. A
-`set=1` carrying *no* AmneziaWG keys leaves the existing configuration alone, so
-peer-only updates are safe.
+**Incremental, like the rest of the UAPI.** A key absent from a `set=1` keeps
+its current value, so `awg set awg0 jc 5` changes the junk count and nothing
+else. This mirrors amneziawg-go's `ipcSetDevice`, which seeds itself from the
+live device, overlays the keys present in the operation, and merges the result
+back.
 
-**`mtu` is ignored on this path.** The key exists only because `Tunn` has no
-concept of an MTU, which matters for the FFI and JNI surfaces. A device does
-know its interface MTU, and it is authoritative, so content padding is clamped
-against the live value.
+The keys collected from an interface section are still parsed and validated as
+one block — the current configuration is re-serialized and the new lines
+appended — so the cross-field rules (overlapping header ranges, S1–S4 ≥ 12 under
+header protection) are enforced atomically and a rejected configuration leaves
+the device untouched.
+
+**Changing the configuration rebuilds the peers.** A `Tunn` captures its
+AmneziaWG parameters at construction, so a device-level change is pushed into
+every existing peer; otherwise inbound datagrams would be classified with the
+new parameters while the peers still sent with the old ones. Sessions reset and
+the peers re-handshake, which is no loss: the parameters that changed define the
+wire format. amneziawg-go needs no equivalent step because its peers read the
+device configuration live.
+
+**`mtu` is not a key on this path.** It exists only because `Tunn` has no
+concept of an MTU, which matters for the FFI and JNI surfaces. A device knows
+its interface MTU and that value is authoritative, so content padding is clamped
+against the live one and `mtu=` over the socket is rejected like any other
+unknown key.
 
 ### Verified interoperability
 
 `boringtun-cli` has completed a handshake with a live AmneziaWG server and
-passed ICMP traffic over the tunnel. The capture, with the server's parameters
-`Jc=8 Jmin=75 Jmax=123 S1=53 S2=65 S3=17 S4=16`, `I1`–`I5` set and
-`ContentPaddingAddition=0-64`:
+passed ICMP traffic over the tunnel, driven through the UAPI socket exactly as
+`awg setconf` would. The server's configuration had all four obfuscation layers
+plus header protection, content padding and randomized timings.
 
-| Δ | Dir | Size | Packet |
-|---|-----|------|--------|
-| 0.0 ms | → | 188 | `I1` — a TLS ClientHello posing as a CDN connection |
-| +0.1 | → | 28 | `I2` = `<r 28>` |
-| +0.2 | → | 21 | `I3` = `<r 17><t>` |
-| +0.3 | → | 62 | `I4` = `<r 62>` |
-| +0.4 | → | 18 | `I5` = `<t><r 14>` |
-| +0.4…0.9 | → | 108, 82, 117, 80, 79, 115, 103, 81 | 8 junk packets, sizes drawn from `[75, 123)` |
-| +0.9 | → | 201 | handshake initiation, `148 + S1` |
-| +15 | ← | 157 | handshake response, `92 + S2` |
+A packet capture of that run confirmed, against the server's own parameters:
 
-The send order is I-packets, then junk, then the padded initiation, and each
-I-packet is byte-exact against its CPS chain. Transport packets carrying a
-56-byte ping measured 143–181 bytes outbound and 169–173 inbound, inside the
-`84 + 32 + S4 + [0,64]` window that content padding defines.
+- **Send order** — each configured `I1`–`I5` datagram first, one UDP datagram
+  per chain and byte-exact against it, then `Jc` junk datagrams, then the
+  handshake initiation. Nothing was reordered or coalesced.
+- **Junk sizing** — every junk datagram fell in the half-open range
+  `[Jmin, Jmax)`, never reaching `Jmax` itself.
+- **Padding arithmetic** — the initiation measured exactly `148 + S1` bytes and
+  the response `92 + S2`, so `S1`/`S2` reached the wire outside the MAC.
+- **Content padding** — transport packets carrying a 56-byte ping landed inside
+  the `84 + 32 + S4 + [content_padding_addition]` window in both directions.
+- **Round trip** — `get=1` reported every AmneziaWG key back, and ICMP flowed at
+  0% loss with `rx_bytes`/`tx_bytes` advancing on both sides.
+
+> The server's actual parameter values are deliberately not recorded here. A
+> deployment's `H1`–`H4`, `S1`–`S4` and junk profile are precisely what stop its
+> traffic looking like WireGuard; publishing them hands a censor an exact
+> signature for that server — match the type field against `H1`–`H4`, then the
+> `148 + S1` initiation. Treat a real config the way you would treat its private
+> key. `references/live-server-test.md` in the `amnezia-dev` skill describes how
+> to run this check against your own server.
 
 Two things this run established that no unit test had:
 
@@ -608,7 +646,11 @@ With header protection enabled the incoming datagram cannot be decrypted in plac
 ### What amneziawg-go Has That We Don't
 
 - **Server/responder mode**: We only implement client-side AWG. The Go version supports both.
-- **Runtime config changes**: The Go version can update AWG parameters via UAPI at runtime. Ours are fixed when the tunnel is constructed, so changing them means recreating it.
+- **Runtime config changes**: The Go version's peers read the device
+  configuration live, so a UAPI update takes effect on the next packet. A `Tunn`
+  captures its configuration at construction, so a `Device` implements the same
+  thing by rebuilding its peers — the sessions reset where Go's would survive.
+  A bare `Tunn` has to be recreated by its caller.
 
 UAPI configuration is no longer on this list — see
 [Device and UAPI](#device-and-uapi-boringtun-cli).
