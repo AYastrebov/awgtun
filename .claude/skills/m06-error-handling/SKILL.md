@@ -1,7 +1,6 @@
 ---
 name: m06-error-handling
-description: "CRITICAL: Use for error handling. Triggers: Result, Option, Error, ?, unwrap, expect, panic, anyhow, thiserror, when to panic vs return Result, custom error, error propagation, 错误处理, Result 用法, 什么时候用 panic"
-user-invocable: false
+description: Use when designing or changing how failures are represented in Rust — whether to panic or return Result, how to shape an error enum, and how much context to carry. This is a library, so the library half of the guidance applies: `ConfigError` in `amnezia.rs` and `WireGuardError` in `noise/errors.rs` are `#[non_exhaustive]` enums a caller matches on, and the FFI and JNI surfaces must turn every failure into a null handle or a status rather than unwind across the boundary. Triggers on Result, Option, `?`, unwrap, expect, panic, thiserror, anyhow, custom error, error propagation, when to panic vs return Result.
 ---
 
 # Error Handling
@@ -60,15 +59,20 @@ When error strategy is unclear:
 ```
 "Should I return Result or Option?"
     ↑ Ask: Is absence/failure normal or exceptional?
-    ↑ Check: m09-domain (what does domain say?)
-    ↑ Check: domain-* (error handling requirements)
+    ↑ Check: what does the protocol require? (AMNEZIA.md, amneziawg-go)
 ```
 
 | Situation | Trace To | Question |
 |-----------|----------|----------|
-| Too many unwraps | m09-domain | Is the data model right? |
-| Error context design | m13-domain-error | What recovery is needed? |
-| Library vs app errors | m11-ecosystem | Who are the consumers? |
+| Too many unwraps | m01-ownership | Is the data model right? |
+| Rejecting a config | amnezia-dev | Does the reference implementation reject it too? |
+| An error crosses a C or JNI boundary | unsafe-checker | Can this unwind? What does the caller see? |
+
+Two rules this codebase already follows, worth keeping in mind before adding a
+variant. A malformed *packet* is not an error to report — it is dropped, because
+an attacker chooses its contents. A malformed *configuration* is an error, and
+it must be rejected only where amneziawg-go also rejects it; inventing stricter
+validation has made real servers unreachable here more than once.
 
 ---
 
@@ -160,7 +164,7 @@ Use ? → Need context?
 
 | When | See |
 |------|-----|
-| Domain error strategy | m13-domain-error |
-| Crate boundaries | m11-ecosystem |
-| Type-safe errors | m05-type-driven |
-| Mental models | m14-mental-model |
+| Reporting a failure across the C ABI or JNI | unsafe-checker |
+| Which configurations are actually invalid | amnezia-dev, `AMNEZIA.md` |
+| Errors from a poisoned or contended lock | m07-concurrency |
+| `Result` in a per-packet path | m10-performance |

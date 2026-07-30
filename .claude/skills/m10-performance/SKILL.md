@@ -1,7 +1,6 @@
 ---
 name: m10-performance
-description: "CRITICAL: Use for performance optimization. Triggers: performance, optimization, benchmark, profiling, flamegraph, criterion, slow, fast, allocation, cache, SIMD, make it faster, 性能优化, 基准测试"
-user-invocable: false
+description: Use when a change is motivated by speed or allocation, or when judging whether an optimization is worth its complexity. Measure before optimizing. The hot path here is per-packet — `encapsulate`/`decapsulate` in `noise/mod.rs` and the event loop in `device/mod.rs`, which deliberately reuse 64 KiB per-thread buffers rather than allocating; crypto is benchmarked with criterion under `boringtun/benches/crypto_benches`. Note that AmneziaWG's junk and padding trade bandwidth for obfuscation by design, so "wasteful" allocation there may be the point. Triggers on performance, optimization, benchmark, criterion, profiling, flamegraph, slow, allocation, zero-copy, cache, SIMD, make it faster.
 ---
 
 # Performance Optimization
@@ -59,16 +58,19 @@ To domain constraints (Layer 3):
 
 ```
 "How fast does this need to be?"
-    ↑ Ask: What's the performance SLA?
-    ↑ Check: domain-* (latency requirements)
-    ↑ Check: Business requirements (acceptable response time)
+    ↑ Ask: Is this on the per-packet path, or once per handshake?
+    ↑ Check: does the protocol mandate the cost? (AMNEZIA.md, amneziawg-go)
 ```
 
 | Question | Trace To | Ask |
 |----------|----------|-----|
-| Latency requirements | domain-* | What's acceptable response time? |
-| Throughput needs | domain-* | How many requests per second? |
-| Memory constraints | domain-* | What's the memory budget? |
+| Is this the hot path? | `noise/mod.rs`, `device/mod.rs` | Per packet, or per handshake? |
+| Can this allocation go? | m02-resource | Is there a reusable buffer already? |
+| Is the lock the bottleneck? | m07-concurrency | Is the guard held across I/O? |
+
+Beware the obvious "win" that is actually the feature: junk packets, S1-S4
+padding and content padding all spend bandwidth and cycles on purpose. Removing
+them is not an optimization, it is a protocol change. See `AMNEZIA.md`.
 
 ---
 
@@ -82,8 +84,8 @@ To implementation (Layer 1):
     ↓ m02-resource: Pre-allocate with_capacity
 
 "Need to parallelize"
-    ↓ m07-concurrency: Choose rayon or threads
-    ↓ m07-concurrency: Consider async for I/O-bound
+    ↓ m07-concurrency: Threads — this project has no async runtime
+    ↓ m07-concurrency: Or widen the existing worker pool (`DeviceConfig::n_threads`)
 
 "Need cache efficiency"
     ↓ Data layout: Prefer Vec over HashMap when possible
@@ -152,6 +154,7 @@ To implementation (Layer 1):
 | When | See |
 |------|-----|
 | Reducing clones | m01-ownership |
-| Concurrency options | m07-concurrency |
-| Smart pointer choice | m02-resource |
-| Domain requirements | domain-* |
+| Concurrency options, lock contention | m07-concurrency |
+| Smart pointer choice, buffer reuse | m02-resource |
+| Reaching for `unsafe` to go faster | unsafe-checker (rule general-02) |
+| Whether the cost is the protocol's | amnezia-dev, `AMNEZIA.md` |

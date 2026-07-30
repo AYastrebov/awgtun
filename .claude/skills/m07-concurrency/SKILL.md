@@ -1,7 +1,6 @@
 ---
 name: m07-concurrency
-description: "CRITICAL: Use for concurrency/async. Triggers: E0277 Send Sync, cannot be sent between threads, thread, spawn, channel, mpsc, Mutex, RwLock, Atomic, async, await, Future, tokio, deadlock, race condition, 并发, 线程, 异步, 死锁"
-user-invocable: false
+description: Use when working on threading, shared state or lock design in Rust. Covers Send/Sync bounds, Mutex/RwLock/atomics, channels, deadlock and race analysis. This project is threads-only, with no async runtime anywhere — the device event loop in `device/mod.rs` runs N worker threads over `Arc<Mutex<Peer>>`, a hand-rolled reader/writer `dev_lock`, and per-thread `ThreadData` buffers. Triggers on E0277 Send/Sync, cannot be sent between threads, thread, spawn, channel, mpsc, Mutex, RwLock, parking_lot, Atomic, Ordering, deadlock, race condition, lock contention.
 ---
 
 # Concurrency
@@ -51,45 +50,43 @@ Before adding concurrency:
 
 ---
 
-## Trace Up ↑ (MANDATORY)
+## Trace Up ↑
 
-**CRITICAL**: Don't just fix the error. Trace UP to find domain constraints.
+Don't just fix the error. Trace up to the constraint that caused it.
 
-### Domain Detection Table
+### This project's concurrency model
 
-| Context Keywords | Load Domain Skill | Key Constraint |
-|-----------------|-------------------|----------------|
-| Web API, HTTP, axum, actix, handler | **domain-web** | Handlers run on any thread |
-| 交易, 支付, trading, payment | **domain-fintech** | Audit + thread safety |
-| gRPC, kubernetes, microservice | **domain-cloud-native** | Distributed tracing |
-| CLI, terminal, clap | **domain-cli** | Usually single-thread OK |
+There is no async runtime here — no tokio, no `.await`, anywhere. `boringtun`
+runs a fixed pool of OS threads, each in its own event loop over epoll (Linux)
+or kqueue (macOS). Reach for threads, locks and atomics; treat any suggestion to
+"just make it async" as out of scope.
 
-### Example: Web API + Rc Error
+| Where | Shape |
+|-------|-------|
+| `device/mod.rs` | `n_threads` workers, each with its own `ThreadData` buffers and TUN queue |
+| `device/dev_lock.rs` | Hand-rolled reader/writer lock; workers hold a read lock, `set=1` takes it writeable |
+| `Arc<Mutex<Peer>>` | Every peer, reachable from all workers and from three index maps |
+| `AtomicUsize`, `AtomicBool` | Interface MTU, rate-limiter counters |
 
-```
-"Rc cannot be sent between threads" in Web API context
-    ↑ DETECT: "Web API" → Load domain-web
-    ↑ FIND: domain-web says "Shared state must be thread-safe"
-    ↑ FIND: domain-web says "Rc in state" is Common Mistake
-    ↓ DESIGN: Use Arc<T> with State extractor
-    ↓ IMPL: axum::extract::State<Arc<AppConfig>>
-```
+Two invariants worth knowing before touching a lock here. A worker must not hold
+a peer lock across a blocking send. And the peer index maps (`peers`,
+`peers_by_idx`, `peers_by_ip`) all point at the *same* `Arc`, so a peer is
+mutated in place rather than replaced — see `Device::set_amnezia_config`.
 
 ### Generic Trace
 
 ```
 "Send not satisfied for my type"
-    ↑ Ask: What domain is this? Load domain-* skill
-    ↑ Ask: Does this type need to cross thread boundaries?
-    ↑ Check: m09-domain (is the data model correct?)
+    ↑ Ask: Does this type need to cross thread boundaries at all?
+    ↑ Ask: Is it reachable from a worker, or owned by one?
 ```
 
 | Situation | Trace To | Question |
 |-----------|----------|----------|
-| Send/Sync in Web | **domain-web** | What's the state management pattern? |
-| Send/Sync in CLI | **domain-cli** | Is multi-thread really needed? |
-| Mutex vs channels | m09-domain | Shared state or message passing? |
-| Async vs threads | m10-performance | What's the workload profile? |
+| Raw pointer is not Send | unsafe-checker | Is the `unsafe impl Send` justified? |
+| Mutex vs channels | m02-resource | Shared state or message passing? |
+| Lock contention on the packet path | m10-performance | Measured, or assumed? |
+| Ordering on an atomic | unsafe-checker | What does `Relaxed` actually guarantee here? |
 
 ---
 
@@ -216,7 +213,7 @@ do_async().await;
 
 | When | See |
 |------|-----|
-| Smart pointer choice | m02-resource |
-| Interior mutability | m03-mutability |
-| Performance tuning | m10-performance |
-| Domain concurrency needs | domain-* |
+| Smart pointer choice, interior mutability | m02-resource |
+| Performance tuning, lock contention | m10-performance |
+| `unsafe impl Send`/`Sync`, atomics ordering | unsafe-checker |
+| Borrow errors behind a lock guard | m01-ownership |

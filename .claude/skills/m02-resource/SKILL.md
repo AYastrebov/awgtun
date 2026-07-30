@@ -1,7 +1,6 @@
 ---
 name: m02-resource
-description: "CRITICAL: Use for smart pointers and resource management. Triggers: Box, Rc, Arc, Weak, RefCell, Cell, smart pointer, heap allocation, reference counting, RAII, Drop, should I use Box or Rc, when to use Arc vs Rc, 智能指针, 引用计数, 堆分配"
-user-invocable: false
+description: Use when choosing a smart pointer or deciding who releases a resource. Covers Box/Rc/Arc/Weak, interior mutability, RAII and Drop. This project is multi-threaded, so `Arc<Mutex<_>>` is the norm and `Rc`/`RefCell` are the wrong reach; the resources that actually matter are OS-owned — TUN and UDP file descriptors, epoll/kqueue registrations — and the FFI and JNI handles, which are raw pointers the caller must hand back to `tunnel_free`. Triggers on Box, Rc, Arc, Weak, RefCell, Cell, smart pointer, heap allocation, reference counting, RAII, Drop, leak, file descriptor ownership, Arc vs Rc.
 ---
 
 # Resource Management
@@ -57,14 +56,17 @@ When pointer choice is unclear, trace to design:
 "Should I use Arc or Rc?"
     ↑ Ask: Is this data shared across threads?
     ↑ Check: m07-concurrency (thread model)
-    ↑ Check: domain-* (performance constraints)
 ```
 
 | Situation | Trace To | Question |
 |-----------|----------|----------|
 | Rc vs Arc confusion | m07-concurrency | What's the concurrency model? |
-| RefCell panics | m03-mutability | Is interior mutability right here? |
-| Memory leaks | m12-lifecycle | Where should cleanup happen? |
+| Lock held too long | m07-concurrency | Should the guard be dropped earlier? |
+| A handle leaks across FFI | unsafe-checker | Who calls `tunnel_free`, and when? |
+
+In this repo the answer to "Rc or Arc" is always Arc: every peer lives in an
+`Arc<Mutex<Peer>>` reachable from several worker threads at once. `Rc` and
+`RefCell` in a `Device` or `Tunn` path are a mistake, not a trade-off.
 
 ---
 
@@ -154,6 +156,6 @@ Need interior mutability?
 | When | See |
 |------|-----|
 | Ownership errors | m01-ownership |
-| Interior mutability details | m03-mutability |
-| Multi-thread context | m07-concurrency |
-| Resource lifecycle | m12-lifecycle |
+| Multi-thread context, lock choice | m07-concurrency |
+| File descriptors, raw handles, `Drop` across FFI | unsafe-checker |
+| Allocation on the packet path | m10-performance |

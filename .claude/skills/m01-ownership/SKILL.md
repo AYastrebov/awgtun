@@ -1,7 +1,6 @@
 ---
 name: m01-ownership
-description: "CRITICAL: Use for ownership/borrow/lifetime issues. Triggers: E0382, E0597, E0506, E0507, E0515, E0716, E0106, value moved, borrowed value does not live long enough, cannot move out of, use of moved value, ownership, borrow, lifetime, 'a, 'static, move, clone, Copy, 所有权, 借用, 生命周期"
-user-invocable: false
+description: Use when a borrow-checker error needs a design answer rather than a `.clone()`. Treats each error as a question about who should own the data and for how long. Relevant here because the packet path is built on borrowed slices with explicit lifetimes — `TunnResult<'a>` and `Packet<'a>` borrow the caller's buffers, and `PacketClassifier<'a>` borrows the config — so a lifetime error usually means the buffer split is wrong, not that something needs copying. Triggers on E0382, E0597, E0506, E0507, E0515, E0716, E0106, E0499, E0502, value moved, borrowed value does not live long enough, cannot move out of, cannot borrow as mutable, ownership, borrow, lifetime, `'a`, `'static`.
 ---
 
 # Ownership & Lifetimes
@@ -58,15 +57,20 @@ When errors persist, trace to design layer:
 ```
 E0382 (moved value)
     ↑ Ask: What design choice led to this ownership pattern?
-    ↑ Check: m09-domain (is this Entity or Value Object?)
-    ↑ Check: domain-* (what constraints apply?)
+    ↑ Check: does the protocol require this data to outlive the call?
+             (AMNEZIA.md, amneziawg-go)
 ```
 
 | Persistent Error | Trace To | Question |
 |-----------------|----------|----------|
-| E0382 repeated | m02-resource | Should use Arc/Rc for sharing? |
-| E0597 repeated | m09-domain | Is scope boundary at right place? |
-| E0506/E0507 | m03-mutability | Should use interior mutability? |
+| E0382 repeated | m02-resource | Should use Arc for sharing? |
+| E0597 repeated | amnezia-dev | Is the buffer boundary in the right place? |
+| E0506/E0507 | m02-resource | Should the owner hold this behind a lock? |
+
+In this repo, "trace up" usually means the wire format: `TunnResult<'a>` borrows
+the caller's `dst`, so a lifetime that will not close is often a sign that the
+padding prefix and the message body were split at the wrong offset. See
+`AMNEZIA.md` and the `amnezia-dev` skill.
 
 ---
 
@@ -128,7 +132,7 @@ From design decisions to implementation:
 
 | When | See |
 |------|-----|
-| Need smart pointers | m02-resource |
-| Need interior mutability | m03-mutability |
-| Data is domain entity | m09-domain |
-| Learning ownership concepts | m14-mental-model |
+| Need smart pointers or shared ownership | m02-resource |
+| Sharing across the device's worker threads | m07-concurrency |
+| The lifetime crosses an FFI or JNI boundary | unsafe-checker |
+| The buffer layout is protocol-driven | amnezia-dev, `AMNEZIA.md` |

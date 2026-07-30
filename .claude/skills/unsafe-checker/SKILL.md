@@ -1,21 +1,7 @@
 ---
 name: unsafe-checker
-description: "CRITICAL: Use for unsafe Rust code review and FFI. Triggers on: unsafe, raw pointer, FFI, extern, transmute, *mut, *const, union, #[repr(C)], libc, std::ffi, MaybeUninit, NonNull, SAFETY comment, soundness, undefined behavior, UB, safe wrapper, memory layout, bindgen, cbindgen, CString, CStr, 安全抽象, 裸指针, 外部函数接口, 内存布局, 不安全代码, FFI 绑定, 未定义行为"
-globs: ["**/*.rs"]
+description: Use when writing or reviewing unsafe Rust, especially at a foreign boundary. 47 soundness rules covering raw pointers, memory layout, panic safety, Send/Sync, unions and FFI. In this repo that means `ffi/mod.rs` and `wireguard_ffi.h` (the C ABI), `jni.rs` (Android), `device/tun_linux.rs` and `tun_darwin.rs`, `device/epoll.rs` and `kqueue.rs` (raw syscalls and fds), and the `MaybeUninit` receive-buffer casts in `device/mod.rs`. Triggers on unsafe, raw pointer, transmute, *mut, *const, union, #[repr(C)], extern "C", #[no_mangle], libc, std::ffi, CStr, CString, MaybeUninit, NonNull, SAFETY comment, soundness, undefined behavior, UB, safe wrapper, memory layout, cbindgen, JNI.
 allowed-tools: ["Read", "Grep", "Glob"]
----
-
-Display the following ASCII art exactly as shown. Do not modify spaces or line breaks:
-```text
-⚠️ **Unsafe Rust Checker Loaded**
-
-     *  ^  *
-    /◉\_~^~_/◉\
- ⚡/     o     \⚡
-   '_        _'
-   / '-----' \
-```
-
 ---
 
 # Unsafe Rust Checker
