@@ -110,6 +110,125 @@ const TRANSPORT_HEADER_SZ: usize = 16; // type(4) + receiver(4) + counter(8)
 /// Matches amneziawg-go's `MessageKeepaliveSize`.
 const KEEPALIVE_SZ: usize = DATA_OVERHEAD_SZ;
 
+/// Classifies an inbound AmneziaWG datagram: how many bytes of crypto padding
+/// prefix it carries, and how much of the message after that prefix is covered
+/// by AWG 3.0 header protection.
+///
+/// This is deliberately separate from [`Tunn`] because a receiver must classify
+/// a datagram *before* it knows which peer — and therefore which `Tunn` — the
+/// datagram belongs to. The `device` module's anonymous-UDP handler does
+/// exactly that. It mirrors amneziawg-go, where `DeterminePacketTypeAndPadding`
+/// is a `Device` method rather than a peer method.
+///
+/// Borrows its configuration so that both `Tunn` and `Device` can build one per
+/// datagram without duplicating state.
+#[derive(Debug, Clone, Copy)]
+pub struct PacketClassifier<'a> {
+    paddings: &'a PaddingConfig,
+    headers: &'a HeaderConfig,
+    header_protection: Option<HeaderProtection>,
+}
+
+impl<'a> PacketClassifier<'a> {
+    pub fn new(
+        paddings: &'a PaddingConfig,
+        headers: &'a HeaderConfig,
+        header_protection: Option<HeaderProtection>,
+    ) -> Self {
+        PacketClassifier {
+            paddings,
+            headers,
+            header_protection,
+        }
+    }
+
+    /// Build a classifier borrowing from an [`Amnezia3Config`].
+    pub fn from_config(config: &'a Amnezia3Config) -> Self {
+        PacketClassifier::new(
+            &config.paddings,
+            &config.headers,
+            config.header_protection(),
+        )
+    }
+
+    /// Determine the padding length for an incoming datagram by trying each
+    /// message type's padding + expected size, then validating the header at
+    /// the padding offset. With AWG 3.0 header protection enabled, the 4 type
+    /// bytes are decrypted before the range check.
+    ///
+    /// Returns `Some((padding, protected_len))` where `protected_len` is the
+    /// number of bytes after the padding covered by header protection (the full
+    /// message for handshake types, the 16-byte header for transport), or
+    /// `None` if no message type matches.
+    pub fn classify(&self, src: &[u8]) -> Option<(usize, usize)> {
+        let checks: [(usize, &crate::amnezia::HeaderRange, usize, bool); 4] = [
+            (
+                self.paddings.s1 as usize,
+                &self.headers.init,
+                HANDSHAKE_INIT_SZ,
+                true,
+            ),
+            (
+                self.paddings.s2 as usize,
+                &self.headers.response,
+                HANDSHAKE_RESP_SZ,
+                true,
+            ),
+            (
+                self.paddings.s3 as usize,
+                &self.headers.cookie,
+                COOKIE_REPLY_SZ,
+                true,
+            ),
+            (
+                self.paddings.s4 as usize,
+                &self.headers.transport,
+                DATA_OVERHEAD_SZ,
+                false,
+            ),
+        ];
+
+        // Every candidate shares the same nonce — the first 12 bytes of the
+        // datagram — so the type keystream is derived once, as in
+        // amneziawg-go's `typeHash`.
+        let type_mask = match self.header_protection {
+            Some(hp) if src.len() >= crate::amnezia::HEADER_PROTECTION_NONCE_SIZE => {
+                Some(hp.type_mask(src))
+            }
+            _ => None,
+        };
+
+        for &(padding, header_range, expected_size, exact) in &checks {
+            let size_ok = if exact {
+                src.len() == padding + expected_size
+            } else {
+                src.len() >= padding + expected_size
+            };
+
+            if size_ok && padding + 4 <= src.len() {
+                let mut type_bytes: [u8; 4] = src[padding..padding + 4]
+                    .try_into()
+                    .expect("bounds checked: padding + 4 <= src.len()");
+                if let Some(mask) = type_mask {
+                    for (byte, mask_byte) in type_bytes.iter_mut().zip(mask.iter()) {
+                        *byte ^= mask_byte;
+                    }
+                }
+                let header = u32::from_le_bytes(type_bytes);
+                if header_range.contains(header) {
+                    let protected_len = if exact {
+                        expected_size
+                    } else {
+                        TRANSPORT_HEADER_SZ
+                    };
+                    return Some((padding, protected_len));
+                }
+            }
+        }
+        None
+    }
+}
+
 #[derive(Debug)]
 pub struct HandshakeInit<'a> {
     sender_idx: u32,
@@ -845,81 +964,18 @@ impl Tunn {
         self.packet_queue.pop_front()
     }
 
-    /// Determine the padding length for an incoming packet by trying each
-    /// message type's padding + expected size, then validating the header at
-    /// the padding offset. With AWG 3.0 header protection enabled, the
-    /// 4 type bytes are decrypted before the range check.
-    ///
-    /// Returns `Some((padding, protected_len))` where `protected_len` is the
-    /// number of bytes after the padding covered by header protection (the
-    /// full message for handshake types, the 16-byte header for transport),
-    /// or `None` if no match.
+    /// A classifier over this tunnel's AmneziaWG configuration.
+    fn classifier(&self) -> PacketClassifier<'_> {
+        PacketClassifier::new(
+            &self.padding_config,
+            &self.header_config,
+            self.header_protection,
+        )
+    }
+
+    /// See [`PacketClassifier::classify`].
     fn determine_padding(&self, src: &[u8]) -> Option<(usize, usize)> {
-        let checks: [(usize, &crate::amnezia::HeaderRange, usize, bool); 4] = [
-            (
-                self.padding_config.s1 as usize,
-                &self.header_config.init,
-                HANDSHAKE_INIT_SZ,
-                true,
-            ),
-            (
-                self.padding_config.s2 as usize,
-                &self.header_config.response,
-                HANDSHAKE_RESP_SZ,
-                true,
-            ),
-            (
-                self.padding_config.s3 as usize,
-                &self.header_config.cookie,
-                COOKIE_REPLY_SZ,
-                true,
-            ),
-            (
-                self.padding_config.s4 as usize,
-                &self.header_config.transport,
-                DATA_OVERHEAD_SZ,
-                false,
-            ),
-        ];
-
-        // Every candidate shares the same nonce — the first 12 bytes of the
-        // datagram — so the type keystream is derived once, as in
-        // amneziawg-go's `typeHash`.
-        let type_mask = match self.header_protection {
-            Some(hp) if src.len() >= crate::amnezia::HEADER_PROTECTION_NONCE_SIZE => {
-                Some(hp.type_mask(src))
-            }
-            _ => None,
-        };
-
-        for &(padding, header_range, expected_size, exact) in &checks {
-            let size_ok = if exact {
-                src.len() == padding + expected_size
-            } else {
-                src.len() >= padding + expected_size
-            };
-
-            if size_ok && padding + 4 <= src.len() {
-                let mut type_bytes: [u8; 4] = src[padding..padding + 4]
-                    .try_into()
-                    .expect("bounds checked: padding + 4 <= src.len()");
-                if let Some(mask) = type_mask {
-                    for (byte, mask_byte) in type_bytes.iter_mut().zip(mask.iter()) {
-                        *byte ^= mask_byte;
-                    }
-                }
-                let header = u32::from_le_bytes(type_bytes);
-                if header_range.contains(header) {
-                    let protected_len = if exact {
-                        expected_size
-                    } else {
-                        TRANSPORT_HEADER_SZ
-                    };
-                    return Some((padding, protected_len));
-                }
-            }
-        }
-        None
+        self.classifier().classify(src)
     }
 
     fn estimate_loss(&self) -> f32 {
@@ -1192,6 +1248,78 @@ mod tests {
             timing_ranges: Default::default(),
             mtu: crate::amnezia::AWG3_DEFAULT_MTU,
         }
+    }
+
+    /// The classifier is the one piece the `device` module uses without a
+    /// `Tunn`, so exercise it directly rather than only through `decapsulate`.
+    #[test]
+    fn classifier_finds_padding_for_each_message_type() {
+        let config = awg3_test_config([0x42; 32]);
+        let hp = config.header_protection().expect("key is set");
+        let classifier = PacketClassifier::from_config(&config);
+
+        // (message type, wire size, S-padding, expected protected span)
+        let cases = [
+            (100u32, HANDSHAKE_INIT_SZ, 16usize, HANDSHAKE_INIT_SZ),
+            (200, HANDSHAKE_RESP_SZ, 16, HANDSHAKE_RESP_SZ),
+            (300, COOKIE_REPLY_SZ, 16, COOKIE_REPLY_SZ),
+            (400, DATA_OVERHEAD_SZ + 64, 16, TRANSPORT_HEADER_SZ),
+        ];
+
+        for (msg_type, size, padding, expected_protected) in cases {
+            let mut datagram = vec![0u8; padding + size];
+            // A distinct, non-zero padding prefix so the nonce is realistic.
+            for (i, byte) in datagram[..padding].iter_mut().enumerate() {
+                *byte = (i as u8).wrapping_add(1);
+            }
+            datagram[padding..padding + 4].copy_from_slice(&msg_type.to_le_bytes());
+            // Header protection is applied last on send.
+            let (prefix, message) = datagram.split_at_mut(padding);
+            hp.apply(prefix, &mut message[..expected_protected]);
+
+            assert_eq!(
+                classifier.classify(&datagram),
+                Some((padding, expected_protected)),
+                "message type {msg_type} should classify"
+            );
+        }
+    }
+
+    #[test]
+    fn classifier_rejects_datagrams_outside_the_header_ranges() {
+        let config = awg3_test_config([0x42; 32]);
+        let hp = config.header_protection().expect("key is set");
+        let classifier = PacketClassifier::from_config(&config);
+
+        // Right size for a handshake init, but a type outside H1 (100-199).
+        let mut datagram = vec![7u8; 16 + HANDSHAKE_INIT_SZ];
+        datagram[16..20].copy_from_slice(&1u32.to_le_bytes());
+        let (prefix, message) = datagram.split_at_mut(16);
+        hp.apply(prefix, &mut message[..HANDSHAKE_INIT_SZ]);
+        assert_eq!(classifier.classify(&datagram), None);
+
+        // A correct type but the wrong wire size for that type.
+        let mut short = vec![7u8; 16 + HANDSHAKE_INIT_SZ - 1];
+        short[16..20].copy_from_slice(&100u32.to_le_bytes());
+        let (prefix, message) = short.split_at_mut(16);
+        hp.apply(prefix, &mut message[..4]);
+        assert_eq!(classifier.classify(&short), None);
+    }
+
+    /// Without header protection or padding the classifier must agree with
+    /// standard WireGuard framing, which is what keeps `Tunn::new` unaffected.
+    #[test]
+    fn classifier_handles_plain_wireguard() {
+        let config = crate::amnezia::Amnezia3Config::wireguard_compatible();
+        let classifier = PacketClassifier::from_config(&config);
+
+        let mut init = vec![0u8; HANDSHAKE_INIT_SZ];
+        init[..4].copy_from_slice(&HANDSHAKE_INIT.to_le_bytes());
+        assert_eq!(classifier.classify(&init), Some((0, HANDSHAKE_INIT_SZ)));
+
+        let mut data = vec![0u8; DATA_OVERHEAD_SZ + 100];
+        data[..4].copy_from_slice(&DATA.to_le_bytes());
+        assert_eq!(classifier.classify(&data), Some((0, TRANSPORT_HEADER_SZ)));
     }
 
     #[test]
