@@ -40,6 +40,7 @@ use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::parse_handshake_anon;
 use crate::noise::rate_limiter::RateLimiter;
 use crate::noise::{Packet, Tunn, TunnResult};
+use crate::noise::{PacketClassifier, COOKIE_REPLY_SZ};
 use crate::x25519;
 use allowed_ips::AllowedIps;
 use parking_lot::Mutex;
@@ -635,17 +636,54 @@ impl Device {
                 let src_buf =
                     unsafe { &mut *(&mut t.src_buf[..] as *mut [u8] as *mut [MaybeUninit<u8>]) };
                 while let Ok((packet_len, addr)) = udp.recv_from(src_buf) {
-                    let packet = &t.src_buf[..packet_len];
+                    // Strip the AmneziaWG padding prefix and, with AWG 3.0
+                    // header protection, decrypt the protected span, before the
+                    // packet can be parsed. This has to happen here rather than
+                    // in `Tunn` because the peer is not known until the packet
+                    // is parsed, which is also why amneziawg-go classifies on
+                    // the device.
+                    //
+                    // Unlike `Tunn::decapsulate`, which only holds `&[u8]`, the
+                    // device owns its receive buffer, so the decryption is done
+                    // in place. The nonce is the padding prefix, which is not
+                    // part of the mutated span.
+                    let (padding, protected_len) = PacketClassifier::from_config(&d.amnezia)
+                        .classify(&t.src_buf[..packet_len])
+                        .unwrap_or((0, 0));
+
+                    if let Some(hp) = d.amnezia.header_protection() {
+                        let protected = protected_len.min(packet_len - padding);
+                        if protected > 0 {
+                            let (prefix, message) = t.src_buf[..packet_len].split_at_mut(padding);
+                            hp.apply(prefix, &mut message[..protected]);
+                        }
+                    }
+
+                    let packet = &t.src_buf[padding..packet_len];
+                    // A cookie reply is built in a scratch buffer so the S3
+                    // padding can be prepended around it, as in
+                    // `Tunn::decapsulate`.
+                    let mut cookie = [0u8; COOKIE_REPLY_SZ];
                     // The rate limiter initially checks mac1 and mac2, and optionally asks to send a cookie
                     let parsed_packet = match rate_limiter.verify_packet(
                         Some(addr.as_socket().unwrap().ip()),
                         packet,
-                        &mut t.dst_buf,
-                        &crate::amnezia::HeaderConfig::default(),
+                        &mut cookie,
+                        &d.amnezia.headers,
                     ) {
                         Ok(packet) => packet,
-                        Err(TunnResult::WriteToNetwork(cookie)) => {
-                            let _: Result<_, _> = udp.send_to(cookie, &addr);
+                        Err(TunnResult::WriteToNetwork(cookie_reply)) => {
+                            let s3 = d.amnezia.paddings.s3 as usize;
+                            let len = cookie_reply.len();
+                            if s3 > 0 {
+                                OsRng.fill_bytes(&mut t.dst_buf[..s3]);
+                            }
+                            t.dst_buf[s3..s3 + len].copy_from_slice(cookie_reply);
+                            if let Some(hp) = d.amnezia.header_protection() {
+                                let (prefix, message) = t.dst_buf[..s3 + len].split_at_mut(s3);
+                                hp.apply(prefix, message);
+                            }
+                            let _: Result<_, _> = udp.send_to(&t.dst_buf[..s3 + len], &addr);
                             continue;
                         }
                         Err(_) => continue,

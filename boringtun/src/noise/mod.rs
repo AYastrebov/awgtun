@@ -103,7 +103,7 @@ const DATA: MessageType = 4;
 
 const HANDSHAKE_INIT_SZ: usize = 148;
 const HANDSHAKE_RESP_SZ: usize = 92;
-const COOKIE_REPLY_SZ: usize = 64;
+pub(crate) const COOKIE_REPLY_SZ: usize = 64;
 const DATA_OVERHEAD_SZ: usize = 32;
 const TRANSPORT_HEADER_SZ: usize = 16; // type(4) + receiver(4) + counter(8)
 /// Wire size of an unpadded keepalive: transport header + AEAD tag.
