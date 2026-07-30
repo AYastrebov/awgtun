@@ -35,7 +35,7 @@ use std::sync::Arc;
 use std::thread;
 use std::thread::JoinHandle;
 
-use crate::amnezia::Amnezia3Config;
+use crate::amnezia::{Amnezia3Config, U32Range};
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::parse_handshake_anon;
 use crate::noise::rate_limiter::RateLimiter;
@@ -315,6 +315,7 @@ impl Device {
         endpoint: Option<SocketAddr>,
         allowed_ips: &[AllowedIP],
         keepalive: Option<u16>,
+        keepalive_range: Option<U32Range>,
         preshared_key: Option<[u8; 32]>,
     ) {
         if remove {
@@ -334,6 +335,14 @@ impl Device {
             .as_ref()
             .expect("Private key must be set first");
 
+        // `persistent_keepalive_interval` is a peer key upstream, so an AWG 3.0
+        // range form overrides just that field of the device config. The timers
+        // give the range precedence over the fixed interval.
+        let mut amnezia = self.peer_amnezia_config();
+        if let Some(range) = keepalive_range {
+            amnezia.timing_ranges.persistent_keepalive = range;
+        }
+
         let tunn = match Tunn::new_with_amnezia3(
             device_key_pair.0.clone(),
             pub_key,
@@ -341,7 +350,7 @@ impl Device {
             keepalive,
             next_index,
             None,
-            self.peer_amnezia_config(),
+            amnezia,
         ) {
             Ok(tunn) => tunn,
             Err(e) => {
@@ -352,7 +361,14 @@ impl Device {
             }
         };
 
-        let peer = Peer::new(tunn, next_index, endpoint, allowed_ips, preshared_key);
+        let peer = Peer::new(
+            tunn,
+            next_index,
+            endpoint,
+            allowed_ips,
+            preshared_key,
+            keepalive_range,
+        );
 
         let peer = Arc::new(Mutex::new(peer));
         self.peers.insert(pub_key, Arc::clone(&peer));

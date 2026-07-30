@@ -4,11 +4,13 @@
 use super::dev_lock::LockReadGuard;
 use super::drop_privileges::get_saved_ids;
 use super::{AllowedIP, Device, Error, SocketAddr};
+use crate::amnezia::Amnezia3Config;
 use crate::device::Action;
 use crate::serialization::KeyBytes;
 use crate::x25519;
 use hex::encode as encode_hex;
 use libc::*;
+use std::fmt::Write as _;
 use std::fs::{create_dir, remove_file};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::os::unix::io::{AsRawFd, FromRawFd};
@@ -168,6 +170,9 @@ fn api_get(writer: &mut BufWriter<&UnixStream>, d: &Device) -> i32 {
         writeln!(writer, "fwmark={}", fwmark);
     }
 
+    // Empty for a standard WireGuard device, so `get=1` is unchanged there.
+    write!(writer, "{}", d.amnezia.to_uapi_block());
+
     for (k, p) in d.peers.iter() {
         let p = p.lock();
         writeln!(writer, "public_key={}", encode_hex(k.as_bytes()));
@@ -176,7 +181,11 @@ fn api_get(writer: &mut BufWriter<&UnixStream>, d: &Device) -> i32 {
             writeln!(writer, "preshared_key={}", encode_hex(key));
         }
 
-        if let Some(keepalive) = p.persistent_keepalive() {
+        // Report the configured AWG 3.0 range rather than the single interval
+        // that happens to be armed, so `showconf` round-trips.
+        if let Some(range) = p.keepalive_range() {
+            writeln!(writer, "persistent_keepalive_interval={}", range);
+        } else if let Some(keepalive) = p.persistent_keepalive() {
             writeln!(writer, "persistent_keepalive_interval={}", keepalive);
         }
 
@@ -201,6 +210,67 @@ fn api_get(writer: &mut BufWriter<&UnixStream>, d: &Device) -> i32 {
     0
 }
 
+/// Is this an interface-level AmneziaWG key?
+///
+/// The names match `Amnezia3Config::parse`, which does the actual parsing;
+/// this only decides which lines to route there. `persistent_keepalive_interval`
+/// is deliberately absent: it is a peer key upstream and stays one here.
+fn is_amnezia_interface_key(key: &str) -> bool {
+    matches!(
+        key,
+        "jc" | "jmin"
+            | "jmax"
+            | "s1"
+            | "s2"
+            | "s3"
+            | "s4"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "i1"
+            | "i2"
+            | "i3"
+            | "i4"
+            | "i5"
+            | "header_protection_key"
+            | "content_padding_addition"
+            | "rekey_after_time"
+            | "rekey_timeout"
+            | "reject_after_time"
+            | "keepalive_timeout"
+            | "max_handshake_attempts"
+            | "mtu"
+    )
+}
+
+/// Apply the AmneziaWG lines collected from the interface section.
+///
+/// The block is parsed and validated as a whole rather than key by key, so
+/// cross-field rules (overlapping header ranges, S1-S4 >= 12 when header
+/// protection is on) are enforced atomically and a rejected config leaves the
+/// device untouched.
+///
+/// This makes AmneziaWG parameters replace-all per `set=1`, unlike WireGuard's
+/// incremental UAPI: a key absent from the block returns to its default. That
+/// matches how `awg setconf` sends a configuration, and it avoids having to
+/// rebuild a live peer's tunnel, which is not supported.
+fn apply_amnezia_block(device: &mut Device, block: &str) -> i32 {
+    if block.is_empty() {
+        return 0;
+    }
+    match Amnezia3Config::parse(block) {
+        Ok(config) => {
+            device.amnezia = config;
+            0
+        }
+        Err(e) => {
+            tracing::error!(message = "Invalid AmneziaWG configuration", error = ?e);
+            EINVAL
+        }
+    }
+}
+
 fn api_set(reader: &mut BufReader<&UnixStream>, d: &mut LockReadGuard<Device>) -> i32 {
     d.try_writeable(
         |device| device.trigger_yield(),
@@ -208,19 +278,28 @@ fn api_set(reader: &mut BufReader<&UnixStream>, d: &mut LockReadGuard<Device>) -
             device.cancel_yield();
 
             let mut cmd = String::new();
+            // AmneziaWG keys are collected and applied as one block; see
+            // `apply_amnezia_block`.
+            let mut amnezia_block = String::new();
 
             while reader.read_line(&mut cmd).is_ok() {
                 cmd.pop(); // remove newline if any
                 if cmd.is_empty() {
-                    return 0; // Done
+                    return apply_amnezia_block(device, &amnezia_block); // Done
                 }
                 {
-                    let parsed_cmd: Vec<&str> = cmd.split('=').collect();
+                    let parsed_cmd: Vec<&str> = cmd.splitn(2, '=').collect();
                     if parsed_cmd.len() != 2 {
                         return EPROTO;
                     }
 
                     let (key, val) = (parsed_cmd[0], parsed_cmd[1]);
+
+                    if is_amnezia_interface_key(key) {
+                        let _ = writeln!(amnezia_block, "{}={}", key, val);
+                        cmd.clear();
+                        continue;
+                    }
 
                     match key {
                         "private_key" => match val.parse::<KeyBytes>() {
@@ -254,13 +333,19 @@ fn api_set(reader: &mut BufReader<&UnixStream>, d: &mut LockReadGuard<Device>) -
                             Err(_) => return EINVAL,
                         },
                         "public_key" => match val.parse::<KeyBytes>() {
-                            // Indicates a new peer section
+                            // Indicates a new peer section. The interface
+                            // section is over, so the AmneziaWG config must be
+                            // applied before any peer is built from it.
                             Ok(key_bytes) => {
+                                let status = apply_amnezia_block(device, &amnezia_block);
+                                if status != 0 {
+                                    return status;
+                                }
                                 return api_set_peer(
                                     reader,
                                     device,
                                     x25519::PublicKey::from(key_bytes.0),
-                                )
+                                );
                             }
                             Err(_) => return EINVAL,
                         },
@@ -287,6 +372,7 @@ fn api_set_peer(
     let mut replace_ips = false;
     let mut endpoint = None;
     let mut keepalive = None;
+    let mut keepalive_range = None;
     let mut public_key = pub_key;
     let mut preshared_key = None;
     let mut allowed_ips: Vec<AllowedIP> = vec![];
@@ -300,6 +386,7 @@ fn api_set_peer(
                 endpoint,
                 allowed_ips.as_slice(),
                 keepalive,
+                keepalive_range,
                 preshared_key,
             );
             allowed_ips.clear(); //clear the vector content after update
@@ -325,9 +412,15 @@ fn api_set_peer(
                     Ok(addr) => endpoint = Some(addr),
                     Err(_) => return EINVAL,
                 },
+                // A plain interval keeps WireGuard's meaning; an AWG 3.0
+                // `lo-hi` range randomizes it per keepalive. This key stays
+                // per-peer, as it is upstream.
                 "persistent_keepalive_interval" => match val.parse::<u16>() {
                     Ok(interval) => keepalive = Some(interval),
-                    Err(_) => return EINVAL,
+                    Err(_) => match crate::amnezia::U32Range::parse(val) {
+                        Ok(range) => keepalive_range = Some(range),
+                        Err(_) => return EINVAL,
+                    },
                 },
                 "replace_allowed_ips" => match val.parse::<bool>() {
                     Ok(true) => replace_ips = true,
@@ -347,6 +440,7 @@ fn api_set_peer(
                         endpoint,
                         allowed_ips.as_slice(),
                         keepalive,
+                        keepalive_range,
                         preshared_key,
                     );
                     allowed_ips.clear(); //clear the vector content after update
@@ -365,4 +459,75 @@ fn api_set_peer(
         cmd.clear();
     }
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The routing table and the parser must agree: every key routed to the
+    /// AmneziaWG block has to be one `Amnezia3Config::parse` accepts, or the
+    /// device would reject a config it just claimed to understand.
+    #[test]
+    fn every_routed_key_is_accepted_by_the_parser() {
+        let keys = [
+            ("jc", "1"),
+            ("jmin", "64"),
+            ("jmax", "128"),
+            ("s1", "16"),
+            ("s2", "16"),
+            ("s3", "16"),
+            ("s4", "16"),
+            ("h1", "100-199"),
+            ("h2", "200-299"),
+            ("h3", "300-399"),
+            ("h4", "400-499"),
+            ("i1", "<b 0xff>"),
+            ("i2", "<r 8>"),
+            ("i3", "<t>"),
+            ("i4", "<rc 4>"),
+            ("i5", "<rd 4>"),
+            (
+                "header_protection_key",
+                "4242424242424242424242424242424242424242424242424242424242424242",
+            ),
+            ("content_padding_addition", "1-64"),
+            ("rekey_after_time", "100-140"),
+            ("rekey_timeout", "3-9"),
+            ("reject_after_time", "170-200"),
+            ("keepalive_timeout", "8-15"),
+            ("max_handshake_attempts", "10-20"),
+            ("mtu", "1400"),
+        ];
+
+        let mut block = String::new();
+        for (key, value) in keys {
+            assert!(is_amnezia_interface_key(key), "{key} should be routed");
+            let _ = writeln!(block, "{}={}", key, value);
+        }
+
+        Amnezia3Config::parse(&block).expect("every routed key parses");
+    }
+
+    /// WireGuard's own interface keys must not be swallowed by the AmneziaWG
+    /// block, and the peer-scoped keepalive must stay in the peer section.
+    #[test]
+    fn wireguard_keys_are_not_routed_to_the_amnezia_block() {
+        for key in [
+            "private_key",
+            "listen_port",
+            "fwmark",
+            "replace_peers",
+            "public_key",
+            "preshared_key",
+            "endpoint",
+            "allowed_ip",
+            "replace_allowed_ips",
+            "remove",
+            "protocol_version",
+            "persistent_keepalive_interval",
+        ] {
+            assert!(!is_amnezia_interface_key(key), "{key} must not be routed");
+        }
+    }
 }

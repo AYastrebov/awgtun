@@ -7,6 +7,7 @@ use socket2::{Domain, Protocol, Type};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::str::FromStr;
 
+use crate::amnezia::U32Range;
 use crate::device::{AllowedIps, Error};
 use crate::noise::{Tunn, TunnResult};
 
@@ -24,6 +25,10 @@ pub struct Peer {
     endpoint: RwLock<Endpoint>,
     allowed_ips: AllowedIps<()>,
     preshared_key: Option<[u8; 32]>,
+    /// AWG 3.0 `persistent_keepalive_interval` range, when configured as one.
+    /// Kept so `get=1` reports the configured range rather than the single
+    /// interval that happens to be armed right now.
+    keepalive_range: Option<U32Range>,
 }
 
 #[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash, Debug)]
@@ -57,6 +62,7 @@ impl Peer {
         endpoint: Option<SocketAddr>,
         allowed_ips: &[AllowedIP],
         preshared_key: Option<[u8; 32]>,
+        keepalive_range: Option<U32Range>,
     ) -> Peer {
         Peer {
             tunnel,
@@ -67,6 +73,7 @@ impl Peer {
             }),
             allowed_ips: allowed_ips.iter().map(|ip| (ip, ())).collect(),
             preshared_key,
+            keepalive_range,
         }
     }
 
@@ -173,6 +180,11 @@ impl Peer {
 
     pub fn persistent_keepalive(&self) -> Option<u16> {
         self.tunnel.persistent_keepalive()
+    }
+
+    /// The configured AWG 3.0 keepalive range, if the interval was set as one.
+    pub fn keepalive_range(&self) -> Option<U32Range> {
+        self.keepalive_range
     }
 
     pub fn preshared_key(&self) -> Option<&[u8; 32]> {
