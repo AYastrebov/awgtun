@@ -484,6 +484,17 @@ impl Default for HeaderConfig {
     }
 }
 
+/// Inverse of [`HeaderRange::parse`].
+impl fmt::Display for HeaderRange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.start == self.end {
+            write!(f, "{}", self.start)
+        } else {
+            write!(f, "{}-{}", self.start, self.end)
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PaddingConfig {
     pub s1: u8,
@@ -844,6 +855,38 @@ fn reject_arg(tag: &str, arg: Option<&str>) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// Inverse of [`parse_cps_tag`].
+impl fmt::Display for CpsTag {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CpsTag::Bytes(bytes) => {
+                write!(f, "<b 0x")?;
+                for byte in bytes {
+                    write!(f, "{:02x}", byte)?;
+                }
+                write!(f, ">")
+            }
+            CpsTag::Timestamp => write!(f, "<t>"),
+            CpsTag::RandomBytes { len } => write!(f, "<r {}>", len),
+            CpsTag::RandomChars { len } => write!(f, "<rc {}>", len),
+            CpsTag::RandomDigits { len } => write!(f, "<rd {}>", len),
+            CpsTag::Data => write!(f, "<d>"),
+            CpsTag::DataString => write!(f, "<ds>"),
+            CpsTag::DataSize { len } => write!(f, "<dz {}>", len),
+        }
+    }
+}
+
+/// Inverse of [`CpsChain::parse`].
+impl fmt::Display for CpsChain {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for tag in &self.tags {
+            write!(f, "{}", tag)?;
+        }
+        Ok(())
+    }
+}
+
 fn parse_cps_tag(tag: &str) -> Result<CpsTag, ConfigError> {
     let mut parts = tag.split_whitespace();
     let name = parts.next().ok_or_else(|| ConfigError::InvalidCps {
@@ -1101,6 +1144,17 @@ impl U32Range {
             default
         } else {
             self.hi
+        }
+    }
+}
+
+/// Inverse of [`U32Range::parse`].
+impl fmt::Display for U32Range {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.lo == self.hi {
+            write!(f, "{}", self.lo)
+        } else {
+            write!(f, "{}-{}", self.lo, self.hi)
         }
     }
 }
@@ -1421,6 +1475,96 @@ impl Amnezia3Config {
 
         config.validate()?;
         Ok(config)
+    }
+
+    /// Serialize back to the `key=value` block [`Self::parse`] accepts.
+    ///
+    /// Only fields that differ from the default are emitted, so a standard
+    /// WireGuard configuration produces an empty string and `get=1` stays
+    /// byte-identical to upstream boringtun for non-AmneziaWG devices.
+    ///
+    /// Every emitted line round-trips: `parse(&cfg.to_uapi_block()) == cfg`.
+    pub fn to_uapi_block(&self) -> String {
+        use std::fmt::Write as _;
+
+        let default = Amnezia3Config::default();
+        let mut out = String::new();
+
+        if self.junk != default.junk {
+            let _ = writeln!(out, "jc={}", self.junk.count);
+            let _ = writeln!(out, "jmin={}", self.junk.min_size);
+            let _ = writeln!(out, "jmax={}", self.junk.max_size);
+        }
+
+        for (key, value, fallback) in [
+            ("s1", self.paddings.s1, default.paddings.s1),
+            ("s2", self.paddings.s2, default.paddings.s2),
+            ("s3", self.paddings.s3, default.paddings.s3),
+            ("s4", self.paddings.s4, default.paddings.s4),
+        ] {
+            if value != fallback {
+                let _ = writeln!(out, "{}={}", key, value);
+            }
+        }
+
+        // Header ranges are a set: emit all four if any one differs, so the
+        // parser rebuilds them through `HeaderConfig::new` and re-checks for
+        // overlap.
+        if self.headers != default.headers {
+            let _ = writeln!(out, "h1={}", self.headers.init);
+            let _ = writeln!(out, "h2={}", self.headers.response);
+            let _ = writeln!(out, "h3={}", self.headers.cookie);
+            let _ = writeln!(out, "h4={}", self.headers.transport);
+        }
+
+        for (key, chain) in [
+            ("i1", &self.init_packets.i1),
+            ("i2", &self.init_packets.i2),
+            ("i3", &self.init_packets.i3),
+            ("i4", &self.init_packets.i4),
+            ("i5", &self.init_packets.i5),
+        ] {
+            if let Some(chain) = chain {
+                let _ = writeln!(out, "{}={}", key, chain);
+            }
+        }
+
+        if let Some(key) = self.header_protection_key {
+            let _ = write!(out, "header_protection_key=");
+            for byte in key {
+                let _ = write!(out, "{:02x}", byte);
+            }
+            let _ = writeln!(out);
+        }
+
+        if let Some(range) = self.content_padding_addition {
+            let _ = writeln!(out, "content_padding_addition={}", range);
+        }
+
+        for (key, range) in [
+            ("rekey_after_time", self.timing_ranges.rekey_after_time),
+            ("rekey_timeout", self.timing_ranges.rekey_timeout),
+            ("reject_after_time", self.timing_ranges.reject_after_time),
+            ("keepalive_timeout", self.timing_ranges.keepalive_timeout),
+            (
+                "max_handshake_attempts",
+                self.timing_ranges.max_handshake_attempts,
+            ),
+            (
+                "persistent_keepalive_interval",
+                self.timing_ranges.persistent_keepalive,
+            ),
+        ] {
+            if !range.is_zero() {
+                let _ = writeln!(out, "{}={}", key, range);
+            }
+        }
+
+        if self.mtu != default.mtu {
+            let _ = writeln!(out, "mtu={}", self.mtu);
+        }
+
+        out
     }
 }
 
@@ -2173,6 +2317,76 @@ mod tests {
             U32Range { lo: 20, hi: 30 }
         );
         assert_eq!(config.mtu, 1400);
+    }
+
+    /// `to_uapi_block` is what `get=1` returns, so it has to feed straight back
+    /// into `parse` — that is the property `awg showconf` depends on.
+    #[test]
+    fn amnezia3_uapi_block_round_trips() {
+        let block = "jc=4\n\
+                     jmin=64\n\
+                     jmax=256\n\
+                     s1=16\n\
+                     s2=17\n\
+                     s3=18\n\
+                     s4=19\n\
+                     h1=100-199\n\
+                     h2=200-299\n\
+                     h3=300-399\n\
+                     h4=400-499\n\
+                     i1=<b 0xff><r 16>\n\
+                     i2=<t><rc 8><rd 4><dz 2>\n\
+                     header_protection_key=\
+                     4242424242424242424242424242424242424242424242424242424242424242\n\
+                     content_padding_addition=1-64\n\
+                     rekey_after_time=100-140\n\
+                     rekey_timeout=3-9\n\
+                     reject_after_time=170-200\n\
+                     keepalive_timeout=8-15\n\
+                     max_handshake_attempts=10-20\n\
+                     persistent_keepalive_interval=20-30\n\
+                     mtu=1400\n";
+
+        let config = Amnezia3Config::parse(block).expect("valid config block");
+        let emitted = config.to_uapi_block();
+
+        // Every key survives the round trip...
+        assert_eq!(
+            Amnezia3Config::parse(&emitted).expect("emitted block re-parses"),
+            config
+        );
+        // ...and the emitted text matches the input, since the input is already
+        // in canonical form. This catches silently dropped keys, which an
+        // equality-only check would miss if `parse` also ignored them.
+        assert_eq!(emitted, block);
+    }
+
+    /// A plain WireGuard device must not grow AmneziaWG lines in `get=1`.
+    #[test]
+    fn amnezia3_uapi_block_is_empty_for_wireguard_defaults() {
+        assert_eq!(Amnezia3Config::default().to_uapi_block(), "");
+        assert_eq!(Amnezia3Config::wireguard_compatible().to_uapi_block(), "");
+    }
+
+    /// A 2.0-only config must not acquire 3.0 keys on the way out.
+    #[test]
+    fn amnezia3_uapi_block_round_trips_a_two_zero_config() {
+        let config = Amnezia3Config::parse(
+            "jc=2\njmin=64\njmax=128\ns1=8\ns2=8\nh1=100\nh2=200\nh3=300\nh4=400\n",
+        )
+        .expect("valid 2.0 block");
+
+        let emitted = config.to_uapi_block();
+        assert!(!emitted.contains("header_protection_key"));
+        assert!(!emitted.contains("content_padding_addition"));
+        assert!(!emitted.contains("rekey_timeout"));
+        assert!(!emitted.contains("mtu="));
+        // Single-value ranges emit without a redundant `a-a` form.
+        assert!(emitted.contains("h1=100\n"), "emitted: {emitted}");
+        assert_eq!(
+            Amnezia3Config::parse(&emitted).expect("emitted block re-parses"),
+            config
+        );
     }
 
     #[test]
