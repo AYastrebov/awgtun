@@ -35,6 +35,7 @@ use std::sync::Arc;
 use std::thread;
 use std::thread::JoinHandle;
 
+use crate::amnezia::Amnezia3Config;
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::parse_handshake_anon;
 use crate::noise::rate_limiter::RateLimiter;
@@ -149,6 +150,11 @@ pub struct Device {
     next_index: IndexLfsr,
 
     config: DeviceConfig,
+
+    /// AmneziaWG parameters for this interface. Device-scoped, as in
+    /// amneziawg-go: every peer's `Tunn` is built from it, and inbound
+    /// datagrams are classified with it before the peer is known.
+    amnezia: Amnezia3Config,
 
     cleanup_paths: Vec<String>,
 
@@ -327,14 +333,23 @@ impl Device {
             .as_ref()
             .expect("Private key must be set first");
 
-        let tunn = Tunn::new(
+        let tunn = match Tunn::new_with_amnezia3(
             device_key_pair.0.clone(),
             pub_key,
             preshared_key,
             keepalive,
             next_index,
             None,
-        );
+            self.peer_amnezia_config(),
+        ) {
+            Ok(tunn) => tunn,
+            Err(e) => {
+                // The config was validated when it was set, so this is
+                // unreachable in practice; refuse the peer rather than panic.
+                tracing::error!(message = "Invalid AmneziaWG configuration", error = ?e);
+                return;
+            }
+        };
 
         let peer = Peer::new(tunn, next_index, endpoint, allowed_ips, preshared_key);
 
@@ -348,6 +363,18 @@ impl Device {
         }
 
         tracing::info!("Peer added");
+    }
+
+    /// The device's AmneziaWG config as a peer's `Tunn` should see it.
+    ///
+    /// `Amnezia3Config::mtu` exists only because `Tunn` has no concept of an
+    /// MTU; a device does, and it is authoritative, so the live interface MTU
+    /// always wins here. The `mtu` config key is still accepted for the
+    /// surfaces that have no interface (FFI, JNI).
+    fn peer_amnezia_config(&self) -> Amnezia3Config {
+        let mut amnezia = self.amnezia.clone();
+        amnezia.mtu = self.mtu.load(Ordering::Relaxed) as u32;
+        amnezia
     }
 
     pub fn new(name: &str, config: DeviceConfig) -> Result<Device, Error> {
@@ -377,6 +404,7 @@ impl Device {
             peers_by_ip: AllowedIps::new(),
             udp4: Default::default(),
             udp6: Default::default(),
+            amnezia: Amnezia3Config::default(),
             cleanup_paths: Default::default(),
             mtu: AtomicUsize::new(mtu),
             rate_limiter: None,
