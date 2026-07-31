@@ -38,14 +38,22 @@ AmneziaWG 3.0 adds three more layers on top, described in [AmneziaWG 3.0](#amnez
 | H2 | u32 range | Any non-overlapping | Handshake response header |
 | H3 | u32 range | Any non-overlapping | Cookie reply header |
 | H4 | u32 range | Any non-overlapping | Transport data header |
-| S1 | u8 | 0-64 | Init padding bytes |
-| S2 | u8 | 0-64 | Response padding bytes |
-| S3 | u8 | 0-64 | Cookie padding bytes |
-| S4 | u8 | 0-32 | Transport padding bytes |
-| Jc | u8 | 0-10 | Junk packet count (0 = disabled) |
-| Jmin | u16 | 64-1024 | Minimum junk size (inclusive) |
-| Jmax | u16 | 64-1024 | Maximum junk size (exclusive, as in amneziawg-go) |
+| S1 | u8 | 0-255 | Init padding bytes |
+| S2 | u8 | 0-255 | Response padding bytes |
+| S3 | u8 | 0-255 | Cookie padding bytes |
+| S4 | u8 | 0-255 | Transport padding bytes |
+| Jc | u8 | 0-255 | Junk packet count (0 = disabled) |
+| Jmin | u16 | 0-65535 | Minimum junk size (inclusive) |
+| Jmax | u16 | 0-65535 | Maximum junk size (exclusive, as in amneziawg-go) |
 | I1-I5 | CPS string | See below | Init packet chain specs |
+
+The ranges above are the field types, not protocol rules — upstream imposes no
+maximum on any of them, and treating its *recommended* values as limits is what
+once made real servers unreachable from here. See [Validation
+Rules](#validation-rules). The one real ceiling is that S1-S4 are `u8` here
+against upstream's `uint16`, so a padding value above 255 is rejected; widening
+it would break the `amnezia_config` C ABI and Amnezia's tooling stays far below
+that.
 
 ### CPS Chain Format
 
@@ -85,13 +93,19 @@ would underflow computing `Jmax - Jmin`.
 
 ## AmneziaWG 3.0
 
-Reference: amneziawg-go @ `d57d98d`. Configure with `Amnezia3Config` and `Tunn::new_with_amnezia3`.
+Reference: amneziawg-go @ `cf9d2dd`, amneziawg-tools @ `d09ecc3`, and the
+kernel module @ `c78a89e` (all 2026-07-31). Configure with `Amnezia3Config` and
+`Tunn::new_with_amnezia3`.
 
 ### Header protection
 
 Raw, unauthenticated ChaCha20 (32-byte key, 12-byte nonce, block counter 0) over the low-entropy header fields of every datagram. The nonce is the **first 12 bytes of the random padding prefix**, which is why enabling header protection requires S1-S4 to all be at least 12.
 
-Note that the AmneziaWG README says the minimum is 8; the code (`uapi.go`, `HeaderCipherNonceSize`) enforces 12. We follow the code.
+The AmneziaWG README used to say 8 while the code enforced 12; upstream settled
+on 12 in `ce7cf10`/`7860d60`, which is what this implements. The kernel module
+reaches the same rule from the other direction in `7304fbf`/`ff0aa32`: it now
+refuses a header protection key outright when any of S1-S4 is below 12, rather
+than accepting the config and producing unclassifiable packets.
 
 | Message | Encrypted span |
 |---------|----------------|
@@ -135,7 +149,21 @@ The WireGuard timing constants become inclusive ranges; an unset (all-zero) rang
 
 amneziawg-go gives up on a handshake after a **count** of attempts; boringtun bounds retries by time (`REKEY_ATTEMPT_TIME`). The two are expressed here as `rekey_timeout * max_handshake_attempts`, which for default ranges is exactly the classic 90 s.
 
-Go also uses `Lo(rekey_timeout)` as the minimum spacing between initiations (`rekeyMinTimeout`). boringtun has no equivalent — it suppresses duplicate initiations structurally, via `is_in_progress()`.
+Go also uses `Lo(rekey_timeout)` as the minimum spacing between initiations (`rekeyMinTimeout`), and the kernel module agrees since `51f3bb1` fixed an inverted ternary that had been reading the range only when it was *unset*. boringtun has no equivalent gate, and does not need one: it suppresses duplicate initiations structurally via `is_in_progress()`, and its retransmit interval is a fresh pick from `[Lo, Hi]`, which is never below the floor the other two enforce.
+
+#### Where the three implementations disagree
+
+Keypair expiry (`zeroKeyMaterial`, armed at `reject_after_time * 3`) is the one arm where the reference implementations do not agree, so it is worth stating which one this follows and why.
+
+| | Value used |
+|---|---|
+| amneziawg-go (`keychainExpireTime`) | `Hi(reject_after_time)` |
+| kernel module (`wg_timers_session_derived`) | `PickOne(reject_after_time)` |
+| this fork | `Hi`, following Go |
+
+`Hi` is the safe reading. Sessions expire at a value drawn from the range, so key material has to outlive the longest session that could still be in flight; a fresh pick can land below a live session's own draw and zero the keys while it is still in use. Go's choice is also the conservative one, so following it costs nothing.
+
+The kernel module has a second, clearer slip in the same area: `wg_expired_retransmit_handshake` arms `timer_zero_key_material` from `rekey_after_time` rather than `reject_after_time` (`timers.c`, still present at `c78a89e`). Both are upstream bugs to watch rather than behavior to copy — which is the reason to read all three implementations when auditing, not just the Go one.
 
 ## Packet Layout
 

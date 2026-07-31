@@ -158,8 +158,14 @@ rg -n "handleDeviceLine" -A 40 /tmp/awggo/device/uapi.go
 ```
 
 Companion repos for the 3.0 configuration surface, when the Go device is not
-enough: `amneziawg-tools` and `amneziawg-linux-kernel-module`, both on branch
-`feat/awg3`.
+enough: `amneziawg-tools` and `amneziawg-linux-kernel-module`. AWG 3.0 landed on
+`master` in both on 2026-07-30, so `feat/awg3` is no longer where to look; the
+live branch to watch now is `feature/awg4`.
+
+Read all three when auditing. They disagree, and the disagreements are where
+bugs live — see the reject-after-time note under AmneziaWG 3.0 in `AMNEZIA.md`
+for a case where the kernel module and the Go device pick different values for
+the same timer.
 
 ### Where things live
 
