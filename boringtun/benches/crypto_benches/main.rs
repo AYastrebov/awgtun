@@ -1,5 +1,6 @@
 use amnezia_benching::{
     bench_amnezia_decapsulate, bench_amnezia_encapsulate, bench_amnezia_handshake_init,
+    bench_amnezia_update_timers,
 };
 use blake2s_benching::{bench_blake2s_hash, bench_blake2s_hmac, bench_blake2s_keyed};
 use chacha20poly1305_benching::bench_chacha20poly1305;
@@ -22,6 +23,7 @@ criterion::criterion_group!(
     bench_x25519_public_key,
     bench_amnezia_encapsulate,
     bench_amnezia_decapsulate,
-    bench_amnezia_handshake_init
+    bench_amnezia_handshake_init,
+    bench_amnezia_update_timers
 );
 criterion::criterion_main!(crypto_benches);

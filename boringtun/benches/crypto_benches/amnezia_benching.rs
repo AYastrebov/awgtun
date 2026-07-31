@@ -1,5 +1,6 @@
 use boringtun::amnezia::{
-    Amnezia2Config, Amnezia3Config, HeaderConfig, HeaderRange, JunkConfig, PaddingConfig, U32Range,
+    Amnezia2Config, Amnezia3Config, HeaderConfig, HeaderRange, JunkConfig, PaddingConfig,
+    TimingRanges, U32Range,
 };
 use boringtun::noise::{Tunn, TunnResult};
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput};
@@ -175,6 +176,70 @@ pub fn bench_amnezia_handshake_init(c: &mut Criterion) {
                 len + queued
             })
         });
+    }
+    group.finish();
+}
+
+/// `update_timers` is the one AmneziaWG path whose cost scales with peer count
+/// rather than packet rate: the device calls it for every peer every 250 ms,
+/// and it almost always has nothing to do. On that steady-state path an
+/// established initiator draws four values from the AWG 3.0 timing ranges —
+/// the new-handshake timeout, the keepalive timeout, and two rekey deadlines —
+/// so this is where a syscall-per-draw RNG would be paid 4x per peer per tick.
+pub fn bench_amnezia_update_timers(c: &mut Criterion) {
+    let mut group = c.benchmark_group("amnezia_update_timers");
+
+    // Every timing range populated, so all four picks are live. Values are far
+    // enough out that nothing actually fires during a benchmark run and the
+    // measurement stays on the "nothing to do" path the device really sees.
+    let mut awg3_timed = configs()
+        .into_iter()
+        .find(|(name, _)| *name == "awg3")
+        .map(|(_, config)| config)
+        .unwrap();
+    awg3_timed.timing_ranges = TimingRanges {
+        rekey_after_time: U32Range::new(120, 180).unwrap(),
+        rekey_timeout: U32Range::new(5, 9).unwrap(),
+        reject_after_time: U32Range::new(180, 220).unwrap(),
+        keepalive_timeout: U32Range::new(10, 20).unwrap(),
+        max_handshake_attempts: U32Range::new(10, 20).unwrap(),
+        persistent_keepalive: U32Range::default(),
+    };
+
+    let cases = vec![
+        ("wireguard", Amnezia3Config::wireguard_compatible()),
+        ("awg3_timing_ranges", awg3_timed),
+    ];
+
+    for (name, config) in cases {
+        // Idle: no session yet. This is most peers most of the time.
+        let secret = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let peer =
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::random_from_rng(OsRng));
+        let mut idle =
+            Tunn::new_with_amnezia3(secret, peer, None, None, 1, None, config.clone()).unwrap();
+        let mut dst = vec![0u8; 2048];
+
+        group.bench_function(BenchmarkId::from_parameter(format!("{}_idle", name)), |b| {
+            b.iter(|| match idle.update_timers(&mut dst) {
+                TunnResult::Done => 0usize,
+                other => panic!("expected an idle tick, got {:?}", other),
+            })
+        });
+
+        // Established: the initiator arms two extra rekey deadlines, so this is
+        // the four-pick case.
+        let (mut sender, _receiver) = established_pair(&config);
+        group.bench_function(
+            BenchmarkId::from_parameter(format!("{}_established", name)),
+            |b| {
+                b.iter(|| match sender.update_timers(&mut dst) {
+                    TunnResult::Done => 0usize,
+                    TunnResult::WriteToNetwork(packet) => packet.len(),
+                    other => panic!("unexpected tick result {:?}", other),
+                })
+            },
+        );
     }
     group.finish();
 }
