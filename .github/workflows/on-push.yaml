@@ -8,6 +8,10 @@ on:
     branches: [ "master", "amnezia" ]
   pull_request:
     branches: [ "master", "amnezia" ]
+  # Lets a run be started from the Actions tab without an empty commit, which
+  # is what you want when a job failed for an environmental reason rather than
+  # a code one.
+  workflow_dispatch: {}
 
 env:
   CARGO_TERM_COLOR: always
