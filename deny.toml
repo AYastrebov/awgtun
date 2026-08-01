@@ -7,7 +7,14 @@
 [advisories]
 # Fail on any crate with a filed RUSTSEC advisory. Add exceptions here only with
 # a comment saying why the advisory does not apply to how we use the crate.
-ignore = []
+ignore = [
+    # RUSTSEC-2025-0069: `daemonize` is unmaintained, with an unmerged fix for
+    # some UB and no safe upgrade available. It is used by boringtun-cli only,
+    # to fork into the background, and never by the library, so nothing that
+    # links libboringtun is exposed to it. Worth replacing — the fork it
+    # performs is also what `FastRandom`'s pthread_atfork guard exists for.
+    "RUSTSEC-2025-0069",
+]
 
 [licenses]
 # BSD-3-Clause ourselves, and everything we pull in should be permissive enough
@@ -22,18 +29,11 @@ allow = [
     "ISC",
     "MIT",
     "MIT-0",
+    "0BSD",
     "Unicode-3.0",
     "Zlib",
 ]
 confidence-threshold = 0.9
-
-[[licenses.clarify]]
-# ring vendors code under a mix of licences with no SPDX expression in its
-# manifest; the OpenSSL-derived parts are ISC/MIT/OpenSSL. This is the standard
-# clarification used across the ecosystem.
-crate = "ring"
-expression = "MIT AND ISC AND OpenSSL"
-license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
 
 [bans]
 # Duplicate versions of a crate mean two copies compiled in. For a library this

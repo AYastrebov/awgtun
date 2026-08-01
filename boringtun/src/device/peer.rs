@@ -154,6 +154,10 @@ impl Peer {
         if let Some(fwmark) = fwmark {
             udp_conn.set_mark(fwmark)?;
         }
+        // `SO_MARK` is a Linux-family option. Elsewhere the argument is accepted
+        // and ignored, so callers need no `cfg` of their own.
+        #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
+        let _ = fwmark;
 
         tracing::info!(
             message="Connected endpoint",

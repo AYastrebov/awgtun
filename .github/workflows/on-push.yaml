@@ -124,7 +124,7 @@ jobs:
       # Pinned to `rust-version` in boringtun/Cargo.toml. The library is what
       # FFI, JNI and Rust consumers depend on, so it carries the MSRV; the CLI
       # follows whatever clap and its dependencies require, which is far newer.
-      - uses: dtolnay/rust-toolchain@1.71.0
+      - uses: dtolnay/rust-toolchain@1.78.0
       - uses: Swatinem/rust-cache@v2
       # `check`, not `test`: the dev-dependencies (criterion, and `time` beneath
       # it) require much newer toolchains, and an MSRV claim is about building
