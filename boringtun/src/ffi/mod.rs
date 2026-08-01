@@ -22,7 +22,7 @@ use tracing_subscriber::fmt;
 
 use crate::serialization::KeyBytes;
 use std::ffi::{CStr, CString};
-use std::io::{Error, ErrorKind, Write};
+use std::io::{Error, Write};
 use std::os::raw::c_char;
 use std::panic;
 use std::ptr;
@@ -180,10 +180,7 @@ impl Write for FFIFunctionPointerWriter {
             unsafe { (self.log_func)(c_string.as_ptr()) }
             Ok(buf.len())
         } else {
-            Err(Error::new(
-                ErrorKind::Other,
-                "Failed to create CString from buffer.",
-            ))
+            Err(Error::other("Failed to create CString from buffer."))
         }
     }
 
@@ -235,11 +232,7 @@ pub unsafe extern "C" fn set_logging_function(
             .try_init()
             .is_ok()
     });
-    if let Ok(value) = result {
-        value
-    } else {
-        false
-    }
+    result.unwrap_or_default()
 }
 
 /// Allocate a new tunnel, return NULL on failure.
