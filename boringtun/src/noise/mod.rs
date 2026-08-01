@@ -1644,8 +1644,10 @@ mod tests {
         let their_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
         let their_public_key = x25519_dalek::PublicKey::from(&their_secret_key);
 
-        let mut config = crate::amnezia::Amnezia3Config::default();
-        config.timing_ranges = ranges;
+        let config = crate::amnezia::Amnezia3Config {
+            timing_ranges: ranges,
+            ..Default::default()
+        };
 
         let my_tun = Tunn::new_with_amnezia3(
             my_secret_key,
