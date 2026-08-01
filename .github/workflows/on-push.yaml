@@ -1,10 +1,24 @@
 name: PR Status Checks
 
+# `amnezia` is the development branch for the AmneziaWG work and needs the same
+# gates as `master`. It was omitted here, so every commit on it shipped with no
+# CI at all.
 on:
   push:
-    branches: [ "master" ]
+    branches: [ "master", "amnezia" ]
   pull_request:
-    branches: [ "master" ]
+    branches: [ "master", "amnezia" ]
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail on any warning rather than letting them accumulate until nobody reads
+  # the log.
+  RUSTFLAGS: -D warnings
+  RUSTDOCFLAGS: -D warnings
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   # Depends on all actions that are required for a "successful" CI run.
@@ -15,6 +29,10 @@ jobs:
       - check_features
       - clippy
       - rustfmt
+      - docs
+      - benches
+      - msrv
+      - deny
       - tests
       - integration-tests
       - test-windows
@@ -25,15 +43,14 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
 
       - name: Check Windows
-        run: cargo check -p boringtun
+        run: cargo check --locked -p boringtun
 
       - name: Test Windows
-        run: cargo test -p boringtun
+        run: cargo test --locked -p boringtun
 
   check_features:
     strategy:
@@ -42,11 +59,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
-      - uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-hack
-      - run: cargo hack check --each-feature
+      - run: cargo hack check --locked --each-feature
 
   clippy:
     strategy:
@@ -55,45 +71,97 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
-      - uses: actions-rs/toolchain@v1
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-hack
-      - run: cargo hack clippy --each-feature
+      # A powerset rather than each-feature: `device` and `mock-instant`
+      # interact (the latter freezes the clock the former's timers depend on),
+      # and combinations like that are exactly what testing features one at a
+      # time cannot see. Depth 2 keeps the matrix bounded.
+      - run: cargo hack clippy --locked --feature-powerset --depth 2 --all-targets
 
   rustfmt:
-    strategy:
-      matrix:
-        os: [ ubuntu-latest, macos-latest ]
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: actions-rs/toolchain@v1
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
+          components: rustfmt
       - run: cargo fmt --all --check
+
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # RUSTDOCFLAGS above turns broken intra-doc links into errors. The docs
+      # here lean on `[`Type`]` links heavily, and a rename silently breaks them
+      # otherwise.
+      - run: cargo doc --locked --no-deps -p boringtun --features device
+
+  benches:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # `cargo test` does not build bench targets, so without this the criterion
+      # benchmarks can stop compiling and nothing notices. Compile only — timing
+      # numbers from a shared runner are noise.
+      - run: cargo bench --locked --no-run
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      # Pinned to `rust-version` in boringtun/Cargo.toml. The library is what
+      # FFI, JNI and Rust consumers depend on, so it carries the MSRV; the CLI
+      # follows whatever clap and its dependencies require, which is far newer.
+      - uses: dtolnay/rust-toolchain@1.71.0
+      - uses: Swatinem/rust-cache@v2
+      # `check`, not `test`: the dev-dependencies (criterion, and `time` beneath
+      # it) require much newer toolchains, and an MSRV claim is about building
+      # the library, not running its test suite.
+      - run: cargo check --locked -p boringtun --lib
+      - run: cargo check --locked -p boringtun --lib --features device
+
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
 
   tests:
     strategy:
       matrix:
         os: [ ubuntu-latest, macos-latest ]
+        toolchain: [ stable, beta ]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
-      - uses: actions-rs/toolchain@v1
+      - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: stable
+          toolchain: ${{ matrix.toolchain }}
+      - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-hack
-      - run: cargo hack test --each-feature
+      - run: cargo hack test --locked --each-feature
 
   integration-tests:
-    strategy:
-      matrix:
-        os: [ ubuntu-latest, macos-latest ]
-    runs-on: ${{ matrix.os }}
+    # Linux only: the integration_tests module is cfg'd off on macOS, so the
+    # job was a no-op there. These need root and a TUN device, and some spin up
+    # Docker containers.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-      - run: cargo test -- --ignored
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Deliberately not --all-features: that enables `mock-instant`, which
+      # freezes the clock so no timer fires, nothing is sent, and every device
+      # test fails looking exactly like a protocol bug. `device` arrives here
+      # through boringtun-cli's dependency.
+      - run: cargo test --locked -- --ignored

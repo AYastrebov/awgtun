@@ -12,6 +12,9 @@ readme = "../README.md"
 repository = "https://github.com/cloudflare/boringtun"
 documentation = "https://docs.rs/boringtun/0.7.1/boringtun/"
 edition = "2018"
+# The floor comes from the dependency tree (parking_lot/lock_api at 1.71), not
+# from this crate's own syntax. CI pins a job to it so the claim stays true.
+rust-version = "1.71"
 
 [features]
 default = []

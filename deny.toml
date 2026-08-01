@@ -1,0 +1,49 @@
+# cargo-deny configuration.
+#
+# This is a VPN with a C ABI and Android bindings, so the dependency tree is
+# part of the attack surface: a known-vulnerable crate here reaches every
+# consumer that links the library. `cargo deny check` runs in CI on every push.
+
+[advisories]
+# Fail on any crate with a filed RUSTSEC advisory. Add exceptions here only with
+# a comment saying why the advisory does not apply to how we use the crate.
+ignore = []
+
+[licenses]
+# BSD-3-Clause ourselves, and everything we pull in should be permissive enough
+# to redistribute in a binary. A copyleft dependency would be a licensing
+# problem for downstream FFI consumers, so it fails the build rather than
+# passing quietly.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[[licenses.clarify]]
+# ring vendors code under a mix of licences with no SPDX expression in its
+# manifest; the OpenSSL-derived parts are ISC/MIT/OpenSSL. This is the standard
+# clarification used across the ecosystem.
+crate = "ring"
+expression = "MIT AND ISC AND OpenSSL"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+[bans]
+# Duplicate versions of a crate mean two copies compiled in. For a library this
+# mostly costs size, but for crypto crates it can also mean two implementations
+# with different audit status, so surface them rather than ignore them.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+# Everything must come from crates.io. A git or path dependency sneaking into
+# the tree of a VPN is worth failing the build over.
+unknown-registry = "deny"
+unknown-git = "deny"

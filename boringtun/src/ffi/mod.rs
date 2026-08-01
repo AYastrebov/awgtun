@@ -12,7 +12,7 @@ use crate::amnezia::{
     JunkConfig, PaddingConfig, TimingRanges, U32Range, HEADER_PROTECTION_KEY_SIZE,
 };
 use crate::x25519::{PublicKey, StaticSecret};
-use base64::{decode, encode};
+use base64::Engine as _;
 use hex::encode as encode_hex;
 use libc::{raise, SIGSEGV};
 use parking_lot::Mutex;
@@ -122,7 +122,7 @@ pub extern "C" fn x25519_public_key(private_key: x25519_key) -> x25519_key {
 /// The memory has to be freed by calling `x25519_key_to_str_free`
 #[no_mangle]
 pub extern "C" fn x25519_key_to_base64(key: x25519_key) -> *const c_char {
-    let encoded_key = encode(key.key);
+    let encoded_key = base64::engine::general_purpose::STANDARD.encode(key.key);
     CString::into_raw(CString::new(encoded_key).unwrap())
 }
 
@@ -151,7 +151,7 @@ pub unsafe extern "C" fn check_base64_encoded_x25519_key(key: *const c_char) -> 
         Ok(string) => string,
     };
 
-    if let Ok(key) = decode(utf8_key) {
+    if let Ok(key) = base64::engine::general_purpose::STANDARD.decode(utf8_key) {
         let len = key.len();
         let mut zero = 0u8;
         for b in key {
@@ -844,8 +844,10 @@ mod tests {
         let secret = StaticSecret::random_from_rng(OsRng);
         let public = PublicKey::from(&secret);
         (
-            CString::new(encode(secret.to_bytes())).expect("no interior nul"),
-            CString::new(encode(public.as_bytes())).expect("no interior nul"),
+            CString::new(base64::engine::general_purpose::STANDARD.encode(secret.to_bytes()))
+                .expect("no interior nul"),
+            CString::new(base64::engine::general_purpose::STANDARD.encode(public.as_bytes()))
+                .expect("no interior nul"),
         )
     }
 

@@ -3,6 +3,8 @@ authors = ["Noah Kennedy <nkennedy@cloudflare.com>", "Andy Grover <agrover@cloud
 description = "an implementation of the WireGuard® protocol designed for portability and speed"
 documentation = "https://docs.rs/boringtun/0.7.1/boringtun/"
 edition = "2021"
+# Higher than the library's: clap and the `time` crate beneath it require it.
+rust-version = "1.88"
 license = "BSD-3-Clause"
 name = "boringtun-cli"
 readme = "../README.md"

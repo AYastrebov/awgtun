@@ -1,9 +1,12 @@
 // Copyright (c) 2019 Cloudflare, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
-//! Simple implementation of the client-side of the WireGuard protocol.
+//! An implementation of the WireGuard protocol, plus AmneziaWG 2.0 and 3.0
+//! obfuscation, with no network or tunnel stack of its own.
 //!
-//! <code>git clone https://github.com/cloudflare/boringtun.git</code>
+//! ```text
+//! git clone https://github.com/cloudflare/boringtun.git
+//! ```
 
 #[cfg(feature = "device")]
 pub mod device;
@@ -18,6 +21,9 @@ pub mod noise;
 #[cfg(not(feature = "mock-instant"))]
 pub(crate) mod sleepyinstant;
 
+// Only the `device` UAPI parser and the C FFI parse keys from strings; with
+// neither feature on, the whole module is dead code.
+#[cfg(any(feature = "device", feature = "ffi-bindings"))]
 pub(crate) mod serialization;
 
 /// Re-export of the x25519 types

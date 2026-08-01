@@ -926,7 +926,8 @@ fn reject_arg(tag: &str, arg: Option<&str>) -> Result<(), ConfigError> {
     Ok(())
 }
 
-/// Inverse of [`parse_cps_tag`].
+/// Inverse of the CPS tag parser: renders a tag back to the form
+/// `CpsChain::parse` accepts.
 impl fmt::Display for CpsTag {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
