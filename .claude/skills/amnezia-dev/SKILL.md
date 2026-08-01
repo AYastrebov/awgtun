@@ -148,6 +148,13 @@ device state live through atomics.
 
 ## Task: Audit against amneziawg-go
 
+**Start from the release of record.** `AMNEZIA.md` has an "Upstream release of
+record" table naming the exact commit of each of the three repos this fork was
+last audited against. `git log <commit>..HEAD` from there is the whole
+drift check — empty on all three means there is nothing to do, and you have
+answered "are we current?" in about a minute rather than re-reading the source.
+Update that table whenever you audit a newer release.
+
 **Clone the reference, don't fetch files one at a time.** You will want to grep
 it — for where a key is parsed, for every caller of a function, for what a
 default is — and that is impossible through a raw-file URL:
@@ -159,8 +166,9 @@ rg -n "handleDeviceLine" -A 40 /tmp/awggo/device/uapi.go
 
 Companion repos for the 3.0 configuration surface, when the Go device is not
 enough: `amneziawg-tools` and `amneziawg-linux-kernel-module`. AWG 3.0 landed on
-`master` in both on 2026-07-30, so `feat/awg3` is no longer where to look; the
-live branch to watch now is `feature/awg4`.
+`master` in both on 2026-07-30, so `feat/awg3` is no longer where to look, and
+`feature/awg4` is not either — it predates the 3.0 work and has not moved since
+2025. Everything current is on `master`.
 
 Read all three when auditing. They disagree, and the disagreements are where
 bugs live — see the reject-after-time note under AmneziaWG 3.0 in `AMNEZIA.md`

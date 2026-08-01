@@ -93,9 +93,27 @@ would underflow computing `Jmax - Jmin`.
 
 ## AmneziaWG 3.0
 
-Reference: amneziawg-go @ `cf9d2dd`, amneziawg-tools @ `d09ecc3`, and the
-kernel module @ `c78a89e` (all 2026-07-31). Configure with `Amnezia3Config` and
-`Tunn::new_with_amnezia3`.
+Configure with `Amnezia3Config` and `Tunn::new_with_amnezia3`.
+
+### Upstream release of record
+
+This implementation is aligned with, and was audited against, these three
+releases. All three are the current `master` and the newest tag of their repo.
+
+| Repo | Release | Commit | Date |
+|---|---|---|---|
+| [amneziawg-go](https://github.com/amnezia-vpn/amneziawg-go) | `v3.0.3` | `cf9d2dd` | 2026-07-31 |
+| [amneziawg-tools](https://github.com/amnezia-vpn/amneziawg-tools) | `v3.0.20260730` | `d09ecc3` | 2026-07-30 |
+| [amneziawg-linux-kernel-module](https://github.com/amnezia-vpn/amneziawg-linux-kernel-module) | `v3.0.20260731-04` | `c78a89e` | 2026-07-31 |
+
+To check for drift, clone each and `git log <commit>..HEAD` from the row above;
+an empty result on all three means there is nothing to do. Read all three when
+auditing rather than only the Go device — they disagree in places, and those
+disagreements are where the bugs are (see [Where the three implementations
+disagree](#where-the-three-implementations-disagree)).
+
+`feature/awg4` exists in all three repos but predates the 3.0 work (2025-10-15
+to 2025-11-04), so it is a stale experiment rather than the next release.
 
 ### Header protection
 
