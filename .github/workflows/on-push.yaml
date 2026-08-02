@@ -1,13 +1,13 @@
 name: PR Status Checks
 
-# `amnezia` is the development branch for the AmneziaWG work and needs the same
-# gates as `master`. It was omitted here, so every commit on it shipped with no
-# CI at all.
+# `master` is the only long-lived branch; the AmneziaWG work was merged into it
+# and `amnezia` deleted. Feature branches are covered by the pull_request
+# trigger, which fires regardless of the source branch's name.
 on:
   push:
-    branches: [ "master", "amnezia" ]
+    branches: [ "master" ]
   pull_request:
-    branches: [ "master", "amnezia" ]
+    branches: [ "master" ]
   # Lets a run be started from the Actions tab without an empty commit, which
   # is what you want when a job failed for an environmental reason rather than
   # a code one.
