@@ -183,6 +183,54 @@ Keypair expiry (`zeroKeyMaterial`, armed at `reject_after_time * 3`) is the one 
 
 The kernel module has a second, clearer slip in the same area: `wg_expired_retransmit_handshake` arms `timer_zero_key_material` from `rekey_after_time` rather than `reject_after_time` (`timers.c`, still present at `c78a89e`). Both are upstream bugs to watch rather than behavior to copy — which is the reason to read all three implementations when auditing, not just the Go one.
 
+### Randomness: which source, and why
+
+AmneziaWG draws a lot of random values per packet, and they are not all the same
+kind of secret. This implementation splits them, as amneziawg-go does.
+
+| Drawn per | Values | Source |
+|---|---|---|
+| Packet | `S1`-`S4` prefix bytes | `FastRandom` |
+| Packet | message type within its `H` range, content padding length | `FastRandom` |
+| Timer tick | every timing range pick | `FastRandom` |
+| Handshake | junk contents, CPS `<r>`/`<rc>`/`<rd>` bytes | `FastRandom` |
+| Once | Noise ephemeral keys, cookie and MAC keys | `OsRandom` |
+
+`OsRandom` is `getrandom`, which costs a syscall — around 160 ns here. That is
+the right price for a long-lived secret drawn once and far too high for a value
+drawn three times per packet. `FastRandom` is a buffered ChaCha20 keystream
+seeded from the OS and kept per thread, at roughly 5-9 ns per draw. Go's
+`crypto/rand` is the same design, which is why `rand.Read` costs 36 ns there
+rather than a syscall.
+
+Upstream draws the line further out still: `UintRange.PickOne` uses `fastrandn`,
+`runtime.fastrand`, which is not cryptographic at all. Using a real CSPRNG for
+those is the more conservative half of the same split.
+
+A CSPRNG is sufficient for the padding prefix even though its first 12 bytes are
+the header protection nonce. With either source the nonces are uniform over 96
+bits, so a collision is a birthday event near 2^48 packets; a CSPRNG's output is
+computationally indistinguishable from uniform, so the bound is the same up to a
+negligible term.
+
+What genuinely differs is state duplication. `fork` copies the buffer, so parent
+and child would emit identical bytes — for an `S1`-`S4` prefix that is keystream
+reuse under one key, and it is not hypothetical, since `boringtun-cli` forks to
+daemonize and any FFI or JNI embedder may fork for its own reasons. A
+`pthread_atfork` child handler bumps a generation counter, and every thread
+discards its buffer when the value moves. The check runs per draw rather than
+per refill, so bytes inherited but not yet consumed are dropped too.
+`fork_does_not_duplicate_the_keystream` covers it, and fails without the guard.
+
+### Constant-time comparison
+
+MAC verification and the decrypted static-key check compare against
+attacker-supplied bytes, where an early return leaks how much of the value the
+attacker guessed correctly. These use `subtle::ConstantTimeEq`. They previously
+used `ring::constant_time::verify_slices_are_equal`, which ring has deprecated
+with the note that it makes "no promises regarding side channels" — the promise
+being the only reason to call it.
+
 ## Packet Layout
 
 ### Send Order for Handshake Initiation
@@ -220,11 +268,17 @@ The implementation follows a layered approach that minimizes changes to boringtu
 ```
 ┌─────────────────────────────────────────────┐
 │              Tunn (noise/mod.rs)             │
-│  - Owns Amnezia2Config fields               │
+│  - Owns the Amnezia3Config fields           │
 │  - Generates dynamic headers from ranges    │
 │  - Prepends/strips padding                  │
 │  - Queues I-packets and junk                │
-│  - Calls determine_padding() on receive     │
+│  - Classifies inbound datagrams             │
+├─────────────────────────────────────────────┤
+│      PacketClassifier (noise/mod.rs)        │
+│  - Strips padding, decrypts the header      │
+│  - Borrows config, needs no Tunn, so the    │
+│    device can classify before it knows      │
+│    which peer a datagram belongs to         │
 ├─────────────────────────────────────────────┤
 │     Handshake / Session / RateLimiter       │
 │  - Accept msg_type: u32 parameter           │
@@ -233,7 +287,8 @@ The implementation follows a layered approach that minimizes changes to boringtu
 ├─────────────────────────────────────────────┤
 │            amnezia.rs module                │
 │  - Config types + validation                │
-│  - RandomSource trait + OsRandom            │
+│  - RandomSource: OsRandom and FastRandom    │
+│  - ChaCha20 header protection primitive     │
 │  - CPS parser and generator                 │
 │  - Junk packet generator                    │
 │  - HeaderRange::generate()                  │
@@ -248,22 +303,26 @@ The Noise handshake code (`handshake.rs`, `session.rs`) only gained a `msg_type:
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `amnezia.rs` | ~1155 | All AWG config types, validation, CPS parser/generator, junk generation, `RandomSource` trait |
+| `amnezia.rs` | ~2730 | Every AWG 2.0 and 3.0 config type, validation, the CPS parser and generator, junk generation, the ChaCha20 header protection primitive, `parse`/`to_uapi_block`, and the `RandomSource` implementations |
+| `jni.rs` | ~370 | Android bindings: `new_tunnel_amnezia3`, `wireguard_poll_outgoing_packet`, `tunnel_free` |
+| `benches/crypto_benches/amnezia_benching.rs` | ~245 | Criterion benchmarks for encapsulate, decapsulate, handshake initiation and `update_timers` |
 
 ### Modified Files
 
 | File | Change Summary |
 |------|---------------|
-| `noise/mod.rs` | `Tunn` struct gains AWG config fields + `network_outgoing` queue. `new_with_amnezia()` constructor. `parse_incoming_packet_config()` classifies by header ranges. `encapsulate()`/`decapsulate()` apply/strip padding. `format_handshake_initiation()` queues I-packets + junk. `determine_padding()` replicates Go's `DeterminePacketTypeAndPadding`. |
-| `noise/handshake.rs` | `format_handshake_initiation()`, `format_handshake_response()`, `receive_handshake_initialization()` accept `msg_type: u32` parameter. Dynamic header written before MAC. |
-| `noise/session.rs` | `format_packet_data()` accepts `msg_type: u32`. Dynamic transport header. |
-| `noise/rate_limiter.rs` | `verify_packet()` accepts `&HeaderConfig`. `format_cookie_reply()` accepts `msg_type: u32`. Dynamic cookie header generation. |
-| `noise/timers.rs` | `clear_all()` also clears `network_outgoing` queue. |
-| `device/mod.rs` | Device-scoped `Amnezia3Config`. Peers built with `new_with_amnezia3()`. Inbound datagrams stripped and header-decrypted before `verify_packet()`. Cookie replies padded and protected. Junk/I-packets drained at the four sites that can start a handshake. |
-| `device/api.rs` | AmneziaWG interface keys collected into a block for `Amnezia3Config::parse` on `set=1`; `to_uapi_block()` emitted on `get=1`. Per-peer `persistent_keepalive_interval` accepts an AWG 3.0 range. |
-| `device/peer.rs` | `drain_outgoing()` helper; keeps the configured keepalive range for `get=1`. |
-| `ffi/mod.rs` | `amnezia_config` C struct, `new_tunnel_amnezia()`, `wireguard_poll_outgoing_packet()`. |
-| `lib.rs` | `pub mod amnezia;` |
+| `noise/mod.rs` | `Tunn` gains the AWG config fields and the `network_outgoing` queue; `new_with_amnezia`/`new_with_amnezia3` constructors; `PacketClassifier` and `Classified` for peer-independent inbound classification; padding and header protection in `encapsulate`/`decapsulate`; content padding; `format_handshake_initiation` queues I-packets and junk; `constant_time_eq` |
+| `noise/handshake.rs` | `format_handshake_initiation`, `format_handshake_response` and `receive_handshake_initialization` take `msg_type: u32`, written before the MAC |
+| `noise/session.rs` | `format_packet_data` takes `msg_type` and `content_padding` |
+| `noise/rate_limiter.rs` | `verify_packet` takes `&HeaderConfig`; `format_cookie_reply` takes `msg_type`; dynamic cookie headers |
+| `noise/timers.rs` | `clear_all` clears `network_outgoing`; the AWG 3.0 `TimingRanges`, `roll_handshake_timings`, and the per-arm range rules in `update_timers` |
+| `device/mod.rs` | Device-scoped `Amnezia3Config`; classify-before-peer on receive; padded and protected cookie replies; junk and I-packets drained at the four sites that can start a handshake; `set_amnezia_config` rebuilds peers when the configuration changes |
+| `device/api.rs` | AmneziaWG keys merged incrementally over the current config on `set=1`, emitted by `to_uapi_block` on `get=1`; per-peer `persistent_keepalive_interval` accepts a range |
+| `device/peer.rs` | `drain_outgoing`, `set_tunnel`, and the configured keepalive range kept for `get=1` |
+| `device/integration_tests/mod.rs` | The `test_awg*` device tests: a two-device handshake, its plain-WireGuard negative control, UAPI round-trip, incremental update, and padding without custom headers |
+| `ffi/mod.rs` | `amnezia_config` and `amnezia3_config` structs, `new_tunnel_amnezia`, `new_tunnel_amnezia3`, `wireguard_poll_outgoing_packet` |
+| `wireguard_ffi.h` | C declarations for both AmneziaWG surfaces |
+| `lib.rs` | `pub mod amnezia;`, and `serialization` gated on the `device`/`ffi-bindings` features |
 
 ## Rust API
 
@@ -619,9 +678,19 @@ host must be resolved before it is pushed.
 
 ### Changing parameters on a live interface
 
-Not supported. `update_peer` refuses to modify an existing peer — a pre-existing
-boringtun limitation, unrelated to AmneziaWG — and the parameters are baked into
-each peer's `Tunn` at construction. Take the interface down and bring it back up.
+The AmneziaWG parameters can be changed on a running device: `set=1` merges the
+new keys over the current configuration, and `Device::set_amnezia_config`
+rebuilds every peer's `Tunn` from the result. Sessions reset and the peers
+re-handshake, which is not a loss — the parameters that changed *are* the wire
+format, so any session in flight was already unusable by the peer that prompted
+the change. `test_awg3_config_updates_are_incremental` covers it end to end.
+
+What is still unsupported is modifying an existing *peer*: `update_peer` panics
+rather than merging into a live one, which is a pre-existing boringtun
+limitation unrelated to AmneziaWG. Remove the peer and add it back.
+
+A bare `Tunn` has no equivalent — it captures its configuration at construction,
+so a library caller changing parameters must build a new one.
 
 ## Comparison with amneziawg-go
 
@@ -637,7 +706,7 @@ each peer's `Tunn` at construction. Take the interface down and bring it back up
 | I-packets/junk on retry | Every attempt | Every attempt | Exact |
 | Junk size distribution | `min + fastrandn(max - min)`, half-open | Half-open `[Jmin, Jmax)` | Exact |
 | Header byte order | Little-endian u32 | Little-endian u32 | Exact |
-| Packet classification | `DeterminePacketTypeAndPadding` | `determine_padding()` | Functionally equivalent |
+| Packet classification | `DeterminePacketTypeAndPadding` (a `Device` method) | `PacketClassifier::classify` (peer-independent, as upstream's is) | Equivalent; ours also returns the keystream it derived |
 | CPS tags | b, t, r, rc, rd, d, ds, dz | Same set | Exact |
 | Transport header for keepalive | Same as data (H4) | Same as data (H4) | Exact |
 | Header protection primitive | Raw ChaCha20, nonce = prefix[..12] | Same | Exact |
@@ -653,6 +722,31 @@ each peer's `Tunn` at construction. Take the interface down and bring it back up
 | Persistent keepalive re-arm | Every authenticated packet traversal | On fire only | **Differs** |
 | IP total-length lower bound | Rejects `< 20` (IPv4 header) | Only an upper bound is checked | **Differs** |
 | Minimum spacing between initiations | `Lo(rekey_timeout)` | Structural (`is_in_progress`) | Functionally equivalent |
+
+### Measured cost
+
+`benches/crypto_benches/amnezia_benching.rs` covers the four AmneziaWG paths.
+Numbers below are 1280-byte payloads on one machine, so treat the ratios rather
+than the absolutes as the message. Plain WireGuard is the control: it runs the
+same code with every parameter unset, so the gap between the rows is the price
+of the obfuscation.
+
+| | WireGuard | AWG 2.0 | AWG 3.0 |
+|---|---:|---:|---:|
+| `encapsulate` | 500 ns | 514 ns | 616 ns |
+| `decapsulate` | 635 ns | 635 ns | 732 ns |
+| handshake initiation | 38.7 µs | 38.8 µs | 39.0 µs |
+| handshake with `Jc=8` | — | — | 39.8 µs |
+
+`update_timers` is the one path whose cost scales with peer count rather than
+packet rate — the device calls it for every peer every 250 ms, and it usually
+has nothing to do. An idle peer draws two values from the timing ranges and an
+established initiator four, so it is 42 ns for a WireGuard peer and 60 ns for an
+AWG 3.0 one.
+
+Those AWG 3.0 figures are roughly half what they were before the randomness
+split above: `encapsulate` was 1077 ns, `decapsulate` 796 ns, and an established
+peer's timer tick 680 ns, almost all of it `getrandom` syscalls.
 
 ### Architectural Differences
 
@@ -689,6 +783,19 @@ The Go implementation strips padding by copying data in-place (`copy(packet, pac
 
 With header protection enabled the incoming datagram cannot be decrypted in place, since `decapsulate` takes `&[u8]`. Neither path allocates: handshake, response and cookie messages have a fixed size bounded by 148 bytes and decrypt into a stack buffer, while a transport packet's 16-byte header decrypts into a stack array and `PacketData` is assembled from it plus the untouched ciphertext slice.
 
+Classification and decryption share one cipher. Everything decrypted in a
+datagram uses that datagram's nonce, so `PacketClassifier::classify` derives 16
+keystream bytes once and returns them in [`Classified::header_mask`]. A
+transport header is exactly those 16 bytes, so the receive path XORs the mask in
+rather than building a second ChaCha20 over the same key and nonce to recompute
+bytes it already had. Handshake messages are protected past 16 bytes and still
+call `apply`; that runs once per handshake rather than once per packet, so the
+second setup does not matter there.
+
+`classified_header_mask_matches_a_second_apply` pins the two against each other.
+If they ever diverged, every AWG 3.0 data packet would decrypt to garbage while
+handshakes kept working, which is a miserable symptom to debug backwards.
+
 ### What amneziawg-go Has That We Don't
 
 - **Batched I/O**: amneziawg-go inherits wireguard-go's `IdealBatchSize = 128`
@@ -712,13 +819,13 @@ UAPI configuration is no longer on this list — see
 
 ## Known Limitations
 
-1. **Client-only**: This fork supports outbound AmneziaWG connections only. Server/inbound mode is not implemented.
+1. **No batched I/O**: amneziawg-go reads and writes up to 128 packets per syscall and uses GSO on Linux; this does one `recv_from` per datagram. At high packet rates that difference outweighs everything else on this page. (This entry used to read "client-only". That was wrong: `handle_handshake_init` answers an initiation with an H2 type, an S2 prefix and header protection, and `test_awg3_handshake_between_two_devices` has a working responder.)
 
 2. **Interop is verified manually, not automatically**: `boringtun-cli` has completed a handshake with a live AmneziaWG server and passed traffic over it (see [Verified interoperability](#verified-interoperability)), but that was a manual run. Automated coverage is still unit tests, a differential test against an independent reimplementation of the Go keystream, and integration tests between two boringtun devices — none of which would catch a misreading of the Go source shared by our implementation and our tests. A Docker-based test against amneziawg-go is not yet written, so interop can regress silently.
 
 3. **Buffer size responsibility**: With padding active, callers must allocate larger output buffers than standard WireGuard. The `encapsulate()` and `format_handshake_initiation()` docs specify the required sizes.
 
-4. **No runtime config changes**: AWG parameters are fixed at tunnel creation. Changing them requires creating a new tunnel.
+4. **Runtime config changes cost the sessions**: a `Device` accepts new AmneziaWG parameters over the UAPI socket, but implements them by rebuilding each peer's `Tunn`, so established sessions drop and re-handshake. amneziawg-go's peers read device state live and keep their sessions. A bare `Tunn` cannot be reconfigured at all and must be rebuilt by its caller.
 
 5. **Legacy fields rejected**: AmneziaWG 1.0/1.5 fields (`j1`, `j2`, `j3`, `itime`) are explicitly rejected.
 
