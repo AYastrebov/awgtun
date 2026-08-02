@@ -261,7 +261,7 @@ Skip it and the tunnel still comes up, which is what makes this so easy to get w
 
 ### JNI (Android)
 
-The `jni-bindings` feature exposes the same surface to `VpnService`. Parameters arrive as one UAPI-style block rather than a long argument list:
+The `jni-bindings` feature exposes the same surface to `VpnService`, through the class `io.github.ayastrebov.boringtun.BoringTunJNI` — the exports are bound to that literal name, so the Kotlin declaration has to match it. Parameters arrive as one UAPI-style block rather than a long argument list:
 
 ```kotlin
 val handle = BoringTunJNI.new_tunnel_amnezia3(

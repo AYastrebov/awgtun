@@ -449,7 +449,7 @@ size_t wireguard_poll_outgoing_packet(
 ## JNI API (Android)
 
 The `jni-bindings` feature exposes the tunnel to Android's `VpnService` through
-`com.cloudflare.app.boringtun.BoringTunJNI`. AmneziaWG is configured with a
+`io.github.ayastrebov.boringtun.BoringTunJNI`. AmneziaWG is configured with a
 single UAPI-style `key=value` block rather than a long scalar signature:
 
 ```kotlin
@@ -517,10 +517,16 @@ Skipping this does not break the tunnel — the handshake still completes — bu
 `BoringTunJNI.tunnel_free(handle)` releases the tunnel. The handle must not be
 used afterwards; passing 0 is a no-op.
 
-> **Note:** every JNI export is bound to the literal class name
-> `com.cloudflare.app.boringtun.BoringTunJNI` via `#[export_name]`. A consumer
-> shipping its own package must either keep that class name or patch the export
-> prefix in `boringtun/src/jni.rs`.
+> **Note:** every JNI export is bound to a literal class name via
+> `#[export_name]`, so the Kotlin class must be declared at exactly
+> `io.github.ayastrebov.boringtun.BoringTunJNI` or the runtime will not resolve
+> the natives. A consumer shipping its own package has to patch the export
+> prefix in `boringtun/src/jni.rs` and rebuild.
+>
+> This used to be `com.cloudflare.app.boringtun.BoringTunJNI`, inherited from
+> upstream. That names Cloudflare's own Android application package, which is
+> wrong for a fork they do not publish, so it was changed. Any consumer built
+> against the old prefix must update its class declaration.
 
 ## Device and UAPI (boringtun-cli)
 
