@@ -299,9 +299,12 @@ Read `references/rebase-guide.md` for the step-by-step procedure and per-file
 conflict strategies.
 
 ```bash
-git fetch origin master
-git log --oneline amnezia..origin/master
-git rebase origin/master
+# One-time: this fork has no upstream remote by default.
+git remote add upstream https://github.com/cloudflare/boringtun
+
+git fetch upstream master
+git log --oneline master..upstream/master   # anything new?
+git merge upstream/master                   # on master; expect conflicts
 ```
 
 ## Task: Extend the Implementation

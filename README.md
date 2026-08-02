@@ -276,7 +276,19 @@ That block uses the UAPI spelling (snake_case names, hex keys), not the CamelCas
 
 - [`AMNEZIA.md`](AMNEZIA.md) — wire format, packet layouts, the UAPI surface, and where this fork differs from the three upstream implementations
 - [AmneziaWG protocol documentation](https://docs.amnezia.org/documentation/amnezia-wg/)
-- [amneziawg-go](https://github.com/amnezia-vpn/amneziawg-go) — the reference implementation
+
+The AmneziaWG behaviour here was written against Amnezia's own implementations,
+which are the authority whenever this fork and they disagree:
+
+- [amneziawg-go](https://github.com/amnezia-vpn/amneziawg-go) — the reference
+  implementation, and the one this fork follows most closely
+- [amneziawg-tools](https://github.com/amnezia-vpn/amneziawg-tools) — `awg` and
+  `awg-quick`, which define the `.conf` and UAPI spellings
+- [amneziawg-linux-kernel-module](https://github.com/amnezia-vpn/amneziawg-linux-kernel-module)
+  — the in-kernel implementation
+
+[`AMNEZIA.md`](AMNEZIA.md#upstream-release-of-record) records the exact release
+of each that this was last audited against.
 
 ## Supported platforms
 
@@ -317,7 +329,15 @@ Java Native Interface bindings are defined in `src/jni.rs`.
 
 ## License
 
-The project is licensed under the [3-Clause BSD License](https://opensource.org/licenses/BSD-3-Clause).
+The project is licensed under the [3-Clause BSD License](https://opensource.org/licenses/BSD-3-Clause), inherited from boringtun, whose copyright notice is retained in [`LICENSE`](LICENSE).
+
+The AmneziaWG support is an independent reimplementation in Rust, written by
+reading [amneziawg-go](https://github.com/amnezia-vpn/amneziawg-go) (MIT) and
+comparing behaviour against it. No code was taken from
+[amneziawg-tools](https://github.com/amnezia-vpn/amneziawg-tools) or the
+[kernel module](https://github.com/amnezia-vpn/amneziawg-linux-kernel-module),
+both of which are GPL-2.0 and were consulted only to check what this
+implementation should do on the wire.
 
 ### Contribution
 
@@ -328,4 +348,9 @@ If you want to contribute to this project, please read our [`CONTRIBUTING.md`].
 [`CONTRIBUTING.md`]: https://github.com/cloudflare/.github/blob/master/CONTRIBUTING.md
 
 ---
-<sub><sub><sub><sub>WireGuard is a registered trademark of Jason A. Donenfeld. BoringTun is not sponsored or endorsed by Jason A. Donenfeld.</sub></sub></sub></sub>
+
+**This project is not affiliated with, endorsed by, or supported by Amnezia.**
+It is an independent implementation of the AmneziaWG protocol. Please do not
+report problems with it to the Amnezia projects; open an issue here instead.
+
+<sub><sub><sub><sub>WireGuard is a registered trademark of Jason A. Donenfeld. BoringTun is not sponsored or endorsed by Jason A. Donenfeld. AmneziaWG and Amnezia are projects of the Amnezia team; this fork is not affiliated with them.</sub></sub></sub></sub>

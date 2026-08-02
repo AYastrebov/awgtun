@@ -1,28 +1,41 @@
-# Rebase Guide: amnezia branch onto upstream master
+# Pulling upstream boringtun into this fork
+
+This fork carries the AmneziaWG work on `master` and has diverged far enough
+that upstream is a source to pull *from* rather than a base to sit on. There is
+no separate integration branch any more, and there was never an `upstream`
+remote — `origin` is the fork.
+
+Merge rather than rebase. `master` is published and other people may have it;
+rebasing it would rewrite history they already hold. Rebasing was the right call
+when the AmneziaWG work lived on a private branch, and is the wrong one now.
 
 ## Pre-flight
 
 ```bash
 git status                    # must be clean
-git branch --show-current     # must be on amnezia
-git fetch origin master
-git log --oneline amnezia..origin/master | head -20
+git branch --show-current     # must be on master
+
+# One-time, if not already configured.
+git remote add upstream https://github.com/cloudflare/boringtun
+
+git fetch upstream master
+git log --oneline master..upstream/master | head -20
 ```
 
-If no new commits, stop — nothing to rebase.
+If no new commits, stop — nothing to pull.
 
 ## Preview conflicts
 
 ```bash
-git diff --name-only $(git merge-base amnezia origin/master)..origin/master
+git diff --name-only $(git merge-base master upstream/master)..upstream/master
 ```
 
-Cross-reference with the table below. Anything outside it should rebase cleanly.
+Cross-reference with the table below. Anything outside it should merge cleanly.
 
-## Rebase
+## Merge
 
 ```bash
-git rebase origin/master
+git merge upstream/master
 ```
 
 ## Conflict resolution by file
@@ -54,7 +67,7 @@ re-apply our additions on top", not "pick a side".
 
 ```bash
 git add <file>
-git rebase --continue
+git merge --continue
 ```
 
 ## Verify
@@ -81,19 +94,20 @@ cargo build --lib -p boringtun --features jni-bindings
 All tests must pass — 97 unit tests and 5 AWG device tests as of this writing.
 If the count dropped, a test was lost in a conflict rather than fixed.
 
-A green suite still is not proof of interop. If the rebase touched
+A green suite still is not proof of interop. If the merge touched
 `noise/mod.rs`, `noise/session.rs` or the `device` receive path, run the live
-server check in `live-server-test.md` before considering the rebase done.
+server check in `live-server-test.md` before considering the merge done.
 
 ## Abort if needed
 
 ```bash
-git rebase --abort
+git merge --abort
 ```
 
 ## Notes
 
-- Never force-push without explicit user confirmation
+- Never force-push. `master` is published, which is also why this merges rather
+  than rebases.
 - If upstream renamed or restructured a file we modify, flag it rather than guessing
 - `.cargo/config.toml` sets `runner = 'sudo -E'`; run test binaries directly to
   avoid the sudo prompt on unit tests

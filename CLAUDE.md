@@ -52,8 +52,24 @@ name with the Skill tool.
 
 ## Branch Strategy
 
-- `master` — tracks upstream cloudflare/boringtun
-- `amnezia` — AmneziaWG 2.0/3.0 integration (primary development branch)
+`master` is the only branch that matters. It is the default branch and carries
+the AmneziaWG work; development happens directly on it.
+
+It used to be described as tracking upstream cloudflare/boringtun, with
+`amnezia` as a separate integration branch. That stopped being accurate: this
+fork has diverged far enough that AmneziaWG *is* the project, and `master` had
+no `upstream` remote configured to track anyway. The `amnezia` branch was
+fast-forwarded into `master` and is redundant.
+
+Pulling from upstream is now an explicit act rather than a branch's standing
+job — add the remote first:
+
+```bash
+git remote add upstream https://github.com/cloudflare/boringtun
+git fetch upstream master
+```
+
+See `.claude/skills/amnezia-dev/references/rebase-guide.md`.
 
 ## Building
 
