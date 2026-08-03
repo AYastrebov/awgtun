@@ -624,12 +624,23 @@ unknown key.
 
 ### Verified interoperability
 
-`boringtun-cli` has completed a handshake with a live AmneziaWG server and
-passed ICMP traffic over the tunnel, driven through the UAPI socket exactly as
-`awg setconf` would. The server's configuration had all four obfuscation layers
-plus header protection, content padding and randomized timings.
+This fork has completed handshakes and passed ICMP traffic against two
+independent AmneziaWG server implementations:
 
-A packet capture of that run confirmed, against the server's own parameters:
+| Server | Configuration | Client path |
+|---|---|---|
+| amneziawg-go | AmneziaWG 2.0 — `H1`–`H4`, `S1`–`S4`, junk, `I1`–`I5` | `boringtun-cli` over the UAPI socket, exactly as `awg setconf` drives it |
+| amneziawg kernel module | AmneziaWG 3.0 — the 2.0 layers plus header protection, content padding and randomized timings | `Tunn` driven directly over a UDP socket |
+
+The 3.0 run is what puts header protection and content padding on the wire
+against something other than ourselves. Header protection in particular gives a
+binary result: the type field is ChaCha20-encrypted under a shared 32-byte key
+with the nonce taken from the padding prefix, so a keystream or nonce derivation
+that disagreed with the reference by a single byte would make every datagram
+unclassifiable and nothing would handshake at all. Both sides handshook in
+roughly 25 ms.
+
+Packet captures of those runs confirmed, against each server's own parameters:
 
 - **Send order** — each configured `I1`–`I5` datagram first, one UDP datagram
   per chain and byte-exact against it, then `Jc` junk datagrams, then the
@@ -639,7 +650,9 @@ A packet capture of that run confirmed, against the server's own parameters:
 - **Padding arithmetic** — the initiation measured exactly `148 + S1` bytes and
   the response `92 + S2`, so `S1`/`S2` reached the wire outside the MAC.
 - **Content padding** — transport packets carrying a 56-byte ping landed inside
-  the `84 + 32 + S4 + [content_padding_addition]` window in both directions.
+  the `84 + 32 + S4 + [content_padding_addition]` window in both directions, and
+  the receiver trimmed the server's padding back to the original packet using
+  the IP total-length field.
 - **Round trip** — `get=1` reported every AmneziaWG key back, and ICMP flowed at
   0% loss with `rx_bytes`/`tx_bytes` advancing on both sides.
 
@@ -651,14 +664,31 @@ A packet capture of that run confirmed, against the server's own parameters:
 > key. `references/live-server-test.md` in the `amnezia-dev` skill describes how
 > to run this check against your own server.
 
-Two things this run established that no unit test had:
+What these runs established that no unit test had:
 
-- The server's `S2` is **65**, above the 64-byte maximum this implementation
-  used to enforce. That limit came from Amnezia's documentation rather than the
-  protocol — amneziawg-go applies no maximum to S1–S4 — and it made interop with
-  this server impossible. See the note on validation strictness below.
+- One server's `S2` sat above the 64-byte maximum this implementation used to
+  enforce. That limit came from Amnezia's documentation rather than the protocol
+  — amneziawg-go applies no maximum to S1–S4 — and it made interop with that
+  server impossible. See the note on validation strictness below.
 - The CPS generator and the junk size distribution match what a real server
   expects, not merely what our own tests assert.
+- Header protection, content padding and the 3.0 timing ranges are accepted by
+  an implementation that shares no code with this one, so they are not merely
+  self-consistent.
+
+Still unverified against a real peer: **session rekeying**. Both runs lasted
+under a second, well inside any `RekeyAfterTime` a server would set, so nothing
+has ever exercised a rekey with a non-boringtun peer.
+
+To reproduce this without a TUN device or root, drive a `Tunn` straight over a
+`UdpSocket`: parse the server's parameters into an `Amnezia3Config`, build the
+tunnel with `Tunn::new_with_amnezia3`, then per attempt call `encapsulate` with
+a hand-built ICMP echo, drain `poll_outgoing_packet()` and send the queue
+*before* the returned initiation, and feed replies to `decapsulate`. That covers
+the whole protocol path; only the `device` module and UAPI socket are skipped.
+Note the two spelling differences between a `.conf` and the UAPI — the 3.0 keys
+are CamelCase in a file and snake_case over the socket, and
+`HeaderProtectionKey` is base64 in a file but 64 hex characters over the socket.
 
 ### Validation is as permissive as the reference
 
@@ -827,7 +857,7 @@ UAPI configuration is no longer on this list — see
 
 1. **No batched I/O**: amneziawg-go reads and writes up to 128 packets per syscall and uses GSO on Linux; this does one `recv_from` per datagram. At high packet rates that difference outweighs everything else on this page. (This entry used to read "client-only". That was wrong: `handle_handshake_init` answers an initiation with an H2 type, an S2 prefix and header protection, and `test_awg3_handshake_between_two_devices` has a working responder.)
 
-2. **Interop is verified manually, not automatically**: `boringtun-cli` has completed a handshake with a live AmneziaWG server and passed traffic over it (see [Verified interoperability](#verified-interoperability)), but that was a manual run. Automated coverage is still unit tests, a differential test against an independent reimplementation of the Go keystream, and integration tests between two boringtun devices — none of which would catch a misreading of the Go source shared by our implementation and our tests. A Docker-based test against amneziawg-go is not yet written, so interop can regress silently.
+2. **Interop is verified manually, not automatically**: this fork has completed handshakes and passed traffic against both amneziawg-go and the amneziawg kernel module, the latter with the full 3.0 feature set (see [Verified interoperability](#verified-interoperability)) — but those were manual runs. Automated coverage is still unit tests, a differential test against an independent reimplementation of the Go keystream, and integration tests between two boringtun devices — none of which would catch a misreading of the Go source shared by our implementation and our tests. A Docker-based test against amneziawg-go is not yet written, so interop can regress silently.
 
 3. **Buffer size responsibility**: With padding active, callers must allocate larger output buffers than standard WireGuard. The `encapsulate()` and `format_handshake_initiation()` docs specify the required sizes.
 

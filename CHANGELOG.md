@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `device`: AmneziaWG support, making `boringtun-cli` a full AmneziaWG endpoint. Parameters are set with `set=1` and reported by `get=1`, so amneziawg-tools' `awg setconf`/`showconf` drive it directly.
 - `Amnezia3Config::to_uapi_block`, the inverse of `parse`, emitting only non-default fields
 - `PacketClassifier`, which strips the padding prefix and decrypts the protected header without a `Tunn`. A device has to classify a datagram before it knows which peer it belongs to, as amneziawg-go does on its own `Device`.
+- Verified interoperability with the AmneziaWG **kernel module** over a full 3.0 configuration — header protection, content padding and randomized timings — alongside the existing amneziawg-go result. See `AMNEZIA.md`.
 
 ### Removed
 - `AWG2_MAX_HANDSHAKE_PADDING`, `AWG2_MAX_TRANSPORT_PADDING`, `AWG2_MAX_JUNK_COUNT`, `AWG2_MIN_JUNK_SIZE`, `AWG2_MAX_JUNK_SIZE`, and the `ConfigError` variants `PaddingOutOfRange`, `JunkCountOutOfRange` and `JunkSizeOutOfRange`. The limits they expressed are not part of the protocol.
