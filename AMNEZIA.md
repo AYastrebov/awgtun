@@ -676,9 +676,53 @@ What these runs established that no unit test had:
   an implementation that shares no code with this one, so they are not merely
   self-consistent.
 
-Still unverified against a real peer: **session rekeying**. Both runs lasted
-under a second, well inside any `RekeyAfterTime` a server would set, so nothing
-has ever exercised a rekey with a non-boringtun peer.
+#### Rekeying and sustained traffic
+
+A later pair of runs against the kernel module held one session open for 51
+minutes and another for 12, rather than exiting once the first echo came back.
+Together they completed **30 rekeys** and pushed roughly 190,000 packets —
+about 144 MB in each direction — through the established session.
+
+- **Rekey timing.** Every undisturbed session was replaced inside the
+  configured `RekeyAfterTime` window, never before its `Lo` and never past its
+  `Hi`. This is the initiator-side `keyRefreshTimeoutSending` check at
+  `noise/timers.rs:333`, which re-picks from the range on every timer tick
+  rather than drawing once per session; over a run of that length the observed
+  intervals clustered near the low end of the window, which is what repeated
+  sampling against a rising session age predicts.
+- **Continuity.** Traffic crossed every rekey without a stall or a dropped
+  packet, including rekeys that fired in the middle of a bulk transfer. The
+  peer accepted our initiations and we accepted its responses with header
+  protection and content padding active on both the expiring and the new
+  session.
+- **Volume.** Content padding and header protection held up over sustained
+  load, not just the single ping the earlier runs sent. Nothing degraded as the
+  nonce counter advanced.
+
+Two observations from those runs are worth recording because they look like
+faults and are not:
+
+- **Sessions that end early after heavy traffic.** Some sessions were replaced
+  well short of the `RekeyAfterTime` window, always following a burst. That is
+  `noise/timers.rs:387` — having sent data and received no *authenticated*
+  packet for `Hi(keepalive) + pick(rekey_timeout)`, we initiate. Bursts lost a
+  small fraction of echo replies; when the losses happened to land on
+  consecutive keepalive-interval probes afterwards, that threshold tripped. It
+  is stock WireGuard behavior detecting a peer that has gone quiet, and it is
+  also what recovers the session: an earlier run stalled for ~90 s and resumed
+  exactly when this rule rebuilt the tunnel.
+- **Throughput figures from this harness are a floor, not a measurement.** A
+  userspace probe echoing through the tunnel topped out near 1,500 packets/s
+  each way. Doubling the in-flight window barely moved it, and packets 2.6×
+  apart in size gave nearly the same bit rate — so the ceiling is the probe's
+  single-threaded per-packet cost, not the tunnel or the link. The per-packet
+  crypto cost is ~1.2 µs, orders of magnitude below what that rate implies. A
+  real throughput number needs `iperf3` over an actual TUN interface.
+
+Still unverified: the loss those bursts showed (~1-2% under load) has not been
+attributed. It is equally consistent with the server, the container hosting it,
+or the path, and nothing points at this implementation — but it has not been
+run down.
 
 To reproduce this without a TUN device or root, drive a `Tunn` straight over a
 `UdpSocket`: parse the server's parameters into an `Amnezia3Config`, build the
