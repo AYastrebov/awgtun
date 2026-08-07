@@ -8,6 +8,7 @@ This document describes the AmneziaWG 2.0 and 3.0 protocol implementation in thi
 - [Configuration Parameters](#configuration-parameters)
 - [AmneziaWG 3.0](#amneziawg-30)
 - [Packet Layout](#packet-layout)
+- [Keepalives](#keepalives)
 - [Implementation Architecture](#implementation-architecture)
 - [File-by-File Changes](#file-by-file-changes)
 - [Rust API](#rust-api)
@@ -146,23 +147,8 @@ A random number of zero bytes, picked per packet from the configured range, appe
 
 The addition is clamped to the space left in the last MTU segment: `add = min(add, mtu - packet_size % mtu)`. `Tunn` has no MTU concept of its own, so the MTU used for clamping is an `Amnezia3Config` field (default 1420, matching the Go device default).
 
-Keepalives are padded too, which used to break them. Both this fork and
-amneziawg-go decided whether an outbound packet was a keepalive by comparing its
-wire size against the unpadded 32-byte one, so a keepalive carrying an S4 prefix
-or content padding registered as data and armed the new-handshake timer —
-meaning keepalives stopped keeping the session quiet and started provoking
-rekeys. Inbound was the mirror image: a content-padded keepalive decrypts to all
-zeros rather than to nothing, so an empty-payload test missed it and it counted
-as data received.
-
-Upstream fixed both in amneziawg-go `08d68cd` and kernel module `ce16310`, and
-this follows. Outbound, whether something is a keepalive is a property of the
-call rather than of the wire size — `src.is_empty()` here, an explicit
-`isKeepalive` flag there. Inbound, a first byte of zero marks a keepalive; no IP
-packet can begin with one, since the high nibble is the version.
-
-A payload that is neither a keepalive nor routable is still dropped and still
-counts as data received.
+Keepalives are content-padded too, which is one of the two ways a padded
+keepalive can stop looking like a keepalive. See [Keepalives](#keepalives).
 
 ### Randomized timings
 
@@ -274,6 +260,104 @@ Transport Keepalive:[Type(H4)][Receiver][Counter][Encrypted Empty]  (no S4 paddi
 **Padding** is prepended **after** MAC computation. It is NOT authenticated. The receiver knows the padding size from its configuration and strips it before processing.
 
 This two-phase approach is critical for interoperability. Getting the order wrong causes silent handshake failures.
+
+## Keepalives
+
+A keepalive is an authenticated transport packet with no payload. Its job is to
+tell the peer "still here" so an idle session is not torn down, and to keep a
+NAT mapping open. It has to be distinguishable from data, because the two feed
+different timers.
+
+Padding makes that distinguishing harder, and getting it wrong inverts what the
+mechanism does. This is worth its own section because both this fork and
+amneziawg-go got it wrong in the same way, and the failure is silent.
+
+### Why the classification matters
+
+`update_timers` decides to start a new handshake on this condition:
+
+```rust
+if data_packet_sent > aut_packet_received
+    && now - aut_packet_received >= Hi(keepalive_timeout) + pick(rekey_timeout)
+    && mem::replace(&mut self.timers.want_handshake, false)
+{
+    handshake_initiation_required = true;
+}
+```
+
+In words: if we have sent *data* more recently than we have received anything
+authenticated, and that has been true for a keepalive interval plus a rekey
+timeout, assume the session is broken and handshake again. That is correct — it
+is how a peer notices a dead path.
+
+`data_packet_sent` only advances for data. A keepalive must not touch it, or
+the condition reads "we have been talking and hearing nothing back" every time
+an idle link sends its scheduled keepalive. The peer is under no obligation to
+answer a keepalive, so `aut_packet_received` stays put, the deadline passes, and
+the session rekeys. Then it does it again. Keepalives stop keeping the session
+quiet and start driving it.
+
+### What went wrong
+
+Both sides of the classification used a test that padding invalidates.
+
+**Outbound.** Whether a packet was a keepalive was inferred from its wire size,
+compared against the unpadded 32 bytes (`MessageKeepaliveSize`). An `S4` prefix
+or a content-padding addition changes that size, so every keepalive on a padded
+configuration registered as data and armed the timer above.
+
+**Inbound.** A keepalive was recognised by an empty payload. With content
+padding the payload is not empty — it decrypts to zeros — so the check missed
+it and the peer's keepalives counted as data received.
+
+This fork inherited the outbound rule deliberately, with a comment citing
+amneziawg-go's `len(elem.packet) != MessageKeepaliveSize` and two tests pinning
+it in place. It was a faithful copy of a real bug.
+
+### The fix
+
+Upstream fixed both in amneziawg-go `08d68cd` and kernel module `ce16310`, both
+titled "keepalives are ignored", and this follows.
+
+**Outbound**, being a keepalive is a property of the call, not of the bytes. Only
+a caller with nothing to send passes an empty payload, so `src.is_empty()` in
+`encapsulate` is the fact itself rather than a proxy for it. Upstream reaches
+the same place with an explicit `isKeepalive` flag set in `SendKeepalive`.
+
+Nothing else can reach `encapsulate` with an empty payload by accident. The
+device reads from the TUN and calls `Tunn::dst_address` first, which rejects
+anything it cannot parse as IPv4 or IPv6, so a zero-length read never gets that
+far. A library or FFI caller passing an empty buffer is asking to send nothing,
+which is a keepalive by definition.
+
+**Inbound**, a first byte of zero marks a keepalive. That is safe because no IP
+packet can begin with a zero byte — the high nibble is the version, 4 or 6 — so
+the test cannot collide with real traffic. Upstream checks `elem.packet[0] == 0`
+and the kernel module `*p == 0` for the same reason.
+
+A payload that is neither a keepalive nor routable is still dropped and still
+counts as data received, and a test pins that so widening the keepalive test
+cannot quietly swallow it.
+
+### Which configurations were affected
+
+Anything with a non-zero `S4`, on AmneziaWG 2.0 or 3.0, or with
+`ContentPaddingAddition` set on 3.0. Plain WireGuard and an AmneziaWG
+configuration with `S4 = 0` and no content padding were never affected, because
+their keepalives are exactly 32 bytes and decrypt to nothing.
+
+### Measured
+
+Against a live AmneziaWG server with `PersistentKeepalive = 25`, left idle for
+70 seconds, reading the handshake's age from `get=1`:
+
+| | age before idle | age after |
+|---|---:|---:|
+| before the fix | 2 s | **7 s** — a new handshake replaced it mid-idle |
+| after the fix | 2 s | **72 s** — one handshake throughout |
+
+The 7 is the tell: the handshake being reported is younger than the idle period,
+so it is not the one the session started with.
 
 ## Implementation Architecture
 
