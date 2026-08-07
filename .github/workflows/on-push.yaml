@@ -123,12 +123,19 @@ jobs:
       - uses: actions/checkout@v6
       # Pinned to `rust-version` in boringtun/Cargo.toml. The library is what
       # FFI, JNI and Rust consumers depend on, so it carries the MSRV; the CLI
-      # follows whatever clap and its dependencies require, which is far newer.
-      - uses: dtolnay/rust-toolchain@1.78.0
+      # follows whatever clap and its dependencies require, which is newer.
+      - uses: dtolnay/rust-toolchain@1.85.0
       - uses: Swatinem/rust-cache@v2
       # `check`, not `test`: the dev-dependencies (criterion, and `time` beneath
       # it) require much newer toolchains, and an MSRV claim is about building
       # the library, not running its test suite.
+      #
+      # If this job starts failing after a `cargo update`, a transitive
+      # dependency raised its own `rust-version` past ours. Either pin that
+      # crate with `cargo update -p <crate> --precise <last good version>` or
+      # raise `rust-version` to match; prefer raising it unless a consumer
+      # actually needs the older toolchain, since pinning holds the whole graph
+      # back to keep a number that nothing depends on.
       - run: cargo check --locked -p boringtun --lib
       - run: cargo check --locked -p boringtun --lib --features device
 

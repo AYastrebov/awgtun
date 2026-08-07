@@ -12,10 +12,15 @@ readme = "../README.md"
 repository = "https://github.com/cloudflare/boringtun"
 documentation = "https://docs.rs/boringtun/0.7.1/boringtun/"
 edition = "2018"
-# The dependency manifests bottom out at 1.71 (parking_lot/lock_api), but
-# Cargo.lock is format v4, which needs Cargo 1.78 to parse at all. CI pins a job
-# here so the claim stays true.
-rust-version = "1.78"
+# Chosen, not discovered. This used to read 1.78 — the floor that fell out of
+# Cargo.lock being format v4 — but that was never a compatibility promise, and
+# holding it meant pinning transitive crates that had moved on (`zeroize` 1.9
+# raised its own floor from 1.60 to 1.85). 1.85 is the lowest version the
+# current dependency graph builds on, it is what the RustCrypto, `x25519-dalek`
+# 3.0 and `jni` 0.22 generations require, and `boringtun-cli` already demands
+# 1.88 — so no one building this repo end to end was served by the lower claim.
+# CI pins a job here so it stays true.
+rust-version = "1.85"
 
 [features]
 default = []
@@ -44,8 +49,18 @@ x25519-dalek = { version = "2.0.1", features = [
 ] }
 rand_core = { version = "0.6.4", features = ["getrandom"] }
 chacha20 = "0.9"
-chacha20poly1305 = "0.10.0-pre.1"
-aead = "0.5.0-pre.2"
+# Stable requirements, not the `0.10.0-pre.1`/`0.5.0-pre.2` these used to name.
+# A pre-release in a requirement opts that dependency into pre-release
+# resolution, so `cargo update` was free to pull an unreleased AEAD into the
+# packet path. Both already resolved to stable; this stops them drifting back.
+chacha20poly1305 = "0.10"
+aead = "0.5"
+# Pinned as a group: `hmac::SimpleHmac<Blake2s256>` computes the WireGuard KDF,
+# so `hmac` and `blake2` must agree on the `digest` major version. `hmac` 0.13
+# is on `digest` 0.11 and `blake2` has no stable 0.11 yet (0.11.0-rc.6 at the
+# time of writing), which holds this pair — and with it `aead` 0.6,
+# `chacha20poly1305` 0.11 and the rest of the RustCrypto wave that drops
+# `generic-array` for `hybrid-array` — at the `digest` 0.10 generation.
 blake2 = "0.10"
 hmac = "0.12"
 jni = { version = "0.19.0", optional = true }

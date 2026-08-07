@@ -22,6 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `HeaderConfig::validate_wireguard_compatible` and the `ConfigError` variants `StandardHeaderValue`, `InitPacketRequiresI1` and `InitPacketGap`. The rules they expressed are not part of the protocol either; `HeaderConfig::validate` now checks only for overlap, which is all amneziawg-go checks.
 
 ### Changed
+- Minimum supported Rust version raised from 1.78 to 1.85. 1.78 was never a compatibility promise — it was the floor implied by `Cargo.lock` being format v4 — and holding it meant pinning transitive crates that had already moved past it. `boringtun-cli` has required 1.88 throughout.
+- Dependencies refreshed to their latest semver-compatible releases. `chacha20poly1305` and `aead` no longer name pre-release versions (`0.10.0-pre.1`, `0.5.0-pre.2`) in their requirements, which had left `cargo update` free to pull an unreleased AEAD into the packet path.
 - Keepalives now carry the S4 padding prefix, matching amneziawg-go. This changes the wire size of keepalives for existing AmneziaWG 2.0 configurations with a non-zero S4.
 - Transport payloads that are neither IPv4 nor IPv6 are dropped silently and counted as data received instead of returning `InvalidPacket`
 
