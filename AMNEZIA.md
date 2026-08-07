@@ -102,9 +102,9 @@ releases. All three are the current `master` and the newest tag of their repo.
 
 | Repo | Release | Commit | Date |
 |---|---|---|---|
-| [amneziawg-go](https://github.com/amnezia-vpn/amneziawg-go) | `v3.0.3` | `cf9d2dd` | 2026-07-31 |
-| [amneziawg-tools](https://github.com/amnezia-vpn/amneziawg-tools) | `v3.0.20260730` | `d09ecc3` | 2026-07-30 |
-| [amneziawg-linux-kernel-module](https://github.com/amnezia-vpn/amneziawg-linux-kernel-module) | `v3.0.20260731-04` | `c78a89e` | 2026-07-31 |
+| [amneziawg-go](https://github.com/amnezia-vpn/amneziawg-go) | `v3.0.20260805` | `08d68cd` | 2026-08-05 |
+| [amneziawg-tools](https://github.com/amnezia-vpn/amneziawg-tools) | `v3.0.20260805` | `9f70177` | 2026-08-05 |
+| [amneziawg-linux-kernel-module](https://github.com/amnezia-vpn/amneziawg-linux-kernel-module) | `v3.0.20260805` | `ce16310` | 2026-08-04 |
 
 To check for drift, clone each and `git log <commit>..HEAD` from the row above;
 an empty result on all three means there is nothing to do. Read all three when
@@ -146,9 +146,23 @@ A random number of zero bytes, picked per packet from the configured range, appe
 
 The addition is clamped to the space left in the last MTU segment: `add = min(add, mtu - packet_size % mtu)`. `Tunn` has no MTU concept of its own, so the MTU used for clamping is an `Amnezia3Config` field (default 1420, matching the Go device default).
 
-Keepalives are padded too. Since amneziawg-go classifies an outbound packet as "data sent" by comparing its wire size against the unpadded 32-byte keepalive, a padded keepalive counts as data and arms the new-handshake timer. This fork replicates that, and it applies to a non-zero S4 as well as to content padding.
+Keepalives are padded too, which used to break them. Both this fork and
+amneziawg-go decided whether an outbound packet was a keepalive by comparing its
+wire size against the unpadded 32-byte one, so a keepalive carrying an S4 prefix
+or content padding registered as data and armed the new-handshake timer —
+meaning keepalives stopped keeping the session quiet and started provoking
+rekeys. Inbound was the mirror image: a content-padded keepalive decrypts to all
+zeros rather than to nothing, so an empty-payload test missed it and it counted
+as data received.
 
-A padded keepalive decrypts to all zeros, which is neither IPv4 nor IPv6. Such payloads are dropped silently and counted as data received, as in the Go sequential receiver.
+Upstream fixed both in amneziawg-go `08d68cd` and kernel module `ce16310`, and
+this follows. Outbound, whether something is a keepalive is a property of the
+call rather than of the wire size — `src.is_empty()` here, an explicit
+`isKeepalive` flag there. Inbound, a first byte of zero marks a keepalive; no IP
+packet can begin with one, since the high nibble is the version.
+
+A payload that is neither a keepalive nor routable is still dropped and still
+counts as data received.
 
 ### Randomized timings
 
@@ -782,7 +796,7 @@ so a library caller changing parameters must build a new one.
 | Padding after MAC | Always prepended | Always prepended | Exact |
 | Send order (I→Junk→Init) | Atomic `SendBuffers` | Separate queue + drain | Functionally equivalent |
 | S4 on keepalive | Applied (`elem.padding` set for every element) | Applied | Exact |
-| "Data sent" classification | `len(packet) != MessageKeepaliveSize` | `packet.len() != 32` | Exact |
+| "Data sent" classification | explicit `isKeepalive` flag, set in `SendKeepalive` | `src.is_empty()` in `encapsulate` | Exact |
 | I-packets/junk on retry | Every attempt | Every attempt | Exact |
 | Junk size distribution | `min + fastrandn(max - min)`, half-open | Half-open `[Jmin, Jmax)` | Exact |
 | Header byte order | Little-endian u32 | Little-endian u32 | Exact |
@@ -794,7 +808,8 @@ so a library caller changing parameters must build a new one.
 | MACs before encryption | Yes | Yes | Exact |
 | All-zero header key = off | Yes | Yes (`Option`/NULL/all-zero) | Exact |
 | Content padding inside AEAD | Yes, clamped to MTU segment | Same, plus a clamp to the caller's buffer | Exact when `dst` has room |
-| Non-IP payload on receive | Dropped, counted as data received | Same | Exact |
+| All-zero payload on receive | Keepalive: `elem.packet[0] == 0` | `packet[0] == 0` | Exact |
+| Other non-IP payload on receive | Dropped, counted as data received | Same | Exact |
 | Timing range pick rules | Per-arm (see table above) | Same | Exact |
 | Content padded to multiple of 16 | Yes, when CPA is unset | **No** (never has been) | **Differs** |
 | Handshake give-up bound | Attempt count | Time (`timeout * attempts`) | Equivalent for default ranges |

@@ -199,7 +199,8 @@ and `uapi.go`.
 - Padding prepended after MAC (`buf := make([]byte, padding+len(packet))`)
 - Header protection applied last, after MACs
 - S4 applied to keepalives (`NewOutboundElement` sets `elem.padding`)
-- "Data sent" judged by wire size (`len(elem.packet) != MessageKeepaliveSize`, 32)
+- Keepalives judged by an explicit flag, never by wire size — padding changes
+  the size, and inferring from it is the bug upstream fixed in `08d68cd`
 - I-packets + junk sent on every attempt, retries included
 - `DeterminePacketTypeAndPadding`: exact size for handshake types, `>=` for transport
 - Header byte order: little-endian u32

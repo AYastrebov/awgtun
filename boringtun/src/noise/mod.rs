@@ -134,8 +134,13 @@ const HANDSHAKE_RESP_SZ: usize = 92;
 pub(crate) const COOKIE_REPLY_SZ: usize = 64;
 const DATA_OVERHEAD_SZ: usize = 32;
 pub(crate) const TRANSPORT_HEADER_SZ: usize = 16; // type(4) + receiver(4) + counter(8)
-/// Wire size of an unpadded keepalive: transport header + AEAD tag.
-/// Matches amneziawg-go's `MessageKeepaliveSize`.
+/// Wire size of an unpadded keepalive: transport header + AEAD tag. Matches
+/// amneziawg-go's `MessageKeepaliveSize`.
+///
+/// No longer used to *decide* whether something is a keepalive — padding
+/// changes the wire size, which is the bug both upstreams fixed. Kept because
+/// it names a real protocol constant and the tests assert against it.
+#[allow(dead_code)]
 const KEEPALIVE_SZ: usize = DATA_OVERHEAD_SZ;
 
 /// Classifies an inbound AmneziaWG datagram: how many bytes of crypto padding
@@ -534,11 +539,17 @@ impl Tunn {
             // Send the packet using an established session
             let content_padding = self.content_padding_addition(src.len(), dst.len());
             let packet = self.format_transport_packet(session, src, content_padding, dst);
-            // amneziawg-go classifies an outbound packet as "data sent" by wire
-            // size (`len(elem.packet) != MessageKeepaliveSize`), so an S4 prefix
-            // makes even an empty packet count as data. Match that rule rather
-            // than testing the payload.
-            let is_keepalive = packet.len() == KEEPALIVE_SZ;
+            // Whether this is a keepalive is a property of the call, not of the
+            // wire size: only a caller with nothing to send passes an empty
+            // payload. amneziawg-go used to infer it from
+            // `len(elem.packet) != MessageKeepaliveSize` and this fork copied
+            // that, which broke as soon as S4 or content padding changed the
+            // wire size — a padded keepalive counted as data and armed the
+            // new-handshake timer, so keepalives stopped doing their job.
+            // Upstream replaced the size test with an explicit flag set in
+            // `SendKeepalive` (amneziawg-go 08d68cd, kernel module ce16310);
+            // `src.is_empty()` is that flag here.
+            let is_keepalive = src.is_empty();
             self.timer_tick(TimerName::TimeLastPacketSent);
             if !is_keepalive {
                 self.timer_tick(TimerName::TimeLastDataPacketSent);
@@ -966,10 +977,16 @@ impl Tunn {
                     IpAddr::from(addr_bytes),
                 )
             }
+            // A keepalive carrying content padding decrypts to all zeros
+            // rather than to nothing, so an empty-payload test alone misses it
+            // and the peer's keepalives register as data. Upstream checks the
+            // first byte for exactly this reason (`elem.packet[0] == 0` in
+            // amneziawg-go, `*p == 0` in the kernel module). No IP packet can
+            // start with a zero byte: the high nibble is the version.
+            _ if packet[0] == 0 => return TunnResult::Done,
             _ => {
-                // amneziawg-go drops payloads that are neither IPv4 nor IPv6 —
-                // content-padded keepalives decrypt to all zeros — but still
-                // counts them as data received.
+                // Neither a keepalive nor a routable packet. Dropped, but it
+                // was authenticated, so it still counts as data received.
                 self.timer_tick(TimerName::TimeLastDataPacketReceived);
                 return TunnResult::Done;
             }
@@ -2260,7 +2277,7 @@ mod tests {
     }
 
     #[test]
-    fn awg3_content_padded_keepalive_is_dropped_as_data() {
+    fn awg3_content_padded_keepalive_is_recognised_as_a_keepalive() {
         let (mut my_tun, mut their_tun) = create_two_tuns_awg3_cpa(8, 8);
         complete_awg3_handshake(&mut my_tun, &mut their_tun);
 
@@ -2273,23 +2290,58 @@ mod tests {
         // S4 (16) + header (16) + content (8 zeros) + tag (16)
         assert_eq!(wire_len, 16 + 16 + 8 + 16);
 
-        // amneziawg-go drops payloads that are neither IPv4 nor IPv6, but still
-        // counts them as data received.
+        // It decrypts to zeros rather than to nothing, so an empty-payload test
+        // alone misses it and the sender's keepalives read as data. Both
+        // upstreams check the first byte for this reason.
         let mut dec_buf = vec![0u8; 2048];
-        // Pin the reference time so the tick is observable under the frozen
-        // `mock-instant` clock too.
+        // Pin the reference time so "stayed at zero" is a real assertion under
+        // the frozen `mock-instant` clock too.
         let now = Duration::from_secs(42);
         their_tun.timers[TimerName::TimeCurrent] = now;
         their_tun.timers[TimerName::TimeLastDataPacketReceived] = Duration::ZERO;
         let result = their_tun.decapsulate(None, &enc_buf[..wire_len], &mut dec_buf);
         assert!(matches!(result, TunnResult::Done));
+        assert_eq!(
+            their_tun.timers[TimerName::TimeLastDataPacketReceived],
+            Duration::ZERO,
+            "a content-padded keepalive is a keepalive, not data"
+        );
+    }
+
+    /// A payload that is neither a keepalive nor routable is still dropped and
+    /// still counts as data, so widening the keepalive test did not swallow it.
+    #[test]
+    fn awg3_unroutable_payload_still_counts_as_data_received() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_awg3();
+        complete_awg3_handshake(&mut my_tun, &mut their_tun);
+
+        // First byte 0x35: high nibble 3, so neither IPv4 nor IPv6, and not the
+        // zero that marks a keepalive.
+        let mut enc_buf = vec![0u8; 2048];
+        let wire_len = match my_tun.encapsulate(&[0x35, 0x00, 0x00, 0x14], &mut enc_buf) {
+            TunnResult::WriteToNetwork(packet) => packet.len(),
+            other => panic!("expected WriteToNetwork, got {:?}", other),
+        };
+
+        let now = Duration::from_secs(42);
+        their_tun.timers[TimerName::TimeCurrent] = now;
+        their_tun.timers[TimerName::TimeLastDataPacketReceived] = Duration::ZERO;
+        let mut dec_buf = vec![0u8; 2048];
+        assert!(matches!(
+            their_tun.decapsulate(None, &enc_buf[..wire_len], &mut dec_buf),
+            TunnResult::Done
+        ));
         assert_eq!(their_tun.timers[TimerName::TimeLastDataPacketReceived], now);
     }
 
     #[test]
-    fn padded_keepalive_counts_as_data_sent() {
-        // With an S4 prefix the wire size differs from MessageKeepaliveSize, so
-        // amneziawg-go arms the data-sent timer even for an empty payload.
+    fn padded_keepalive_is_still_a_keepalive() {
+        // An S4 prefix and content padding change the wire size, and for a
+        // while both this fork and amneziawg-go inferred "is this a keepalive"
+        // from that size — so a padded keepalive armed the data-sent timer,
+        // which then triggers a new handshake as though traffic had gone
+        // unanswered. Upstream fixed it in 08d68cd (Go) and ce16310 (kernel
+        // module) by tracking the fact explicitly instead.
         let (mut my_tun, mut their_tun) = create_two_tuns_awg3();
         let init = create_handshake_init(&mut my_tun);
         let resp = create_handshake_response(&mut their_tun, &init);
@@ -2307,7 +2359,13 @@ mod tests {
             TunnResult::WriteToNetwork(_) => {}
             other => panic!("expected WriteToNetwork, got {:?}", other),
         }
-        assert_eq!(my_tun.timers[TimerName::TimeLastDataPacketSent], now);
+        assert_eq!(
+            my_tun.timers[TimerName::TimeLastDataPacketSent],
+            Duration::ZERO,
+            "a padded keepalive is a keepalive, not data"
+        );
+        // It is still an authenticated packet, so the generic timer moves.
+        assert_eq!(my_tun.timers[TimerName::TimeLastPacketSent], now);
     }
 
     #[test]
