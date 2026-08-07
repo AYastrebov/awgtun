@@ -1,9 +1,49 @@
 # AmneziaWG Implementation Details
 
-This document describes the AmneziaWG 2.0 and 3.0 protocol implementation in this boringtun fork, how it maps to the [amneziawg-go](https://github.com/amnezia-vpn/amneziawg-go) reference, and where the two implementations differ.
+How AmneziaWG 2.0 and 3.0 are implemented in this boringtun fork, how that maps
+to the [amneziawg-go](https://github.com/amnezia-vpn/amneziawg-go) reference, and
+where the two differ.
+
+**This is the implementation reference.** For what the parameters mean and how
+to configure them, read the [README](README.md) first — it covers each
+obfuscation layer, which values both peers must agree on, and a worked `.conf`.
+This document assumes that and goes underneath it.
+
+## Start here
+
+If you are about to change something, these are the three things most likely to
+bite, and all three fail *silently* — no error, no log, just a peer that stops
+answering or a session that misbehaves.
+
+| Invariant | Break it and | Where |
+|---|---|---|
+| Dynamic header goes in **before** the MAC; padding goes on **after** it; header protection is applied **last** | The peer's MAC check fails and it never replies. Nothing logs, on either side | `format_transport_packet`, `format_handshake_initiation` in `noise/mod.rs` |
+| A keepalive is a keepalive regardless of its wire size or padded contents | Idle sessions rekey instead of staying quiet — see [Keepalives](#keepalives) | `encapsulate`, `validate_decapsulated_packet` in `noise/mod.rs` |
+| Validation may be no stricter than amneziawg-go's | Real servers become unreachable with `errno=22`. This has happened twice | `Amnezia3Config::validate` in `amnezia.rs` |
+
+### Where things live
+
+Keyed by the question you are likely to be asking. Grep the symbol; the line
+numbers move, the names do not.
+
+| Question | Symbol | File |
+|---|---|---|
+| How is an outbound transport packet built? | `format_transport_packet` | `noise/mod.rs` |
+| Where does padding get added and stripped? | `format_transport_packet`, `PacketClassifier::classify` | `noise/mod.rs` |
+| How is an inbound datagram identified? | `PacketClassifier::classify` → `Classified` | `noise/mod.rs` |
+| Where does the device classify, before it knows the peer? | `register_udp_handler` | `device/mod.rs` |
+| Where are junk and I-packets queued, and drained? | `queue_pre_handshake_packets`, `Peer::drain_outgoing` | `noise/mod.rs`, `device/peer.rs` |
+| How is header protection applied? | `HeaderProtection::apply`, `keystream` | `amnezia.rs` |
+| Where do the randomized timings get picked? | `update_timers`, `roll_handshake_timings` | `noise/timers.rs` |
+| What validates a config, and how strictly? | `Amnezia3Config::validate` | `amnezia.rs` |
+| How is a UAPI block parsed and emitted? | `Amnezia3Config::parse`, `to_uapi_block` | `amnezia.rs` |
+| How do UAPI keys reach the device? | `apply_amnezia_block`, `Device::set_amnezia_config` | `device/api.rs`, `device/mod.rs` |
+| Which RNG is used where, and why? | `FastRandom`, `OsRandom` | `amnezia.rs` |
+| Where are the CPS tags parsed and generated? | `CpsChain::parse`, `generate_for_init` | `amnezia.rs` |
 
 ## Table of Contents
 
+- [Start here](#start-here) — invariants, and where things live
 - [Protocol Overview](#protocol-overview)
 - [Configuration Parameters](#configuration-parameters)
 - [AmneziaWG 3.0](#amneziawg-30)
@@ -60,6 +100,10 @@ that.
 
 Init packets use a tag-based format: `<tag [arg]><tag [arg]>...`
 
+All eight tags the parser accepts are below. The README lists only the five that
+do anything in an `I1`-`I5` chain; the other three exist because the tag language
+is shared with a data-carrying context, and in an init packet they emit nothing.
+
 | Tag | Description | Example |
 |-----|-------------|---------|
 | `<b 0xHEX>` | Fixed hex bytes | `<b 0xDEADBEEF>` |
@@ -71,7 +115,9 @@ Init packets use a tag-based format: `<tag [arg]><tag [arg]>...`
 | `<ds>` | Base64-encoded source data | `<ds>` |
 | `<dz N>` | N-byte big-endian data length | `<dz 2>` |
 
-For I1-I5 init packets, source data is always empty (`<d>`, `<ds>`, `<dz>` produce zero/empty output).
+`<d>`, `<ds>` and `<dz>` interpolate source data, and an init packet has none —
+so they parse successfully and contribute zero bytes. Putting one in an `I1`
+chain is not an error and not useful.
 
 ### Validation Rules
 
@@ -783,8 +829,8 @@ about 144 MB in each direction — through the established session.
 
 - **Rekey timing.** Every undisturbed session was replaced inside the
   configured `RekeyAfterTime` window, never before its `Lo` and never past its
-  `Hi`. This is the initiator-side `keyRefreshTimeoutSending` check at
-  `noise/timers.rs:333`, which re-picks from the range on every timer tick
+  `Hi`. This is the initiator-side `keyRefreshTimeoutSending` check in
+  `update_timers` (`noise/timers.rs`, the `rekey_after_time` arm), which re-picks from the range on every timer tick
   rather than drawing once per session; over a run of that length the observed
   intervals clustered near the low end of the window, which is what repeated
   sampling against a rising session age predicts.
@@ -801,8 +847,8 @@ Two observations from those runs are worth recording because they look like
 faults and are not:
 
 - **Sessions that end early after heavy traffic.** Some sessions were replaced
-  well short of the `RekeyAfterTime` window, always following a burst. That is
-  `noise/timers.rs:387` — having sent data and received no *authenticated*
+  well short of the `RekeyAfterTime` window, always following a burst. That is the `data_packet_sent > aut_packet_received` arm of `update_timers`
+  (`noise/timers.rs`) — having sent data and received no *authenticated*
   packet for `Hi(keepalive) + pick(rekey_timeout)`, we initiate. Bursts lost a
   small fraction of echo replies; when the losses happened to land on
   consecutive keepalive-interval probes afterwards, that threshold tripped. It
