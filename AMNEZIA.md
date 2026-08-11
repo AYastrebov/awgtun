@@ -47,6 +47,7 @@ numbers move, the names do not.
 - [Protocol Overview](#protocol-overview)
 - [Configuration Parameters](#configuration-parameters)
 - [AmneziaWG 3.0](#amneziawg-30)
+  - [AmneziaWG 3.1, and why none of it is implemented here](#amneziawg-31-and-why-none-of-it-is-implemented-here)
 - [Packet Layout](#packet-layout)
 - [Keepalives](#keepalives)
 - [Implementation Architecture](#implementation-architecture)
@@ -159,8 +160,59 @@ auditing rather than only the Go device — they disagree in places, and those
 disagreements are where the bugs are (see [Where the three implementations
 disagree](#where-the-three-implementations-disagree)).
 
+Check the branches too, not only `master`. The drift check above came back empty
+on 2026-08-12 while AmneziaWG 3.1 was being written on a branch in two of the
+three repos.
+
 `feature/awg4` exists in all three repos but predates the 3.0 work (2025-10-15
 to 2025-11-04), so it is a stale experiment rather than the next release.
+
+### AmneziaWG 3.1, and why none of it is implemented here
+
+Not implemented, deliberately. Audited 2026-08-12 at `feat/awg-3.1`
+— kernel module `ebcb20a` (2026-08-11), tools `c35a3fa` (2026-08-10).
+
+**amneziawg-go has none of it**: no 3.1 branch, no commits since `08d68cd` on
+any ref, and none of its ten branch tips mentions a 3.1 parameter. The ground rule of this
+fork is that the reference decides, and on 3.1 there is no cross-implementation
+agreement to conform to yet — only a kernel module and the CLI that configures
+it. The branch is also still moving: `SendCookie` was renamed to
+`DisableCookies` *and had its polarity inverted* one day before the tip. Writing
+that into a wire format now is how this fork acquired the invented rules it
+spent so long deleting.
+
+What 3.1 adds, so the next audit starts from here rather than rediscovering it:
+
+| Parameter | `.conf` / UAPI / CLI | Meaning |
+|---|---|---|
+| Random trailers | `RandomTrailers` / `random_trailers` / `random-trailers` | bool, device-scoped |
+| Disable cookies | `DisableCookies` / `disable_cookies` / `disable-cookies` | bool, device-scoped |
+
+- **Random trailers** append random bytes to a datagram, but by two different
+  mechanisms. Handshake, response and cookie messages get plain random bytes
+  *after* the message, outside header protection; the receiver relaxes its exact
+  size test to `>=` and trims with `pskb_trim`. Transport packets get no trailer
+  at all — they instead widen the *content padding inside the AEAD*, and only
+  when `ContentPaddingAddition` is unset, which takes precedence
+  (`46517a9`).
+- **The sliding UDP window** sizes both. It is a per-peer high-water mark of
+  observed datagram size (`DEFAULT_UDP_WINDOW = 1000`), raised on both send and
+  receive and reset to the default when the endpoint changes; a trailer is
+  `random(0, udp_window - len - padding)`. So a peer's packets grow to resemble
+  the largest size that peer has already been seen to use.
+- **Disable cookies** suppresses emitting cookie replies entirely. The rate
+  limiter still decides a cookie is *needed* — `packet_needs_cookie` went back to
+  an unconditional `true` — the device just refuses to answer.
+
+Two fixes ride along on that branch that are **not** 3.1 features, and this
+implementation already does both correctly:
+
+- Cookie replies are header-protected. amneziawg-go always did this
+  (`SendHandshakeCookie` in `device/send.go`); the kernel module did not, and
+  3.1 adds it. Ours does it in `decapsulate`, covered by
+  `awg3_cookie_reply_is_padded_and_header_protected`.
+- The header type is compared as little-endian (`le32_to_cpu`). Ours has always
+  used `u32::from_le_bytes`, so it was never wrong on a big-endian target.
 
 ### Header protection
 
