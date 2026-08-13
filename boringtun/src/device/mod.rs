@@ -889,7 +889,12 @@ impl Device {
                     // This packet was OK, that means we want to create a connected socket for this peer
                     let addr = addr.as_socket().unwrap();
                     let ip_addr = addr.ip();
-                    p.set_endpoint(addr);
+                    if p.set_endpoint(addr) {
+                        // AWG 3.1: the window is a property of the path, so a
+                        // new endpoint starts over rather than inheriting the
+                        // sizes learned from the old one.
+                        p.tunnel.reset_udp_window();
+                    }
                     if d.config.use_connected_socket {
                         if let Ok(sock) = p.connect_endpoint(d.listen_port, d.fwmark) {
                             d.register_conn_handler(Arc::clone(peer), sock, ip_addr)

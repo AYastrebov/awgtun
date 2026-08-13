@@ -161,6 +161,21 @@ All of these are sender-only; they govern this peer's own clock.
 | `MaxHandshakeAttempts` | 18 | retries before giving up |
 | `PersistentKeepalive` | off | per-peer; keepalive interval, re-drawn each time |
 
+### Random trailers and cookie suppression — AmneziaWG 3.1
+
+`RandomTrailers = on` puts a random number of bytes on the end of each datagram, so a message with a fixed size stops having one. Initiations, responses and cookie replies carry them outside the MAC, and the receiver trims them by the message's known size. Transport packets instead widen their content padding inside the AEAD, and only when `ContentPaddingAddition` is unset — that one wins if both are set.
+
+**Both ends must set it.** Unlike content padding, a receiver only tolerates a trailing byte when trailers are enabled; otherwise the exact-size test that recognises a handshake message rejects the datagram.
+
+Trailer length is bounded by a sliding window that tracks the largest datagram the tunnel has carried, so packets grow to resemble traffic the peer already sends rather than to a fixed size. The window resets when a peer's endpoint changes.
+
+`DisableCookies = on` stops this end from answering with cookie replies when it is under load. It does not change when a cookie is deemed necessary, only whether one is sent, so a flooding peer gets silence rather than a retry hint. Sender-only.
+
+| Parameter | Default | Both ends? |
+|---|---|---|
+| `RandomTrailers` | off | **yes** |
+| `DisableCookies` | off | no |
+
 ### A complete configuration
 
 ```ini
@@ -192,6 +207,10 @@ RekeyTimeout = 5
 RejectAfterTime = 185-201
 KeepaliveTimeout = 12-26
 MaxHandshakeAttempts = 18
+
+# 3.1. RandomTrailers must match; DisableCookies is local.
+RandomTrailers = on
+DisableCookies = off
 
 [Peer]
 PublicKey = <base64>

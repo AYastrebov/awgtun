@@ -240,6 +240,8 @@ fn is_amnezia_interface_key(key: &str) -> bool {
             | "reject_after_time"
             | "keepalive_timeout"
             | "max_handshake_attempts"
+            | "random_trailers"
+            | "disable_cookies"
     )
 }
 

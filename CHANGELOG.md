@@ -6,6 +6,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- AmneziaWG 3.1: `random_trailers` and `disable_cookies`, at parity with amneziawg-go `08271d0`. Random trailers append a random number of bytes to each initiation, response and cookie reply — outside the MAC, trimmed by the receiver using the message's fixed size — and widen transport content padding inside the AEAD when `content_padding_addition` is unset. Their length is bounded by a per-peer sliding UDP window that tracks the largest datagram the tunnel has carried and resets when the endpoint changes. `disable_cookies` withholds cookie replies without changing the rate limiter's decision. Both default to off, and both peers must agree on `random_trailers`: a receiver only tolerates a trailing byte when it is enabled. Configurable through `Amnezia3Config`, the UAPI socket, and the C FFI (`random_trailers`/`disable_cookies` appended to `amnezia3_config`, so existing field offsets are unchanged).
 - AmneziaWG 3.0: ChaCha20 header protection, content padding inside the AEAD envelope, and randomized WireGuard timings, at parity with amneziawg-go `d57d98d`
 - `Amnezia3Config` and `Tunn::new_with_amnezia3`; `Tunn::new` and `Tunn::new_with_amnezia` are unchanged and now delegate to it
 - C FFI: `amnezia3_config` and `new_tunnel_amnezia3`

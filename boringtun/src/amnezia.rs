@@ -1089,9 +1089,41 @@ impl InitPacketConfig {
 /// default device MTU).
 pub const AWG3_DEFAULT_MTU: u32 = 1420;
 
+/// AmneziaWG 3.1: starting size of the per-peer UDP window, which bounds how
+/// large a random trailer may be.
+///
+/// amneziawg-go uses 500 and the kernel module uses 1000. Go is the reference
+/// this fork follows, and the disagreement is a fingerprinting difference
+/// rather than an interop one: a trailer is random bytes the receiver trims by
+/// the message's fixed size, so neither end has to agree on how long it is.
+pub const AWG31_DEFAULT_UDP_WINDOW: u32 = 500;
+
 /// Minimum S1-S4 padding when header protection is enabled: the ChaCha20
 /// nonce is read from the first 12 bytes of the random padding prefix.
 pub const HEADER_PROTECTION_MIN_PADDING: u8 = 12;
+
+/// AmneziaWG 3.1 random trailer length for a datagram that is `packet_size`
+/// bytes before the trailer, given a UDP window.
+///
+/// Mirrors `randomTrailer` in amneziawg-go's `device/send.go`: zero once the
+/// packet already fills the window, otherwise `fastrandn(window - size)`.
+/// Upstream returns -1 for "feature off" and its callers clamp with
+/// `max(_, 0)`; here the caller decides whether the feature is on, so this
+/// only answers the sizing question.
+///
+/// `gen_range_u32` is inclusive and `fastrandn` is half-open, so the upper
+/// bound is one below the remaining space — the same correction the junk sizes
+/// needed.
+pub fn random_trailer_len(
+    packet_size: usize,
+    udp_window: u32,
+    rng: &mut dyn RandomSource,
+) -> usize {
+    match (udp_window as usize).checked_sub(packet_size) {
+        Some(space) if space > 0 => rng.gen_range_u32(0, space as u32 - 1) as usize,
+        _ => 0,
+    }
+}
 
 /// Inclusive `u32` range used by AWG 3.0 content padding and timing
 /// parameters. A fully-zero range means "unset" (fall back to the WireGuard
@@ -1346,6 +1378,24 @@ pub struct Amnezia3Config {
     pub content_padding_addition: Option<U32Range>,
     /// Randomized WireGuard timing parameters.
     pub timing_ranges: TimingRanges,
+    /// AmneziaWG 3.1: append a random number of bytes to every datagram.
+    ///
+    /// Handshake, response and cookie messages carry the trailer *outside* the
+    /// message and outside header protection; the receiver trims it by the
+    /// message's fixed size. Transport packets get no outer trailer — they
+    /// widen the content padding inside the AEAD instead, and only when
+    /// [`Self::content_padding_addition`] is unset, which takes precedence.
+    ///
+    /// Both ends must agree: a receiver only tolerates a trailing byte when
+    /// this is set, so enabling it on one side alone makes every oversized
+    /// datagram unclassifiable.
+    pub random_trailers: bool,
+    /// AmneziaWG 3.1: never emit a cookie reply.
+    ///
+    /// The rate limiter still decides a cookie is warranted; this only
+    /// suppresses the reply, so a peer under load gets silence instead of a
+    /// retry hint.
+    pub disable_cookies: bool,
     /// Outer MTU used to clamp content padding (amneziawg-go uses the device
     /// MTU; boringtun's `Tunn` has no MTU concept, so it is configured here).
     pub mtu: u32,
@@ -1366,6 +1416,8 @@ impl Amnezia3Config {
             header_protection_key: None,
             content_padding_addition: None,
             timing_ranges: TimingRanges::default(),
+            random_trailers: false,
+            disable_cookies: false,
             mtu: AWG3_DEFAULT_MTU,
         }
     }
@@ -1513,6 +1565,8 @@ impl Amnezia3Config {
                 "persistent_keepalive_interval" => {
                     config.timing_ranges.persistent_keepalive = U32Range::parse(value)?
                 }
+                "random_trailers" => config.random_trailers = parse_field_bool(&key, value)?,
+                "disable_cookies" => config.disable_cookies = parse_field_bool(&key, value)?,
                 // Not an upstream UAPI key: amneziawg-go clamps content padding
                 // against the device MTU, which `Tunn` has no concept of.
                 "mtu" => config.mtu = parse_field_u32(&key, value)?,
@@ -1622,11 +1676,51 @@ impl Amnezia3Config {
             }
         }
 
+        // amneziawg-go emits these unconditionally, but `to_uapi_block` is also
+        // what `device::api` replays to merge an incremental `set=1`, so a
+        // default-valued key here would be indistinguishable from one the
+        // caller set. Emitting only non-defaults keeps both uses correct and
+        // matches how every other key in this block behaves.
+        for (key, value, fallback) in [
+            (
+                "random_trailers",
+                self.random_trailers,
+                default.random_trailers,
+            ),
+            (
+                "disable_cookies",
+                self.disable_cookies,
+                default.disable_cookies,
+            ),
+        ] {
+            if value != fallback {
+                let _ = writeln!(out, "{}={}", key, u8::from(value));
+            }
+        }
+
         if self.mtu != default.mtu {
             let _ = writeln!(out, "mtu={}", self.mtu);
         }
 
         out
+    }
+}
+
+/// Parse a UAPI boolean.
+///
+/// amneziawg-go uses Go's `strconv.ParseBool`, which takes `1`, `t`, `T`,
+/// `TRUE`, `true`, `True` and the matching false spellings. amneziawg-tools
+/// writes `0`/`1` and accepts `on`/`off` on its command line, so both sets are
+/// taken here — rejecting a spelling one of the three implementations emits is
+/// the failure mode this fork keeps having to undo.
+fn parse_field_bool(field: &str, value: &str) -> Result<bool, ConfigError> {
+    match value {
+        "1" | "t" | "T" | "true" | "TRUE" | "True" | "on" | "ON" | "On" => Ok(true),
+        "0" | "f" | "F" | "false" | "FALSE" | "False" | "off" | "OFF" | "Off" => Ok(false),
+        _ => Err(ConfigError::InvalidFieldValue {
+            field: field.to_owned(),
+            reason: "expected a boolean (0/1, true/false, on/off)",
+        }),
     }
 }
 
@@ -1689,6 +1783,8 @@ impl Default for Amnezia3Config {
             header_protection_key: None,
             content_padding_addition: None,
             timing_ranges: TimingRanges::default(),
+            random_trailers: false,
+            disable_cookies: false,
             mtu: AWG3_DEFAULT_MTU,
         }
     }
@@ -2373,6 +2469,8 @@ mod tests {
             header_protection_key: Some([0x42; HEADER_PROTECTION_KEY_SIZE]),
             content_padding_addition: Some(U32Range::single(16)),
             timing_ranges: TimingRanges::default(),
+            random_trailers: false,
+            disable_cookies: false,
             mtu: AWG3_DEFAULT_MTU,
         }
     }
@@ -2497,6 +2595,8 @@ mod tests {
                      keepalive_timeout=8-15\n\
                      max_handshake_attempts=10-20\n\
                      persistent_keepalive_interval=20-30\n\
+                     random_trailers=1\n\
+                     disable_cookies=1\n\
                      mtu=1400\n";
 
         let config = Amnezia3Config::parse(block).expect("valid config block");
@@ -2511,6 +2611,57 @@ mod tests {
         // in canonical form. This catches silently dropped keys, which an
         // equality-only check would miss if `parse` also ignored them.
         assert_eq!(emitted, block);
+    }
+
+    /// The three implementations spell booleans differently — amneziawg-go uses
+    /// Go's `strconv.ParseBool`, amneziawg-tools writes `0`/`1` over the socket
+    /// and takes `on`/`off` on its command line. Rejecting a spelling one of
+    /// them emits is exactly the class of invented strictness this fork keeps
+    /// having to undo.
+    #[test]
+    fn amnezia31_accepts_every_upstream_boolean_spelling() {
+        for spelling in ["1", "t", "T", "true", "TRUE", "True", "on", "ON", "On"] {
+            let block = format!("random_trailers={}\n", spelling);
+            let config = Amnezia3Config::parse(&block)
+                .unwrap_or_else(|e| panic!("{:?} should parse, got {:?}", spelling, e));
+            assert!(config.random_trailers, "{:?} should be true", spelling);
+        }
+        for spelling in [
+            "0", "f", "F", "false", "FALSE", "False", "off", "OFF", "Off",
+        ] {
+            let block = format!("disable_cookies={}\n", spelling);
+            let config = Amnezia3Config::parse(&block)
+                .unwrap_or_else(|e| panic!("{:?} should parse, got {:?}", spelling, e));
+            assert!(!config.disable_cookies, "{:?} should be false", spelling);
+        }
+        assert!(Amnezia3Config::parse("random_trailers=yes\n").is_err());
+    }
+
+    /// Both default to off, so a 3.0 configuration keeps its exact wire
+    /// behaviour and `to_uapi_block` stays byte-identical to what it emitted
+    /// before 3.1 existed.
+    #[test]
+    fn amnezia31_features_default_off_and_are_omitted_when_unset() {
+        let config = Amnezia3Config::default();
+        assert!(!config.random_trailers);
+        assert!(!config.disable_cookies);
+        let emitted = config.to_uapi_block();
+        assert!(!emitted.contains("random_trailers"), "{}", emitted);
+        assert!(!emitted.contains("disable_cookies"), "{}", emitted);
+    }
+
+    #[test]
+    fn amnezia31_random_trailer_len_respects_the_window() {
+        let mut rng = DetRng::new(3);
+        // Packet already fills or exceeds the window: no room, no trailer.
+        assert_eq!(random_trailer_len(500, 500, &mut rng), 0);
+        assert_eq!(random_trailer_len(600, 500, &mut rng), 0);
+        // Otherwise strictly below the remaining space, matching Go's
+        // half-open `fastrandn(window - size)`.
+        for _ in 0..64 {
+            let len = random_trailer_len(400, 500, &mut rng);
+            assert!(len < 100, "trailer {} exceeded the remaining window", len);
+        }
     }
 
     /// A configuration in the shape a real Amnezia server issues: every AWG 3.0

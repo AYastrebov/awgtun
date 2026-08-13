@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-This is a fork of [cloudflare/boringtun](https://github.com/cloudflare/boringtun) with **AmneziaWG 2.0 and 3.0** protocol support. The fork adds packet obfuscation capabilities while preserving full standard WireGuard compatibility when AmneziaWG features are disabled.
+This is a fork of [cloudflare/boringtun](https://github.com/cloudflare/boringtun) with **AmneziaWG 2.0, 3.0 and 3.1** protocol support. The fork adds packet obfuscation capabilities while preserving full standard WireGuard compatibility when AmneziaWG features are disabled.
 
 ## Repository Structure
 

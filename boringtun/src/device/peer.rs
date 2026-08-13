@@ -111,7 +111,13 @@ impl Peer {
         }
     }
 
-    pub fn set_endpoint(&self, addr: SocketAddr) {
+    /// Point this peer at `addr`, returning whether that was a change.
+    ///
+    /// The caller uses the return value to reset the AWG 3.1 UDP window, which
+    /// lives on the tunnel: a window learned from one path should not size the
+    /// trailers sent down the next one. That cannot happen here because the
+    /// tunnel is behind the peer's own lock and this takes `&self`.
+    pub fn set_endpoint(&self, addr: SocketAddr) -> bool {
         let mut endpoint = self.endpoint.write();
         if endpoint.addr != Some(addr) {
             // We only need to update the endpoint if it differs from the current one
@@ -120,7 +126,9 @@ impl Peer {
             }
 
             endpoint.addr = Some(addr);
+            return true;
         }
+        false
     }
 
     pub fn connect_endpoint(

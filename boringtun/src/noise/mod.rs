@@ -90,6 +90,20 @@ pub struct Tunn {
     content_padding: Option<U32Range>,
     /// Outer MTU used to clamp content padding
     mtu: u32,
+    /// AWG 3.1: append a random trailer to every datagram this tunnel sends,
+    /// and tolerate one on every datagram it receives.
+    random_trailers: bool,
+    /// AWG 3.1: never answer with a cookie reply.
+    disable_cookies: bool,
+    /// AWG 3.1 sliding UDP window: a high-water mark of the datagram sizes seen
+    /// on this tunnel, which bounds how large a random trailer may be. Raised
+    /// by both sending and receiving, so a peer's datagrams grow to resemble
+    /// the largest this one has already carried.
+    ///
+    /// Upstream keeps this per-peer and resets it to the default when the
+    /// endpoint changes; `Tunn` is already per-peer, and the endpoint lives in
+    /// the `Device` layer above it, so the reset happens there.
+    udp_window: u32,
     /// Queue for pre-handshake datagrams (I-packets, junk) that need to be
     /// sent before the actual handshake initiation.
     network_outgoing: VecDeque<Vec<u8>>,
@@ -160,6 +174,8 @@ pub struct PacketClassifier<'a> {
     paddings: &'a PaddingConfig,
     headers: &'a HeaderConfig,
     header_protection: Option<HeaderProtection>,
+    /// AWG 3.1: accept trailing bytes past a handshake message's fixed size.
+    random_trailers: bool,
 }
 
 impl<'a> PacketClassifier<'a> {
@@ -172,7 +188,14 @@ impl<'a> PacketClassifier<'a> {
             paddings,
             headers,
             header_protection,
+            random_trailers: false,
         }
+    }
+
+    /// Accept AWG 3.1 random trailers on the handshake message types.
+    pub fn with_random_trailers(mut self, random_trailers: bool) -> Self {
+        self.random_trailers = random_trailers;
+        self
     }
 
     /// Build a classifier borrowing from an [`Amnezia3Config`].
@@ -182,6 +205,7 @@ impl<'a> PacketClassifier<'a> {
             &config.headers,
             config.header_protection(),
         )
+        .with_random_trailers(config.random_trailers)
     }
 
     /// Determine the padding length for an incoming datagram by trying each
@@ -232,7 +256,13 @@ impl<'a> PacketClassifier<'a> {
         };
 
         for &(padding, header_range, expected_size, exact) in &checks {
-            let size_ok = if exact {
+            // A handshake message has a fixed size, so its length is normally
+            // an exact test. AWG 3.1 random trailers append bytes past it, so
+            // the test relaxes to `>=` — but only when configured, because
+            // otherwise an oversized datagram is exactly what an exact test is
+            // there to reject. Transport is `>=` either way; its trailer is
+            // content padding inside the AEAD, not bytes on the end.
+            let size_ok = if exact && !self.random_trailers {
                 src.len() == padding + expected_size
             } else {
                 src.len() >= padding + expected_size
@@ -258,6 +288,7 @@ impl<'a> PacketClassifier<'a> {
                         padding,
                         protected_len,
                         header_mask,
+                        msg_size: if exact { Some(expected_size) } else { None },
                     });
                 }
             }
@@ -283,6 +314,11 @@ pub struct Classified {
     /// still call `apply`. They run once per handshake rather than once per
     /// packet, so the second setup does not matter there.
     pub header_mask: Option<[u8; TRANSPORT_HEADER_SZ]>,
+    /// Fixed size of the message after the padding, for the types that have
+    /// one — everything past it is an AWG 3.1 random trailer and must be
+    /// trimmed before parsing. `None` for transport, whose length is carried by
+    /// the datagram itself.
+    pub msg_size: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -498,8 +534,39 @@ impl Tunn {
             header_protection,
             content_padding: amnezia.content_padding_addition,
             mtu: amnezia.mtu,
+            random_trailers: amnezia.random_trailers,
+            disable_cookies: amnezia.disable_cookies,
+            udp_window: crate::amnezia::AWG31_DEFAULT_UDP_WINDOW,
             network_outgoing: VecDeque::new(),
         })
+    }
+
+    /// AWG 3.1: length of the random trailer for a datagram that is
+    /// `packet_size` bytes without one, clamped to what fits in a `dst_len`
+    /// buffer. 0 when the feature is off.
+    fn trailer_for(&self, packet_size: usize, dst_len: usize) -> usize {
+        if !self.random_trailers {
+            return 0;
+        }
+        let want =
+            crate::amnezia::random_trailer_len(packet_size, self.udp_window, &mut FastRandom);
+        want.min(dst_len.saturating_sub(packet_size))
+    }
+
+    /// AWG 3.1: raise the sliding UDP window to cover a datagram of this size.
+    fn observe_datagram(&mut self, size: usize) {
+        if self.random_trailers {
+            self.udp_window = self.udp_window.max(size.min(u32::MAX as usize) as u32);
+        }
+    }
+
+    /// Reset the AWG 3.1 UDP window to its starting size.
+    ///
+    /// Upstream does this when a peer's endpoint changes, so a window learned
+    /// from one path does not carry over to another. `Tunn` has no endpoint, so
+    /// the `Device` layer calls this.
+    pub fn reset_udp_window(&mut self) {
+        self.udp_window = crate::amnezia::AWG31_DEFAULT_UDP_WINDOW;
     }
 
     /// Update the private key and clear existing sessions
@@ -535,9 +602,16 @@ impl Tunn {
     /// When AmneziaWG is disabled (default config), S1 and S4 are both 0.
     pub fn encapsulate<'a>(&mut self, src: &[u8], dst: &'a mut [u8]) -> TunnResult<'a> {
         let current = self.current;
-        if let Some(ref session) = self.sessions[current % N_SESSIONS] {
+        // Tested with `is_some` rather than bound with `if let`: widening the
+        // AWG 3.1 UDP window below needs `&mut self`, which a live borrow of
+        // `self.sessions` would forbid.
+        if self.sessions[current % N_SESSIONS].is_some() {
             // Send the packet using an established session
-            let content_padding = self.content_padding_addition(src.len(), dst.len());
+            self.observe_datagram(self.padding_config.s4 as usize + DATA_OVERHEAD_SZ + src.len());
+            let content_padding = self.transport_padding(src.len(), dst.len());
+            let session = self.sessions[current % N_SESSIONS]
+                .as_ref()
+                .expect("checked immediately above");
             let packet = self.format_transport_packet(session, src, content_padding, dst);
             // Whether this is a keepalive is a property of the call, not of the
             // wire size: only a caller with nothing to send passes an empty
@@ -562,6 +636,22 @@ impl Tunn {
         self.queue_packet(src);
         // Initiate a new handshake if none is in progress
         self.format_handshake_initiation(dst, false)
+    }
+
+    /// How many bytes of padding go inside a transport packet's AEAD envelope.
+    ///
+    /// Two features can supply it and they are ordered, matching
+    /// `RoutineEncryption` in amneziawg-go: an explicit
+    /// `content_padding_addition` wins, and only when it is unset do AWG 3.1
+    /// random trailers widen the content instead. A transport packet never
+    /// carries an *outer* trailer — its length is self-describing, so bytes on
+    /// the end would be indistinguishable from ciphertext.
+    fn transport_padding(&self, packet_size: usize, dst_len: usize) -> usize {
+        if self.content_padding.is_some() {
+            return self.content_padding_addition(packet_size, dst_len);
+        }
+        let s4 = self.padding_config.s4 as usize;
+        self.trailer_for(s4 + DATA_OVERHEAD_SZ + packet_size, dst_len)
     }
 
     /// AWG 3.0 content padding addition: a random pick from the configured
@@ -649,6 +739,17 @@ impl Tunn {
             .unwrap_or((0, 0));
         let payload = &datagram[padding..];
 
+        // AWG 3.1: drop the random trailer. The message types that carry one
+        // have a fixed size, so everything past it is padding a peer appended
+        // outside the MAC. The header-protected path below would trim it anyway
+        // as a side effect of `protected_len.min(..)`, but an unprotected 3.1
+        // peer exists too, and there the trailer would reach MAC verification
+        // and fail it.
+        let payload = match classified.and_then(|c| c.msg_size) {
+            Some(size) if size <= payload.len() => &payload[..size],
+            _ => payload,
+        };
+
         // Transport packets protect only the 16-byte header, so the message is
         // never contiguous after decryption. Decrypt the header on the stack and
         // assemble the packet directly — `verify_packet` neither MACs nor rate
@@ -699,6 +800,13 @@ impl Tunn {
         ) {
             Ok(packet) => packet,
             Err(TunnResult::WriteToNetwork(cookie)) => {
+                // AWG 3.1: the rate limiter still decided a cookie was
+                // warranted; `disable_cookies` only suppresses the reply, so
+                // the sender gets silence instead of a retry hint.
+                if self.disable_cookies {
+                    tracing::debug!("Cookie reply suppressed by disable_cookies");
+                    return TunnResult::Done;
+                }
                 // Add S3 padding to cookie reply
                 let s3 = self.padding_config.s3 as usize;
                 if s3 > 0 {
@@ -709,7 +817,11 @@ impl Tunn {
                     let (prefix, message) = dst.split_at_mut(s3);
                     hp.apply(prefix, &mut message[..cookie.len()]);
                 }
-                return TunnResult::WriteToNetwork(&mut dst[..s3 + cookie.len()]);
+                let trailer = self.trailer_for(s3 + cookie.len(), dst.len());
+                if trailer > 0 {
+                    FastRandom.fill_bytes(&mut dst[s3 + cookie.len()..s3 + cookie.len() + trailer]);
+                }
+                return TunnResult::WriteToNetwork(&mut dst[..s3 + cookie.len() + trailer]);
             }
             Err(TunnResult::Err(e)) => return TunnResult::Err(e),
             _ => unreachable!(),
@@ -760,6 +872,10 @@ impl Tunn {
             let (prefix, message) = dst.split_at_mut(s2);
             hp.apply(prefix, &mut message[..packet_len]);
         }
+        let trailer = self.trailer_for(s2 + packet_len, dst.len());
+        if trailer > 0 {
+            FastRandom.fill_bytes(&mut dst[s2 + packet_len..s2 + packet_len + trailer]);
+        }
 
         self.timer_tick(TimerName::TimeLastPacketReceived);
         self.timer_tick(TimerName::TimeLastPacketSent);
@@ -767,7 +883,9 @@ impl Tunn {
 
         tracing::debug!(message = "Sending handshake_response", local_idx = index);
 
-        Ok(TunnResult::WriteToNetwork(&mut dst[..s2 + packet_len]))
+        Ok(TunnResult::WriteToNetwork(
+            &mut dst[..s2 + packet_len + trailer],
+        ))
     }
 
     fn handle_handshake_response<'a>(
@@ -841,6 +959,16 @@ impl Tunn {
     ) -> Result<TunnResult<'a>, WireGuardError> {
         let r_idx = packet.receiver_idx as usize;
         let idx = r_idx % N_SESSIONS;
+
+        // AWG 3.1: widen the UDP window to this datagram's size, so what we
+        // send grows to resemble what this peer already sends. The ciphertext
+        // still carries its AEAD tag here, so header + ciphertext is the whole
+        // datagram after the S4 prefix — the same total the send side observes.
+        self.observe_datagram(
+            self.padding_config.s4 as usize
+                + TRANSPORT_HEADER_SZ
+                + packet.encrypted_encapsulated_packet.len(),
+        );
 
         // Get the (probably) right session
         let decapsulated_packet = {
@@ -918,11 +1046,22 @@ impl Tunn {
                     hp.apply(prefix, &mut message[..packet_len]);
                 }
 
+                // AWG 3.1 random trailer, appended after header protection and
+                // outside it — the receiver trims it by the message's fixed
+                // size. Clamped to what is left in `dst` so that turning the
+                // feature on cannot raise this function's documented buffer
+                // requirement of `148 + S1`, the same treatment content padding
+                // gets in `encapsulate`.
+                let trailer = self.trailer_for(s1 + packet_len, dst.len());
+                if trailer > 0 {
+                    FastRandom.fill_bytes(&mut dst[s1 + packet_len..s1 + packet_len + trailer]);
+                }
+
                 if starting_new_handshake {
                     self.timer_tick(TimerName::TimeLastHandshakeStarted);
                 }
                 self.timer_tick(TimerName::TimeLastPacketSent);
-                TunnResult::WriteToNetwork(&mut dst[..s1 + packet_len])
+                TunnResult::WriteToNetwork(&mut dst[..s1 + packet_len + trailer])
             }
             Err(e) => TunnResult::Err(e),
         }
@@ -1046,6 +1185,7 @@ impl Tunn {
             &self.header_config,
             self.header_protection,
         )
+        .with_random_trailers(self.random_trailers)
     }
 
     /// See [`PacketClassifier::classify`].
@@ -1321,6 +1461,8 @@ mod tests {
             header_protection_key: Some(key),
             content_padding_addition: None,
             timing_ranges: Default::default(),
+            random_trailers: false,
+            disable_cookies: false,
             mtu: crate::amnezia::AWG3_DEFAULT_MTU,
         }
     }
@@ -1899,6 +2041,245 @@ mod tests {
             TunnResult::Done
         ));
         assert!(my_tun.handshake.has_cookie());
+    }
+
+    fn awg31_test_config(
+        key: [u8; 32],
+        random_trailers: bool,
+        disable_cookies: bool,
+    ) -> Amnezia3Config {
+        let mut config = awg3_test_config(key);
+        config.random_trailers = random_trailers;
+        config.disable_cookies = disable_cookies;
+        config
+    }
+
+    fn awg31_pair(
+        random_trailers: bool,
+        disable_cookies: bool,
+        limiter: Option<Arc<RateLimiter>>,
+    ) -> (Tunn, Tunn) {
+        let key = [0x42u8; 32];
+        let my_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let my_public_key = x25519_dalek::PublicKey::from(&my_secret_key);
+        let their_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let their_public_key = x25519_dalek::PublicKey::from(&their_secret_key);
+
+        let mine = Tunn::new_with_amnezia3(
+            my_secret_key,
+            their_public_key,
+            None,
+            None,
+            1,
+            None,
+            awg31_test_config(key, random_trailers, disable_cookies),
+        )
+        .expect("valid awg3.1 config");
+        let theirs = Tunn::new_with_amnezia3(
+            their_secret_key,
+            my_public_key,
+            None,
+            None,
+            2,
+            limiter,
+            awg31_test_config(key, random_trailers, disable_cookies),
+        )
+        .expect("valid awg3.1 config");
+        (mine, theirs)
+    }
+
+    #[test]
+    fn awg31_random_trailer_grows_the_initiation_and_peer_still_parses_it() {
+        // S1 is 16 in the test config, so a 3.0 initiation is exactly 164
+        // bytes. With trailers on it may be longer, and the responder has to
+        // trim before verifying the MAC.
+        let (mut my_tun, mut their_tun) = awg31_pair(true, false, None);
+
+        // The trailer length is random, so drive several handshakes and require
+        // that at least one actually grew. The window starts at 500 and the
+        // datagram is 164, leaving ~336 bytes of room, so P(no growth) per
+        // attempt is about 1/336.
+        // Draw initiations until one actually carries a trailer. Only that one
+        // is handed to the responder: a real handshake per attempt would trip
+        // the peer's handshake rate limiter and fail with `UnderLoad`, which is
+        // correct behaviour and not what this test is about.
+        let mut trailered = None;
+        for _ in 0..32 {
+            // `force_resend`, because a handshake is in progress after the
+            // first pass and `format_handshake_initiation` answers `Done` then.
+            let init = match my_tun.format_handshake_initiation(&mut vec![0u8; 2048], true) {
+                TunnResult::WriteToNetwork(packet) => packet.to_vec(),
+                other => panic!("expected an initiation, got {:?}", other),
+            };
+            assert!(
+                init.len() >= 16 + HANDSHAKE_INIT_SZ,
+                "initiation shorter than S1 + 148: {}",
+                init.len()
+            );
+            if init.len() > 16 + HANDSHAKE_INIT_SZ {
+                trailered = Some(init);
+                break;
+            }
+        }
+
+        let init = trailered.expect("no trailer was appended in 32 initiations");
+        let mut their_dst = vec![0u8; 2048];
+        match their_tun.decapsulate(None, &init, &mut their_dst) {
+            TunnResult::WriteToNetwork(_) => {}
+            other => panic!("responder rejected a trailered initiation: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn awg31_full_handshake_and_data_with_trailers() {
+        let (mut my_tun, mut their_tun) = awg31_pair(true, false, None);
+
+        let init = create_handshake_init(&mut my_tun);
+        let mut their_dst = vec![0u8; 2048];
+        let resp = match their_tun.decapsulate(None, &init, &mut their_dst) {
+            TunnResult::WriteToNetwork(packet) => packet.to_vec(),
+            other => panic!("expected a response, got {:?}", other),
+        };
+        assert!(resp.len() >= 16 + HANDSHAKE_RESP_SZ);
+
+        let mut my_dst = vec![0u8; 2048];
+        assert!(matches!(
+            my_tun.decapsulate(None, &resp, &mut my_dst),
+            TunnResult::WriteToNetwork(_)
+        ));
+
+        // A real IPv4 packet survives the round trip with trailers enabled.
+        let sent = create_ipv4_udp_packet();
+        let mut encapsulated = vec![0u8; 2048];
+        let on_wire = match my_tun.encapsulate(&sent, &mut encapsulated) {
+            TunnResult::WriteToNetwork(packet) => packet.to_vec(),
+            other => panic!("expected a transport packet, got {:?}", other),
+        };
+        let mut received = vec![0u8; 2048];
+        match their_tun.decapsulate(None, &on_wire, &mut received) {
+            TunnResult::WriteToTunnelV4(packet, _) => assert_eq!(packet, &sent[..]),
+            other => panic!("expected the payload back, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn awg31_trailers_off_rejects_an_oversized_handshake() {
+        // The exact-size test is what makes an unexpected trailing byte a
+        // non-match, so it must stay exact when the feature is off.
+        let key = [0x42u8; 32];
+        let strict = awg31_test_config(key, false, false);
+        let lenient = awg31_test_config(key, true, false);
+
+        let mut oversized = vec![0u8; 16 + HANDSHAKE_INIT_SZ + 7];
+        // A type inside H1 (100..=199) at the padding offset.
+        oversized[16..20].copy_from_slice(&150u32.to_le_bytes());
+
+        // Header protection would scramble the type, so classify without it.
+        let mut plain_strict = strict.clone();
+        plain_strict.header_protection_key = None;
+        let mut plain_lenient = lenient.clone();
+        plain_lenient.header_protection_key = None;
+
+        assert!(
+            PacketClassifier::from_config(&plain_strict)
+                .classify(&oversized)
+                .is_none(),
+            "an oversized initiation matched with trailers disabled"
+        );
+        let classified = PacketClassifier::from_config(&plain_lenient)
+            .classify(&oversized)
+            .expect("trailers enabled should classify an oversized initiation");
+        assert_eq!(classified.padding, 16);
+        assert_eq!(
+            classified.msg_size,
+            Some(HANDSHAKE_INIT_SZ),
+            "the trailer has to be trimmed back to the fixed message size"
+        );
+    }
+
+    #[test]
+    fn awg31_transport_msg_size_is_none_so_nothing_is_trimmed() {
+        // A transport packet's length is self-describing, so it never carries
+        // an outer trailer and must not be truncated.
+        let key = [0x42u8; 32];
+        let mut config = awg31_test_config(key, true, false);
+        config.header_protection_key = None;
+
+        let mut packet = vec![0u8; 16 + DATA_OVERHEAD_SZ + 40];
+        packet[16..20].copy_from_slice(&450u32.to_le_bytes()); // inside H4
+
+        let classified = PacketClassifier::from_config(&config)
+            .classify(&packet)
+            .expect("a transport packet should classify");
+        assert_eq!(classified.msg_size, None);
+    }
+
+    #[test]
+    fn awg31_disable_cookies_suppresses_the_reply() {
+        let key = [0x42u8; 32];
+        let their_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let their_public_key = x25519_dalek::PublicKey::from(&their_secret_key);
+
+        // Same zero-limit rate limiter as the cookie test: every packet is
+        // "under load", so a reply is always warranted.
+        for (disable, expect_reply) in [(false, true), (true, false)] {
+            let my_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+            let my_public_key = x25519_dalek::PublicKey::from(&my_secret_key);
+            let mut my_tun = Tunn::new_with_amnezia3(
+                my_secret_key,
+                their_public_key,
+                None,
+                None,
+                1,
+                None,
+                awg31_test_config(key, false, disable),
+            )
+            .expect("valid config");
+            let mut their_tun = Tunn::new_with_amnezia3(
+                their_secret_key.clone(),
+                my_public_key,
+                None,
+                None,
+                2,
+                Some(Arc::new(RateLimiter::new(&their_public_key, 0))),
+                awg31_test_config(key, false, disable),
+            )
+            .expect("valid config");
+
+            let init = create_handshake_init(&mut my_tun);
+            let mut dst = vec![0u8; 2048];
+            let result =
+                their_tun.decapsulate(Some(std::net::IpAddr::from([1, 2, 3, 4])), &init, &mut dst);
+            if expect_reply {
+                assert!(
+                    matches!(result, TunnResult::WriteToNetwork(_)),
+                    "expected a cookie reply, got {:?}",
+                    result
+                );
+            } else {
+                assert!(
+                    matches!(result, TunnResult::Done),
+                    "disable_cookies should suppress the reply, got {:?}",
+                    result
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn awg31_trailer_never_exceeds_the_callers_buffer() {
+        // Enabling trailers must not raise the documented buffer requirement of
+        // `148 + S1`, the same guarantee content padding has.
+        let (mut my_tun, _) = awg31_pair(true, false, None);
+        let mut tight = vec![0u8; 16 + HANDSHAKE_INIT_SZ];
+        for _ in 0..32 {
+            match my_tun.format_handshake_initiation(&mut tight, true) {
+                TunnResult::WriteToNetwork(packet) => {
+                    assert_eq!(packet.len(), 16 + HANDSHAKE_INIT_SZ)
+                }
+                other => panic!("expected an initiation, got {:?}", other),
+            }
+        }
     }
 
     #[test]

@@ -47,7 +47,7 @@ numbers move, the names do not.
 - [Protocol Overview](#protocol-overview)
 - [Configuration Parameters](#configuration-parameters)
 - [AmneziaWG 3.0](#amneziawg-30)
-  - [AmneziaWG 3.1, and why none of it is implemented here](#amneziawg-31-and-why-none-of-it-is-implemented-here)
+- [AmneziaWG 3.1](#amneziawg-31)
 - [Packet Layout](#packet-layout)
 - [Keepalives](#keepalives)
 - [Implementation Architecture](#implementation-architecture)
@@ -150,9 +150,9 @@ releases. All three are the current `master` and the newest tag of their repo.
 
 | Repo | Release | Commit | Date |
 |---|---|---|---|
-| [amneziawg-go](https://github.com/amnezia-vpn/amneziawg-go) | `v3.0.20260805` | `08d68cd` | 2026-08-05 |
-| [amneziawg-tools](https://github.com/amnezia-vpn/amneziawg-tools) | `v3.0.20260805` | `9f70177` | 2026-08-05 |
-| [amneziawg-linux-kernel-module](https://github.com/amnezia-vpn/amneziawg-linux-kernel-module) | `v3.0.20260805` | `ce16310` | 2026-08-04 |
+| [amneziawg-go](https://github.com/amnezia-vpn/amneziawg-go) | `v3.1.20260813` | `08271d0` | 2026-08-13 |
+| [amneziawg-tools](https://github.com/amnezia-vpn/amneziawg-tools) | `v3.1.20260812` | `ee0f0a9` | 2026-08-13 |
+| [amneziawg-linux-kernel-module](https://github.com/amnezia-vpn/amneziawg-linux-kernel-module) | `v3.1.20260812` | `4680320` | 2026-08-13 |
 
 To check for drift, clone each and `git log <commit>..HEAD` from the row above;
 an empty result on all three means there is nothing to do. Read all three when
@@ -161,58 +161,101 @@ disagreements are where the bugs are (see [Where the three implementations
 disagree](#where-the-three-implementations-disagree)).
 
 Check the branches too, not only `master`. The drift check above came back empty
-on 2026-08-12 while AmneziaWG 3.1 was being written on a branch in two of the
-three repos.
+on 2026-08-12 while AmneziaWG 3.1 was being written on a `feat/awg-3.1` branch in
+two of the three repos; it merged to `master` everywhere the next day.
 
 `feature/awg4` exists in all three repos but predates the 3.0 work (2025-10-15
 to 2025-11-04), so it is a stale experiment rather than the next release.
 
-### AmneziaWG 3.1, and why none of it is implemented here
+## AmneziaWG 3.1
 
-Not implemented, deliberately. Audited 2026-08-12 at `feat/awg-3.1`
-— kernel module `ebcb20a` (2026-08-11), tools `c35a3fa` (2026-08-10).
+Two device-scoped booleans, both off by default. Audited and implemented
+2026-08-13 against amneziawg-go `08271d0`, which is the reference the wire
+behaviour below follows.
 
-**amneziawg-go has none of it**: no 3.1 branch, no commits since `08d68cd` on
-any ref, and none of its ten branch tips mentions a 3.1 parameter. The ground rule of this
-fork is that the reference decides, and on 3.1 there is no cross-implementation
-agreement to conform to yet — only a kernel module and the CLI that configures
-it. The branch is also still moving: `SendCookie` was renamed to
-`DisableCookies` *and had its polarity inverted* one day before the tip. Writing
-that into a wire format now is how this fork acquired the invented rules it
-spent so long deleting.
+| Parameter | `.conf` | UAPI | `awg set` |
+|---|---|---|---|
+| Random trailers | `RandomTrailers` | `random_trailers` | `random-trailers <on\|off>` |
+| Disable cookies | `DisableCookies` | `disable_cookies` | `disable-cookies <on\|off>` |
 
-What 3.1 adds, so the next audit starts from here rather than rediscovering it:
+Booleans are accepted in every spelling the three implementations emit — `0`/`1`
+(what amneziawg-tools writes over the socket), Go's `strconv.ParseBool` set
+(`t`, `T`, `true`, `TRUE`, `True` and the false forms) and `on`/`off`.
 
-| Parameter | `.conf` / UAPI / CLI | Meaning |
+### Random trailers
+
+A random number of bytes on the end of a datagram, so a message with a fixed
+size stops having one. It is applied two different ways, and the difference
+matters:
+
+| Message | Where the bytes go | Trimmed by |
 |---|---|---|
-| Random trailers | `RandomTrailers` / `random_trailers` / `random-trailers` | bool, device-scoped |
-| Disable cookies | `DisableCookies` / `disable_cookies` / `disable-cookies` | bool, device-scoped |
+| Initiation, response, cookie reply | *After* the message, outside the MAC and outside header protection | The receiver, using the message's fixed size |
+| Transport | Nowhere — the *content padding inside the AEAD* widens instead | The IP total-length field, as content padding already was |
 
-- **Random trailers** append random bytes to a datagram, but by two different
-  mechanisms. Handshake, response and cookie messages get plain random bytes
-  *after* the message, outside header protection; the receiver relaxes its exact
-  size test to `>=` and trims with `pskb_trim`. Transport packets get no trailer
-  at all — they instead widen the *content padding inside the AEAD*, and only
-  when `ContentPaddingAddition` is unset, which takes precedence
-  (`46517a9`).
-- **The sliding UDP window** sizes both. It is a per-peer high-water mark of
-  observed datagram size (`DEFAULT_UDP_WINDOW = 1000`), raised on both send and
-  receive and reset to the default when the endpoint changes; a trailer is
-  `random(0, udp_window - len - padding)`. So a peer's packets grow to resemble
-  the largest size that peer has already been seen to use.
-- **Disable cookies** suppresses emitting cookie replies entirely. The rate
-  limiter still decides a cookie is *needed* — `packet_needs_cookie` went back to
-  an unconditional `true` — the device just refuses to answer.
+A transport packet gets no outer trailer because its length is self-describing:
+bytes on the end would be indistinguishable from ciphertext. Upstream orders the
+two padding sources explicitly, and so does `Tunn::transport_padding` — an
+explicit `content_padding_addition` wins, and random trailers only widen the
+content when it is unset.
 
-Two fixes ride along on that branch that are **not** 3.1 features, and this
-implementation already does both correctly:
+**Both ends must enable it.** The receiver only tolerates a trailing byte when
+`random_trailers` is set; otherwise the exact-size test that identifies a
+handshake message rejects the datagram. Turning it on for one peer alone breaks
+the handshake in the direction that grew.
 
-- Cookie replies are header-protected. amneziawg-go always did this
-  (`SendHandshakeCookie` in `device/send.go`); the kernel module did not, and
-  3.1 adds it. Ours does it in `decapsulate`, covered by
+### The sliding UDP window
+
+What bounds a trailer's length. It is a per-peer high-water mark of observed
+datagram size, starting at `AWG31_DEFAULT_UDP_WINDOW` and raised by both sending
+and receiving, so a tunnel's datagrams grow to resemble the largest it has
+already carried. A trailer is then `fastrandn(window - packet_size)` — uniform,
+half-open, zero once the packet already fills the window.
+
+The window is a property of the path, so it resets to the default when a peer's
+endpoint changes. `Tunn` has no endpoint, so `Device` calls
+`Tunn::reset_udp_window` when `Peer::set_endpoint` reports a change.
+
+amneziawg-go starts the window at **500** and the kernel module at **1000**.
+This fork follows Go. The disagreement is a fingerprinting difference rather
+than an interop one: a trailer is random bytes the receiver trims by a size it
+already knows, so neither end has to agree on how long it is.
+
+### Disable cookies
+
+Suppresses the cookie reply. The rate limiter still decides a cookie is
+warranted — upstream reverted `packet_needs_cookie` to an unconditional `true` —
+so this only withholds the answer, and a peer under load gets silence instead of
+a retry hint.
+
+### Two fixes that arrived with 3.1 but are not 3.1 features
+
+This implementation already did both, so neither needed a change:
+
+- Cookie replies are header-protected. amneziawg-go always did this; the kernel
+  module did not, and 3.1 adds it. Covered by
   `awg3_cookie_reply_is_padded_and_header_protected`.
-- The header type is compared as little-endian (`le32_to_cpu`). Ours has always
-  used `u32::from_le_bytes`, so it was never wrong on a big-endian target.
+- The header type is compared as little-endian (`le32_to_cpu`). `u32::from_le_bytes`
+  has always been used here, so it was never wrong on a big-endian target.
+
+### A bug in amneziawg-go's cookie trailer
+
+`SendHandshakeCookie` in `device/send.go` at `08271d0` allocates
+
+```go
+buf := make([]byte, padding+MessageCookieReplySize, trailerLen)
+```
+
+which passes `trailerLen` as the slice's *capacity* rather than adding it to the
+length. Go panics when a `make` capacity is below its length, so with random
+trailers enabled this crashes whenever the drawn `trailerLen` is under
+`padding + 64`, and produces a zero-length trailer when it is not. Reaching it
+needs the device to be under load and `disable_cookies` off.
+
+This fork implements the intent — a cookie reply gets a trailer sized from the
+window, like the other two handshake types — rather than reproducing the bug.
+Nothing interoperates differently either way: the trailer is trimmed by the
+receiver, so a peer cannot tell whether one was appended.
 
 ### Header protection
 

@@ -135,6 +135,15 @@ struct amnezia3_config {
     uint32_t persistent_keepalive_min;
     uint32_t persistent_keepalive_max;
     uint32_t mtu;                       // 0 selects the default (1420)
+    // AmneziaWG 3.1. Appended after mtu so every field above keeps its offset;
+    // zeroing the struct gives 3.0 behaviour unchanged.
+    //
+    // Random trailers add a random number of bytes to the end of each
+    // handshake, response and cookie datagram, and widen transport content
+    // padding when content_padding_* is unset. Both peers must enable it: a
+    // receiver only tolerates a trailer when it is on.
+    uint8_t random_trailers;
+    uint8_t disable_cookies;            // non-zero: never send a cookie reply
 };
 
 // Allocate a new tunnel with AmneziaWG 2.0 configuration.

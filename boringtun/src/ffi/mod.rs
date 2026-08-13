@@ -608,6 +608,16 @@ pub struct amnezia3_config {
     pub persistent_keepalive_max: u32,
     /// Outer MTU used to clamp content padding. 0 selects the default (1420).
     pub mtu: u32,
+    /// AmneziaWG 3.1. Appended after `mtu` so every field above keeps its
+    /// offset; a caller that zeroes the struct gets 3.0 behaviour unchanged.
+    ///
+    /// Non-zero enables random trailers: a random number of bytes on the end of
+    /// each handshake, response and cookie datagram, and wider content padding
+    /// on transport packets when `content_padding_*` is unset. Both peers must
+    /// set it — a receiver only tolerates a trailer when it is on.
+    pub random_trailers: u8,
+    /// Non-zero suppresses cookie replies entirely.
+    pub disable_cookies: u8,
 }
 
 /// Build an inclusive range from a C min/max pair. A zero pair means "unset".
@@ -690,6 +700,8 @@ pub unsafe extern "C" fn new_tunnel_amnezia3(
     amnezia.header_protection_key = header_protection_key_from_c(cfg.header_protection_key);
     amnezia.content_padding_addition = content_padding;
     amnezia.timing_ranges = timing_ranges;
+    amnezia.random_trailers = cfg.random_trailers != 0;
+    amnezia.disable_cookies = cfg.disable_cookies != 0;
     if cfg.mtu != 0 {
         amnezia.mtu = cfg.mtu;
     }
@@ -884,6 +896,8 @@ mod tests {
             persistent_keepalive_min: 0,
             persistent_keepalive_max: 0,
             mtu: 0,
+            random_trailers: 0,
+            disable_cookies: 0,
         }
     }
 
