@@ -2214,6 +2214,100 @@ mod tests {
         assert_eq!(classified.msg_size, None);
     }
 
+    /// Regression test for the shape of amneziawg-go's cookie trailer bug
+    /// (upstream issue #178). There, `SendHandshakeCookie` passes the trailer
+    /// length as the slice *capacity* rather than adding it to the length, so
+    /// the reply either panics the process or goes out with an empty trailer —
+    /// on every draw, meaning the feature never works on that path.
+    ///
+    /// Rust cannot reproduce the panic half: there is no `make(len, cap)` to
+    /// get wrong, and `trailer_for` clamps to the space left in `dst` so the
+    /// slice index cannot overrun. The half worth pinning is the quiet one:
+    /// that a cookie reply really does grow.
+    #[test]
+    fn awg31_cookie_reply_actually_carries_a_trailer() {
+        let key = [0x42u8; 32];
+        let their_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let their_public_key = x25519_dalek::PublicKey::from(&their_secret_key);
+        let my_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let my_public_key = x25519_dalek::PublicKey::from(&my_secret_key);
+
+        let mut my_tun = Tunn::new_with_amnezia3(
+            my_secret_key,
+            their_public_key,
+            None,
+            None,
+            1,
+            None,
+            awg31_test_config(key, true, false),
+        )
+        .expect("valid config");
+        // A zero-limit rate limiter reports "under load" on every packet, which
+        // is the only path that emits a cookie reply.
+        let mut their_tun = Tunn::new_with_amnezia3(
+            their_secret_key,
+            my_public_key,
+            None,
+            None,
+            2,
+            Some(Arc::new(RateLimiter::new(&their_public_key, 0))),
+            awg31_test_config(key, true, false),
+        )
+        .expect("valid config");
+
+        // S3 is 16 here, so a 3.0 reply is exactly 80 bytes. Draw until one
+        // grows; the window is 500, leaving ~420 bytes of room, so an empty
+        // trailer happens about 1 draw in 420.
+        let mut saw_trailer = false;
+        for _ in 0..32 {
+            let init = match my_tun.format_handshake_initiation(&mut vec![0u8; 2048], true) {
+                TunnResult::WriteToNetwork(packet) => packet.to_vec(),
+                other => panic!("expected an initiation, got {:?}", other),
+            };
+            let mut dst = vec![0u8; 2048];
+            let cookie = match their_tun.decapsulate(
+                Some(std::net::IpAddr::from([1, 2, 3, 4])),
+                &init,
+                &mut dst,
+            ) {
+                TunnResult::WriteToNetwork(packet) => packet.to_vec(),
+                other => panic!("expected a cookie reply, got {:?}", other),
+            };
+            assert!(
+                cookie.len() >= 16 + COOKIE_REPLY_SZ,
+                "cookie reply shorter than S3 + 64: {}",
+                cookie.len()
+            );
+            if cookie.len() > 16 + COOKIE_REPLY_SZ {
+                saw_trailer = true;
+                break;
+            }
+        }
+        assert!(
+            saw_trailer,
+            "cookie replies never grew: the trailer is being computed and then dropped, \
+             which is the bug upstream has"
+        );
+
+        // And the trailer must not push past the caller's buffer, which is the
+        // documented `64 + S3` for this path.
+        let mut tight = vec![0u8; 16 + COOKIE_REPLY_SZ];
+        let init = match my_tun.format_handshake_initiation(&mut vec![0u8; 2048], true) {
+            TunnResult::WriteToNetwork(packet) => packet.to_vec(),
+            other => panic!("expected an initiation, got {:?}", other),
+        };
+        match their_tun.decapsulate(
+            Some(std::net::IpAddr::from([1, 2, 3, 4])),
+            &init,
+            &mut tight,
+        ) {
+            TunnResult::WriteToNetwork(packet) => {
+                assert_eq!(packet.len(), 16 + COOKIE_REPLY_SZ)
+            }
+            other => panic!("expected a cookie reply, got {:?}", other),
+        }
+    }
+
     #[test]
     fn awg31_disable_cookies_suppresses_the_reply() {
         let key = [0x42u8; 32];
