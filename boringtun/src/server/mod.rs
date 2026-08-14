@@ -101,8 +101,9 @@ pub struct WgServer {
     peers_by_idx: HashMap<u32, [u8; 32]>,
     /// Cryptokey routing: destination IP -> owning peer pubkey bytes.
     routing: IpNetworkTable<[u8; 32]>,
-    /// Monotonic local-index allocator. A plain counter suffices here — unlike
-    /// the device, the server does not obfuscate its indices with an LFSR.
+    /// Local-index allocator cursor. Indices live in a 24-bit space because the
+    /// on-wire receiver index is `index << 8`; [`Self::alloc_index`] keeps them
+    /// there and skips any still in use.
     next_index: u32,
 }
 
@@ -126,6 +127,20 @@ impl WgServer {
         }
     }
 
+    /// Allocate a free local index in the 24-bit on-wire space (`index << 8`
+    /// must stay within `u32`). Skips 0 and any index currently bound to a peer,
+    /// so a long-running server that has churned through many peers cannot alias
+    /// a live one once the cursor wraps.
+    fn alloc_index(&mut self) -> u32 {
+        loop {
+            let idx = self.next_index & 0x00ff_ffff;
+            self.next_index = self.next_index.wrapping_add(1);
+            if idx != 0 && !self.peers_by_idx.contains_key(&idx) {
+                return idx;
+            }
+        }
+    }
+
     /// Add or replace a peer. Assigns a fresh local index, wires the peer into
     /// the pubkey map, the index map (`index == receiver_idx >> 8`), and the
     /// cryptokey-routing table.
@@ -135,8 +150,7 @@ impl WgServer {
         // Replacing an existing peer: drop its old index/route bindings first.
         self.remove_peer(&peer.public_key);
 
-        let index = self.next_index;
-        self.next_index = self.next_index.wrapping_add(1);
+        let index = self.alloc_index();
 
         let tunn = Tunn::new_with_amnezia3(
             self.private_key.clone(),
@@ -176,14 +190,16 @@ impl WgServer {
         }
     }
 
-    /// Handle one inbound UDP datagram received from `src`. `out` is a scratch
-    /// buffer (>= 65536) that a returned [`ServerInput::WriteToTunnel`] borrows
-    /// from.
+    /// Handle one inbound UDP datagram received from `src`. `datagram` is the
+    /// caller's receive buffer (`&mut` so the AmneziaWG header can be unprotected
+    /// in place — no per-packet allocation, as the device does on its own recv
+    /// buffer); `out` is a scratch buffer (>= 65536) that a returned
+    /// [`ServerInput::WriteToTunnel`] borrows from.
     ///
     /// This is the sans-io port of the device's anonymous UDP demux.
     pub fn handle_incoming<'a>(
         &mut self,
-        datagram: &[u8],
+        datagram: &mut [u8],
         src: SocketAddr,
         out: &'a mut [u8],
     ) -> ServerInput<'a> {
@@ -192,13 +208,10 @@ impl WgServer {
             return ServerInput::Done;
         }
 
-        // The caller only lends `&[u8]`, but unprotecting the header must mutate
-        // the datagram in place (as the device does on its owned receive
-        // buffer), so work on a copy we own. The S1-S4 padding prefix is the
-        // header-protection nonce and is not part of the mutated span.
-        let mut buf = datagram.to_vec();
-
-        let classified = PacketClassifier::from_config(&self.amnezia).classify(&buf[..len]);
+        // Unprotecting the header mutates the datagram in place. The S1-S4
+        // padding prefix is the header-protection nonce and is not part of the
+        // mutated span.
+        let classified = PacketClassifier::from_config(&self.amnezia).classify(&datagram[..len]);
         let (padding, protected_len) = classified
             .as_ref()
             .map(|c| (c.padding, c.protected_len))
@@ -213,7 +226,7 @@ impl WgServer {
             // A transport header is exactly the span `classify` already derived
             // the keystream for; decrypt it with a cheap XOR. Per-packet case.
             Some(mask) if protected == TRANSPORT_HEADER_SZ => {
-                let message = &mut buf[padding..len];
+                let message = &mut datagram[padding..len];
                 for (byte, mask_byte) in message.iter_mut().zip(mask.iter()) {
                     *byte ^= mask_byte;
                 }
@@ -222,14 +235,14 @@ impl WgServer {
             // handshake, so paying for a second cipher setup is fine.
             _ if protected > 0 => {
                 if let Some(hp) = self.amnezia.header_protection() {
-                    let (prefix, message) = buf[..len].split_at_mut(padding);
+                    let (prefix, message) = datagram[..len].split_at_mut(padding);
                     hp.apply(prefix, &mut message[..protected]);
                 }
             }
             _ => {}
         }
 
-        let packet = &buf[padding..len];
+        let packet = &datagram[padding..len];
 
         // A cookie reply is built into scratch so the S3 padding can be wrapped
         // around it, mirroring `Tunn::decapsulate`.
@@ -297,16 +310,20 @@ impl WgServer {
             None => return ServerInput::Done,
         };
 
-        // A valid transport/handshake packet re-homes the peer's endpoint. The
-        // window is a property of the path, so a new endpoint starts over.
+        let out_len = out.len();
+        let result = peer.tunn.handle_verified_packet(parsed, out);
+
+        // Re-home the peer's endpoint after processing, matching the device: a
+        // valid packet updates the endpoint, and since the AWG 3.1 UDP window is
+        // a property of the path, a changed endpoint starts it over. `result`
+        // borrows `out`, not the peer, so touching `peer.tunn` here is fine.
         let endpoint_changed = peer.endpoint != Some(src);
         peer.endpoint = Some(src);
         if endpoint_changed {
             peer.tunn.reset_udp_window();
         }
 
-        let out_len = out.len();
-        match peer.tunn.handle_verified_packet(parsed, out) {
+        match result {
             TunnResult::WriteToNetwork(resp) => {
                 let mut datagrams = vec![resp.to_vec()];
                 // Flush any queued follow-up. Re-entering `encapsulate` via
@@ -492,7 +509,7 @@ jc=0
         let ip_packet = ipv4_packet([10, 0, 0, 1]);
 
         // 2. Client starts a handshake.
-        let init = match client.encapsulate(&ip_packet, &mut client_buf) {
+        let mut init = match client.encapsulate(&ip_packet, &mut client_buf) {
             TunnResult::WriteToNetwork(data) => data.to_vec(),
             other => panic!("expected a handshake initiation, got {:?}", other),
         };
@@ -500,7 +517,7 @@ jc=0
         while let Some(_junk) = client.poll_outgoing_packet() {}
 
         // 3. Server answers the initiation with a handshake response.
-        let response = match server.handle_incoming(&init, client_src, &mut out) {
+        let response = match server.handle_incoming(&mut init, client_src, &mut out) {
             ServerInput::WriteToNetwork { to, datagrams } => {
                 assert_eq!(to, client_src, "response must go back to the client");
                 assert!(!datagrams.is_empty(), "expected >= 1 response datagram");
@@ -517,11 +534,11 @@ jc=0
         while let TunnResult::WriteToNetwork(_) = client.decapsulate(None, &[], &mut client_buf) {}
 
         // 4. A data packet crosses and is delivered to the tunnel.
-        let transport = match client.encapsulate(&ip_packet, &mut client_buf) {
+        let mut transport = match client.encapsulate(&ip_packet, &mut client_buf) {
             TunnResult::WriteToNetwork(data) => data.to_vec(),
             other => panic!("expected a transport packet, got {:?}", other),
         };
-        match server.handle_incoming(&transport, client_src, &mut out) {
+        match server.handle_incoming(&mut transport, client_src, &mut out) {
             ServerInput::WriteToTunnel { peer, packet } => {
                 assert_eq!(peer, client_public.to_bytes(), "delivered to right peer");
                 assert_eq!(packet, &ip_packet[..], "payload must survive the tunnel");
@@ -585,13 +602,13 @@ jc=0
         let mut client_buf = vec![0u8; MAX_UDP_SIZE];
         let mut out = vec![0u8; MAX_UDP_SIZE];
         let ip_packet = ipv4_packet([10, 0, 0, 1]);
-        let init = match client.encapsulate(&ip_packet, &mut client_buf) {
+        let mut init = match client.encapsulate(&ip_packet, &mut client_buf) {
             TunnResult::WriteToNetwork(data) => data.to_vec(),
             other => panic!("expected init, got {:?}", other),
         };
         while let Some(_junk) = client.poll_outgoing_packet() {}
         // No peer with this public key -> anonymous parse finds nobody.
-        match server.handle_incoming(&init, client_src, &mut out) {
+        match server.handle_incoming(&mut init, client_src, &mut out) {
             ServerInput::Done => {}
             _ => panic!("unknown peer must be dropped"),
         }
