@@ -11,6 +11,9 @@
 #[cfg(feature = "device")]
 pub mod device;
 
+#[cfg(feature = "server")]
+pub mod server;
+
 pub mod amnezia;
 #[cfg(feature = "ffi-bindings")]
 pub mod ffi;

@@ -25,6 +25,10 @@ rust-version = "1.85"
 [features]
 default = []
 device = ["socket2", "thiserror"]
+# Sans-io (runtime-agnostic, synchronous) multi-peer AmneziaWG/WireGuard server
+# core. No new dependencies: uses only always-on deps plus the crate's own
+# `noise`/`amnezia`.
+server = []
 jni-bindings = ["ffi-bindings", "jni"]
 ffi-bindings = ["tracing-subscriber"]
 # mocks std::time::Instant with mock_instant
