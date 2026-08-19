@@ -270,16 +270,27 @@ jobs:
             echo "gh attestation verify <file>.tar.gz --repo ${{ github.repository }}"
             echo '```'
           } >> NOTES.md
-      # Draft on purpose. The artefacts are worth looking at before anyone can
-      # download them, and a draft can be deleted without leaving a tag behind
-      # that someone has already pinned.
-      - name: Create draft release
+      # Published straight away rather than as a draft. Everything that would
+      # have been eyeballed in a draft is checked above instead: the tag has to
+      # match Cargo.toml, the changelog has to have a section, every packaging
+      # step fails loudly on a missing file, and no artefact reaches this point
+      # unless its job succeeded.
+      #
+      # A tag carrying a pre-release identifier (v0.9.0-rc.1, v1.0.0-beta) is
+      # marked as a prerelease, so it does not become the "latest" release that
+      # install instructions and tooling resolve to.
+      - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          prerelease=""
+          case "${GITHUB_REF_NAME}" in
+            *-*) prerelease="--prerelease"
+                 echo "pre-release identifier in ${GITHUB_REF_NAME}, marking as prerelease" ;;
+          esac
           gh release create "${GITHUB_REF_NAME}" \
-            --draft \
+            $prerelease \
             --title "${GITHUB_REF_NAME}" \
             --notes-file NOTES.md \
             artifacts/*.tar.gz artifacts/SHA256SUMS
