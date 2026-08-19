@@ -1,0 +1,263 @@
+name: Release
+
+# Driven by the tag, so the version lives in exactly one place that is hard to
+# get wrong: `v0.8.0` builds and publishes 0.8.0. The job below refuses to run
+# if that tag disagrees with Cargo.toml, because a release whose artefacts
+# report a different version than their filenames is worse than no release.
+on:
+  push:
+    tags: [ "v*" ]
+  # Lets the whole pipeline be rehearsed against a branch without creating a
+  # tag. It stops before publishing anything.
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build artefacts but do not create a release"
+        type: boolean
+        default: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  # Fail early and cheaply. Everything below takes minutes across six runners;
+  # a version mismatch or a missing changelog section should not be discovered
+  # at the end of that.
+  verify:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+      - id: v
+        name: Check the tag agrees with Cargo.toml
+        run: |
+          set -euo pipefail
+          manifest=$(grep -m1 '^version = ' awgtun/Cargo.toml | cut -d'"' -f2)
+          if [ "${{ github.event_name }}" = "push" ]; then
+            tag="${GITHUB_REF_NAME#v}"
+            if [ "$tag" != "$manifest" ]; then
+              echo "::error::tag v$tag does not match awgtun/Cargo.toml $manifest"
+              exit 1
+            fi
+            version="$tag"
+          else
+            version="$manifest"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "releasing $version"
+      - name: Check the changelog has a section for it
+        run: |
+          set -euo pipefail
+          v="${{ steps.v.outputs.version }}"
+          grep -q "^## \[$v\]" CHANGELOG.md || {
+            echo "::error::CHANGELOG.md has no '## [$v]' section"; exit 1; }
+
+  cli:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: false
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            cross: false
+          - target: armv7-unknown-linux-gnueabihf
+            os: ubuntu-latest
+            cross: true
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            cross: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+      - uses: taiki-e/install-action@cross
+        if: matrix.cross
+      - name: Build
+        run: ${{ matrix.cross && 'cross' || 'cargo' }} build --locked --release -p awgtun-cli --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          set -euo pipefail
+          name="awgtun-cli-${{ needs.verify.outputs.version }}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/awgtun-cli" "dist/$name/"
+          # BSD-3-Clause clause 2: a binary distribution has to reproduce the
+          # copyright notice and disclaimer. Shipping without this is a licence
+          # violation, not an oversight in packaging.
+          cp LICENSE.md README.md "dist/$name/"
+          tar -C dist -czf "$name.tar.gz" "$name"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.target }}
+          path: "*.tar.gz"
+          if-no-files-found: error
+
+  ffi:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: false
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            cross: false
+          - target: armv7-unknown-linux-gnueabihf
+            os: ubuntu-latest
+            cross: true
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            cross: false
+          # No CLI here: the device layer is Linux and macOS only, so Windows
+          # gets the library and nothing else. The README table says the same.
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            cross: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-ffi-${{ matrix.target }}
+      - uses: taiki-e/install-action@cross
+        if: matrix.cross
+      - name: Build
+        run: ${{ matrix.cross && 'cross' || 'cargo' }} build --locked --release -p awgtun --lib --target ${{ matrix.target }} --features ffi-bindings
+      # bash on the Windows runner too, so one packaging script covers every
+      # target; only the library filenames differ.
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="awgtun-ffi-${{ needs.verify.outputs.version }}-${{ matrix.target }}"
+          mkdir -p "dist/$name/include" "dist/$name/lib"
+          cp awgtun/src/wireguard_ffi.h "dist/$name/include/"
+          # A consumer needs the header plus whichever library form suits their
+          # link model, so ship whichever of them this platform produces:
+          # .a/.so on Linux, .a/.dylib on macOS, .lib/.dll on Windows.
+          found=0
+          for f in libawgtun.a libawgtun.so libawgtun.dylib awgtun.lib awgtun.dll; do
+            p="target/${{ matrix.target }}/release/$f"
+            if [ -f "$p" ]; then cp "$p" "dist/$name/lib/"; found=1; fi
+          done
+          [ "$found" = 1 ] || { echo "::error::no library artefacts found"; exit 1; }
+          cp LICENSE.md "dist/$name/"
+          tar -C dist -czf "$name.tar.gz" "$name"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ffi-${{ matrix.target }}
+          path: "*.tar.gz"
+          if-no-files-found: error
+
+  android:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-android
+      - uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r27c
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+      - name: Build every ABI
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          set -euo pipefail
+          name="awgtun-android-${{ needs.verify.outputs.version }}"
+          mkdir -p "dist/$name"
+          # jniLibs layout, so the output can be dropped straight into an
+          # Android project.
+          cargo ndk -t arm64-v8a -t armeabi-v7a -t x86 -t x86_64 \
+            -o "dist/$name/jniLibs" \
+            build --locked --release -p awgtun --features jni-bindings
+          cp LICENSE.md "dist/$name/"
+          tar -C dist -czf "$name.tar.gz" "$name"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android
+          path: "*.tar.gz"
+          if-no-files-found: error
+
+  publish:
+    needs: [ verify, cli, ffi, android ]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write      # create the release
+      id-token: write      # sign the provenance attestation
+      attestations: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd artifacts
+          sha256sum *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+      # Binds each artefact to the commit and workflow that produced it, so a
+      # download can be verified with `gh attestation verify`. This matters more
+      # than usual for something people run as root on a VPN endpoint.
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: artifacts/*.tar.gz
+      - name: Release notes from the changelog
+        run: |
+          set -euo pipefail
+          v="${{ needs.verify.outputs.version }}"
+          awk -v ver="$v" '
+            $0 ~ "^## \\[" ver "\\]" { inside = 1; next }
+            inside && /^## \[/       { exit }
+            inside                   { print }
+          ' CHANGELOG.md > NOTES.md
+          [ -s NOTES.md ] || { echo "::error::empty release notes for $v"; exit 1; }
+          {
+            echo
+            echo "---"
+            echo
+            echo "Verify a download:"
+            echo '```'
+            echo "gh attestation verify <file>.tar.gz --repo ${{ github.repository }}"
+            echo '```'
+          } >> NOTES.md
+      # Draft on purpose. The artefacts are worth looking at before anyone can
+      # download them, and a draft can be deleted without leaving a tag behind
+      # that someone has already pinned.
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "${GITHUB_REF_NAME}" \
+            --draft \
+            --title "${GITHUB_REF_NAME}" \
+            --notes-file NOTES.md \
+            artifacts/*.tar.gz artifacts/SHA256SUMS

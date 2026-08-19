@@ -17,6 +17,7 @@ Validated against [amneziawg-go](https://github.com/amnezia-vpn/amneziawg-go), a
 
 ## Contents
 
+- [Install](#install)
 - [Quick start](#quick-start)
 - [What AmneziaWG does](#what-amneziawg-does)
 - [Parameters](#parameters)
@@ -33,10 +34,32 @@ Validated against [amneziawg-go](https://github.com/amnezia-vpn/amneziawg-go), a
 - [Supported platforms](#supported-platforms)
 - [License](#license)
 
-## Quick start
+## Install
+
+Prebuilt archives for every [supported platform](#supported-platforms) are
+attached to each [release](https://github.com/AYastrebov/awgtun/releases): the
+`awgtun-cli` binary, a C FFI bundle with the header and both library forms, and
+Android `.so` files laid out as `jniLibs`.
 
 ```bash
-# Build the CLI
+tar xzf awgtun-cli-<version>-<target>.tar.gz
+sudo install awgtun-cli-<version>-<target>/awgtun-cli /usr/local/bin/
+```
+
+Every archive is signed with build provenance, so you can check it came from
+this repository's release workflow rather than from someone else:
+
+```bash
+gh attestation verify awgtun-cli-<version>-<target>.tar.gz --repo AYastrebov/awgtun
+```
+
+`SHA256SUMS` is attached alongside them.
+
+## Quick start
+
+Building from source instead:
+
+```bash
 cargo build --bin awgtun-cli --release
 
 # Bring up an interface and hand it an AmneziaWG config
@@ -351,18 +374,31 @@ of each that this was last audited against.
 
 ## Supported platforms
 
-Target triple                 |Binary|Library|
-------------------------------|:----:|------|
-x86_64-unknown-linux-gnu      |  ✓   | ✓    |
-aarch64-unknown-linux-gnu     |  ✓   | ✓    |
-armv7-unknown-linux-gnueabihf |  ✓   | ✓    |
-x86_64-apple-darwin           |  ✓   | ✓    |
-x86_64-pc-windows-msvc        |      | ✓    |
-aarch64-apple-ios             |      | ✓    |
-armv7-apple-ios               |      | ✓    |
-armv7s-apple-ios              |      | ✓    |
-aarch64-linux-android         |      | ✓    |
-arm-linux-androideabi         |      | ✓    |
+Everything below is built on every release and attached to it. Anything not
+listed may still compile, it just is not checked or shipped.
+
+| Target triple | CLI | Library |
+|---|:---:|:---:|
+| `x86_64-unknown-linux-gnu` | ✓ | ✓ |
+| `aarch64-unknown-linux-gnu` | ✓ | ✓ |
+| `armv7-unknown-linux-gnueabihf` | ✓ | ✓ |
+| `aarch64-apple-darwin` | ✓ | ✓ |
+| `x86_64-pc-windows-msvc` | | ✓ |
+| `aarch64-linux-android` | | ✓ |
+| `armv7-linux-androideabi` | | ✓ |
+| `i686-linux-android` | | ✓ |
+| `x86_64-linux-android` | | ✓ |
+
+Both Linux targets and macOS build on native runners, so their test suites run
+rather than merely compiling. `armv7` and the Android ABIs are cross-compiled
+and only checked to build.
+
+> [!NOTE]
+> This table used to list `armv7-apple-ios`, a target Rust no longer has, and
+> `x86_64-apple-darwin` while omitting `aarch64-apple-darwin`, which is every
+> Mac since 2020. Intel macOS is deliberately not shipped. The table was
+> inherited from upstream and had drifted; it now matches what the release
+> workflow produces.
 
 ### Linux
 

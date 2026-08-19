@@ -3,7 +3,12 @@
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.0] - 2026-08-20
+
+The project is now **awgtun**, published from
+[AYastrebov/awgtun](https://github.com/AYastrebov/awgtun). It was called
+boringtun, which is Cloudflare's crate name and was never available to this
+fork. See the rename entry under Changed for what that breaks.
 
 ### Added
 - AmneziaWG 3.1: `random_trailers` and `disable_cookies`, at parity with amneziawg-go `1b86b2a`. Random trailers append a random number of bytes to each initiation, response and cookie reply — outside the MAC, trimmed by the receiver using the message's fixed size — and widen transport content padding inside the AEAD when `content_padding_addition` is unset. Their length is bounded by a per-peer sliding UDP window that tracks the largest datagram the tunnel has carried and resets when the endpoint changes. `disable_cookies` withholds cookie replies without changing the rate limiter's decision. Both default to off, and both peers must agree on `random_trailers`: a receiver only tolerates a trailing byte when it is enabled. Configurable through `Amnezia3Config`, the UAPI socket, and the C FFI (`random_trailers`/`disable_cookies` appended to `amnezia3_config`, so existing field offsets are unchanged).
@@ -23,6 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `HeaderConfig::validate_wireguard_compatible` and the `ConfigError` variants `StandardHeaderValue`, `InitPacketRequiresI1` and `InitPacketGap`. The rules they expressed are not part of the protocol either; `HeaderConfig::validate` now checks only for overlap, which is all amneziawg-go checks.
 
 ### Changed
+- **Renamed from `boringtun` to `awgtun`.** The library crate is `awgtun` and the binary is `awgtun-cli`; `use boringtun::` becomes `use awgtun::`. The JNI class moves to `io.github.ayastrebov.awgtun.AwgTunJNI`, which breaks the ABI for anything already built against the old exports. `repository` and `documentation` pointed at cloudflare/boringtun and docs.rs/boringtun and now point here; `keywords` and `categories` are set so the crate is findable under "amneziawg" despite the name. BSD-3-Clause requires no name to be kept, and `LICENSE.md` retains Cloudflare's copyright notice as clauses 1 and 2 require.
+- Version restarts at 0.8.0. The inherited 0.7.1 collided with a real, unrelated crates.io release of the same number.
+- Supported platforms table corrected. It advertised `armv7-apple-ios`, a target Rust no longer has, and omitted `aarch64-apple-darwin`, which is every Mac since 2020. It now lists exactly what the release workflow builds.
 - Minimum supported Rust version raised from 1.78 to 1.85. 1.78 was never a compatibility promise — it was the floor implied by `Cargo.lock` being format v4 — and holding it meant pinning transitive crates that had already moved past it. `awgtun-cli` has required 1.88 throughout.
 - Dependencies refreshed to their latest semver-compatible releases. `chacha20poly1305` and `aead` no longer name pre-release versions (`0.10.0-pre.1`, `0.5.0-pre.2`) in their requirements, which had left `cargo update` free to pull an unreleased AEAD into the packet path.
 - Keepalives now carry the S4 padding prefix, matching amneziawg-go. This changes the wire size of keepalives for existing AmneziaWG 2.0 configurations with a non-zero S4.

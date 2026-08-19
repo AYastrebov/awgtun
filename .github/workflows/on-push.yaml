@@ -39,6 +39,7 @@ jobs:
       - deny
       - tests
       - integration-tests
+      - cross-build
       - test-windows
     steps:
       - run: exit 0
@@ -138,6 +139,60 @@ jobs:
       # back to keep a number that nothing depends on.
       - run: cargo check --locked -p awgtun --lib
       - run: cargo check --locked -p awgtun --lib --features device
+
+  # Every target the README advertises and the release workflow ships. Without
+  # this, a cross-compilation break is only discovered at release time, when the
+  # tag is already pushed and the fix means a new one.
+  cross-build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Native ARM64 runner rather than `cross`, so this target gets its
+          # tests run and not merely compiled. Emulated or cross-compiled ARM
+          # would only tell us it builds.
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            cross: false
+            test: true
+          - target: armv7-unknown-linux-gnueabihf
+            os: ubuntu-latest
+            cross: true
+          # macos-latest is Apple Silicon, so this is a native build too.
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            cross: false
+            test: true
+          - target: aarch64-linux-android
+            os: ubuntu-latest
+            cross: true
+          - target: armv7-linux-androideabi
+            os: ubuntu-latest
+            cross: true
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - uses: taiki-e/install-action@cross
+        if: matrix.cross
+      # The library is the part that has to build everywhere. The CLI needs a
+      # TUN stack and is only shipped for the platforms that have one.
+      - name: Build library
+        run: ${{ matrix.cross && 'cross' || 'cargo' }} build --locked -p awgtun --lib --target ${{ matrix.target }} --features ffi-bindings
+      - name: Build CLI
+        if: "!contains(matrix.target, 'android')"
+        run: ${{ matrix.cross && 'cross' || 'cargo' }} build --locked -p awgtun-cli --target ${{ matrix.target }}
+      # Only where the runner is the target architecture. A cross-compiled
+      # binary cannot be executed here, and "it compiled" is a much weaker
+      # claim than "its tests pass".
+      - name: Test
+        if: matrix.test
+        run: cargo test --locked -p awgtun --target ${{ matrix.target }} --features device
 
   deny:
     runs-on: ubuntu-latest
