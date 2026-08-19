@@ -40,6 +40,7 @@ jobs:
       - tests
       - integration-tests
       - cross-build
+      - android-build
       - test-windows
     steps:
       - run: exit 0
@@ -157,18 +158,13 @@ jobs:
             test: true
           - target: armv7-unknown-linux-gnueabihf
             os: ubuntu-latest
-            cross: true
+            cross: false
+            armv7: true
           # macos-latest is Apple Silicon, so this is a native build too.
           - target: aarch64-apple-darwin
             os: macos-latest
             cross: false
             test: true
-          - target: aarch64-linux-android
-            os: ubuntu-latest
-            cross: true
-          - target: armv7-linux-androideabi
-            os: ubuntu-latest
-            cross: true
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
@@ -180,12 +176,27 @@ jobs:
           key: ${{ matrix.target }}
       - uses: taiki-e/install-action@cross
         if: matrix.cross
+      # `cross` cannot build this target: ring's build script passes
+      # -mno-omit-leaf-frame-pointer, which is an x86 GCC option that no ARM
+      # gcc accepts. clang takes it on every architecture, so it compiles the C
+      # and the GNU toolchain only links.
+      - name: ARM cross toolchain
+        if: matrix.armv7
+        run: sudo apt-get update && sudo apt-get install -y gcc-arm-linux-gnueabihf
       # The library is the part that has to build everywhere. The CLI needs a
       # TUN stack and is only shipped for the platforms that have one.
       - name: Build library
+        env:
+          CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
+          CC_armv7_unknown_linux_gnueabihf: clang
+          CFLAGS_armv7_unknown_linux_gnueabihf: --target=arm-linux-gnueabihf --sysroot=/usr/arm-linux-gnueabihf
         run: ${{ matrix.cross && 'cross' || 'cargo' }} build --locked -p awgtun --lib --target ${{ matrix.target }} --features ffi-bindings
       - name: Build CLI
         if: "!contains(matrix.target, 'android')"
+        env:
+          CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
+          CC_armv7_unknown_linux_gnueabihf: clang
+          CFLAGS_armv7_unknown_linux_gnueabihf: --target=arm-linux-gnueabihf --sysroot=/usr/arm-linux-gnueabihf
         run: ${{ matrix.cross && 'cross' || 'cargo' }} build --locked -p awgtun-cli --target ${{ matrix.target }}
       # Only where the runner is the target architecture. A cross-compiled
       # binary cannot be executed here, and "it compiled" is a much weaker
@@ -193,6 +204,26 @@ jobs:
       - name: Test
         if: matrix.test
         run: cargo test --locked -p awgtun --target ${{ matrix.target }} --features device
+
+  # cargo-ndk with a real NDK, the same way the release workflow builds these.
+  # `cross` cannot: its Android images fail to link against libunwind.
+  android-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      - uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r27c
+      - run: cargo install cargo-ndk --locked
+      - name: Build every ABI
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: cargo ndk -t arm64-v8a -t armeabi-v7a -t x86 -t x86_64 build --locked -p awgtun --features jni-bindings
 
   deny:
     runs-on: ubuntu-latest

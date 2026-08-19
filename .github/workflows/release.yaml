@@ -70,7 +70,8 @@ jobs:
             cross: false
           - target: armv7-unknown-linux-gnueabihf
             os: ubuntu-latest
-            cross: true
+            cross: false
+            armv7: true
           - target: aarch64-apple-darwin
             os: macos-latest
             cross: false
@@ -85,7 +86,17 @@ jobs:
           key: release-${{ matrix.target }}
       - uses: taiki-e/install-action@cross
         if: matrix.cross
+      # ring's build script passes -mno-omit-leaf-frame-pointer, an x86 GCC
+      # option no ARM gcc accepts. clang takes it everywhere, so it compiles the
+      # C and the GNU toolchain only links.
+      - name: ARM cross toolchain
+        if: matrix.armv7
+        run: sudo apt-get update && sudo apt-get install -y gcc-arm-linux-gnueabihf
       - name: Build
+        env:
+          CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
+          CC_armv7_unknown_linux_gnueabihf: clang
+          CFLAGS_armv7_unknown_linux_gnueabihf: --target=arm-linux-gnueabihf --sysroot=/usr/arm-linux-gnueabihf
         run: ${{ matrix.cross && 'cross' || 'cargo' }} build --locked --release -p awgtun-cli --target ${{ matrix.target }}
       - name: Package
         run: |
@@ -118,7 +129,8 @@ jobs:
             cross: false
           - target: armv7-unknown-linux-gnueabihf
             os: ubuntu-latest
-            cross: true
+            cross: false
+            armv7: true
           - target: aarch64-apple-darwin
             os: macos-latest
             cross: false
@@ -138,7 +150,17 @@ jobs:
           key: release-ffi-${{ matrix.target }}
       - uses: taiki-e/install-action@cross
         if: matrix.cross
+      # ring's build script passes -mno-omit-leaf-frame-pointer, an x86 GCC
+      # option no ARM gcc accepts. clang takes it everywhere, so it compiles the
+      # C and the GNU toolchain only links.
+      - name: ARM cross toolchain
+        if: matrix.armv7
+        run: sudo apt-get update && sudo apt-get install -y gcc-arm-linux-gnueabihf
       - name: Build
+        env:
+          CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
+          CC_armv7_unknown_linux_gnueabihf: clang
+          CFLAGS_armv7_unknown_linux_gnueabihf: --target=arm-linux-gnueabihf --sysroot=/usr/arm-linux-gnueabihf
         run: ${{ matrix.cross && 'cross' || 'cargo' }} build --locked --release -p awgtun --lib --target ${{ matrix.target }} --features ffi-bindings
       # bash on the Windows runner too, so one packaging script covers every
       # target; only the library filenames differ.
