@@ -2214,16 +2214,18 @@ mod tests {
         assert_eq!(classified.msg_size, None);
     }
 
-    /// Regression test for the shape of amneziawg-go's cookie trailer bug
-    /// (upstream issue #178). There, `SendHandshakeCookie` passes the trailer
-    /// length as the slice *capacity* rather than adding it to the length, so
-    /// the reply either panics the process or goes out with an empty trailer —
-    /// on every draw, meaning the feature never works on that path.
+    /// Regression test for the shape of a bug amneziawg-go shipped in
+    /// `v3.1.20260813` and fixed in `1b86b2a` after being reported from here
+    /// (upstream issue #178). `SendHandshakeCookie` passed the trailer length
+    /// as the slice capacity rather than adding it to the length, so the reply
+    /// either panicked the process or went out with an empty trailer, on every
+    /// reachable draw.
     ///
     /// Rust cannot reproduce the panic half: there is no `make(len, cap)` to
     /// get wrong, and `trailer_for` clamps to the space left in `dst` so the
-    /// slice index cannot overrun. The half worth pinning is the quiet one:
-    /// that a cookie reply really does grow.
+    /// slice index cannot overrun. The half worth pinning is the quiet one,
+    /// that a cookie reply really does grow, since nothing about the language
+    /// stops someone computing a trailer here and then dropping it.
     #[test]
     fn awg31_cookie_reply_actually_carries_a_trailer() {
         let key = [0x42u8; 32];

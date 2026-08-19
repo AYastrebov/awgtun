@@ -150,7 +150,7 @@ releases. All three are the current `master` and the newest tag of their repo.
 
 | Repo | Release | Commit | Date |
 |---|---|---|---|
-| [amneziawg-go](https://github.com/amnezia-vpn/amneziawg-go) | `v3.1.20260813` | `08271d0` | 2026-08-13 |
+| [amneziawg-go](https://github.com/amnezia-vpn/amneziawg-go) | `v3.1.20260814` | `1b86b2a` | 2026-08-13 |
 | [amneziawg-tools](https://github.com/amnezia-vpn/amneziawg-tools) | `v3.1.20260812` | `ee0f0a9` | 2026-08-13 |
 | [amneziawg-linux-kernel-module](https://github.com/amnezia-vpn/amneziawg-linux-kernel-module) | `v3.1.20260812` | `4680320` | 2026-08-13 |
 
@@ -170,7 +170,7 @@ to 2025-11-04), so it is a stale experiment rather than the next release.
 ## AmneziaWG 3.1
 
 Two device-scoped booleans, both off by default. Audited and implemented
-2026-08-13 against amneziawg-go `08271d0`, which is the reference the wire
+2026-08-13 against amneziawg-go `1b86b2a`, which is the reference the wire
 behaviour below follows.
 
 | Parameter | `.conf` | UAPI | `awg set` |
@@ -238,24 +238,34 @@ This implementation already did both, so neither needed a change:
 - The header type is compared as little-endian (`le32_to_cpu`). `u32::from_le_bytes`
   has always been used here, so it was never wrong on a big-endian target.
 
-### A bug in amneziawg-go's cookie trailer
+### The cookie trailer bug, and why this fork never had it
 
-`SendHandshakeCookie` in `device/send.go` at `08271d0` allocates
+Fixed upstream in `1b86b2a` (`v3.1.20260814`), reported from here as
+[amneziawg-go#178](https://github.com/amnezia-vpn/amneziawg-go/issues/178).
+Worth keeping written down, because the reason this fork was not affected is a
+rule rather than luck.
+
+As shipped in `v3.1.20260813`, `SendHandshakeCookie` allocated
 
 ```go
 buf := make([]byte, padding+MessageCookieReplySize, trailerLen)
 ```
 
-which passes `trailerLen` as the slice's *capacity* rather than adding it to the
-length. Go panics when a `make` capacity is below its length, so with random
-trailers enabled this crashes whenever the drawn `trailerLen` is under
-`padding + 64`, and produces a zero-length trailer when it is not. Reaching it
-needs the device to be under load and `disable_cookies` off.
+passing `trailerLen` as the slice's capacity instead of adding it to the length.
+Go panics when a `make` capacity is below its length, so with random trailers on
+that crashed the process whenever the drawn value was under `padding + 64`, and
+sent a reply with no trailer when it was not. Every reachable draw hit one or
+the other, so the trailer never went out on that path. Measured over the whole
+reachable range: 15% panics at `S3=0`, 19% at `S3=16`, empty trailer otherwise.
 
-This fork implements the intent — a cookie reply gets a trailer sized from the
-window, like the other two handshake types — rather than reproducing the bug.
-Nothing interoperates differently either way: the trailer is trimmed by the
-receiver, so a peer cannot tell whether one was appended.
+The initiation and response paths were correct throughout, and the fix was to
+make the third site match them.
+
+That is the same reason this fork was unaffected. The three trailer sites here
+were written to do the same thing as each other, so there was no odd one out to
+get wrong. `awg31_cookie_reply_actually_carries_a_trailer` pins the behaviour
+the upstream bug removed — that a cookie reply really does grow — and it fails
+if our cookie path is rewritten into the shape upstream had.
 
 ### Header protection
 
