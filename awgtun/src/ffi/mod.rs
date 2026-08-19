@@ -5,7 +5,7 @@
 // pointers and buffers/lengths to these, ok?
 #![allow(clippy::missing_safety_doc)]
 
-//! C bindings for the BoringTun library
+//! C bindings for the awgtun library
 use super::noise::{Tunn, TunnResult};
 use crate::amnezia::{
     Amnezia2Config, Amnezia3Config, CpsChain, HeaderConfig, HeaderRange, InitPacketConfig,

@@ -56,7 +56,7 @@ Don't just fix the error. Trace up to the constraint that caused it.
 
 ### This project's concurrency model
 
-There is no async runtime here — no tokio, no `.await`, anywhere. `boringtun`
+There is no async runtime here — no tokio, no `.await`, anywhere. `awgtun`
 runs a fixed pool of OS threads, each in its own event loop over epoll (Linux)
 or kqueue (macOS). Reach for threads, locks and atomics; treat any suggestion to
 "just make it async" as out of scope.

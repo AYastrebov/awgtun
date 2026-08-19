@@ -1,7 +1,7 @@
 ---
 name: amnezia-dev
 description: >
-  AmneziaWG 2.0/3.0 development skill for the boringtun fork. Covers protocol
+  AmneziaWG 2.0/3.0 development skill for the awgtun fork. Covers protocol
   implementation, obfuscation parameters, rebase workflow, auditing against
   amneziawg-go, debugging, testing against a live server, and extending the
   codebase. Use this skill whenever working on AmneziaWG features, investigating
@@ -19,7 +19,7 @@ description: >
 # AmneziaWG 2.0 / 3.0 Development Guide
 
 Context for developing, debugging, auditing and maintaining the AmneziaWG 2.0
-and 3.0 implementation in this boringtun fork.
+and 3.0 implementation in this fork of boringtun.
 
 Repo docs worth reading alongside this skill:
 - `CLAUDE.md` — structure, build/test commands, integration points
@@ -223,15 +223,15 @@ If a device test sends *nothing at all* — no handshake, no junk, silence on th
 wire — check how the test binary was built before you touch protocol code:
 
 ```bash
-cargo test -p boringtun --lib --features device --no-run   # correct
-cargo test -p boringtun --lib --all-features --no-run      # clock is frozen
+cargo test -p awgtun --lib --features device --no-run   # correct
+cargo test -p awgtun --lib --all-features --no-run      # clock is frozen
 ```
 
 `--all-features` enables `mock-instant`, which freezes `Instant::now()`. Every
 timer computes an elapsed time of zero forever, so no keepalive fires, no
 handshake starts, and every device integration test fails in a way that looks
 exactly like a protocol bug. This has burned an entire debugging session. CI is
-fine — `cargo test -- --ignored` picks up `device` through `boringtun-cli` and
+fine — `cargo test -- --ignored` picks up `device` through `awgtun-cli` and
 leaves `mock-instant` off.
 
 ### Handshake never completes
@@ -349,18 +349,18 @@ two plain WireGuard devices handshake happily.
 ```bash
 # Unit tests. The .cargo/config.toml runner is `sudo -E`, so build then run the
 # binary directly to avoid the sudo prompt.
-cargo test -p boringtun --lib --no-run
-./target/debug/deps/boringtun-* --no-capture
-./target/debug/deps/boringtun-* amnezia --no-capture   # AWG subset
+cargo test -p awgtun --lib --no-run
+./target/debug/deps/awgtun-* --no-capture
+./target/debug/deps/awgtun-* amnezia --no-capture   # AWG subset
 
 # Device integration tests: need the `device` feature, root, and --ignored.
 # Never --all-features here (see the mock-instant trap above).
-cargo test -p boringtun --lib --features device --no-run
-sudo -E ./target/debug/deps/boringtun-* --ignored --test-threads 1 awg
+cargo test -p awgtun --lib --features device --no-run
+sudo -E ./target/debug/deps/awgtun-* --ignored --test-threads 1 awg
 
 # Feature builds
-cargo build --lib -p boringtun --features ffi-bindings
-cargo build --lib -p boringtun --features jni-bindings
+cargo build --lib -p awgtun --features ffi-bindings
+cargo build --lib -p awgtun --features jni-bindings
 ```
 
 Some device integration tests spin up Docker containers; filtering by `awg` or

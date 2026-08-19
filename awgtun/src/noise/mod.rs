@@ -656,7 +656,7 @@ impl Tunn {
 
     /// AWG 3.0 content padding addition: a random pick from the configured
     /// range, clamped to the space left in the last MTU segment. Mirrors
-    /// amneziawg-go's `randomPaddingAddition`; boringtun never pads content to a
+    /// amneziawg-go's `randomPaddingAddition`; this implementation never pads content to a
     /// multiple of 16, so the addition applies as-is.
     fn content_padding_addition(&self, packet_size: usize, dst_len: usize) -> usize {
         let range = match self.content_padding {

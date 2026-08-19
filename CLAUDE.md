@@ -7,7 +7,7 @@ This is a fork of [cloudflare/boringtun](https://github.com/cloudflare/boringtun
 ## Repository Structure
 
 ```
-boringtun/              # Main library crate
+awgtun/                 # Main library crate
   src/
     amnezia.rs          # AmneziaWG 2.0/3.0 config, CPS generator, junk generation,
                         # header protection primitive
@@ -20,7 +20,7 @@ boringtun/              # Main library crate
     device/             # Optional TUN device integration (feature-gated)
     ffi/                # C FFI bindings
     lib.rs
-boringtun-cli/          # Optional CLI binary
+awgtun-cli/             # Optional CLI binary
 ```
 
 ## A real server's parameters are secret
@@ -74,7 +74,7 @@ See `.claude/skills/amnezia-dev/references/rebase-guide.md`.
 ## Building
 
 ```bash
-cargo build --lib -p boringtun --release
+cargo build --lib -p awgtun --release
 ```
 
 ## Testing
@@ -82,27 +82,27 @@ cargo build --lib -p boringtun --release
 The `.cargo/config.toml` sets `runner = 'sudo -E'` for TUN device tests. To run unit tests without sudo, build then run the binary directly:
 
 ```bash
-cargo test -p boringtun --lib --no-run
-./target/debug/deps/boringtun-* --no-capture
+cargo test -p awgtun --lib --no-run
+./target/debug/deps/awgtun-* --no-capture
 ```
 
 To run only AmneziaWG tests:
 ```bash
-./target/debug/deps/boringtun-* amnezia --no-capture
+./target/debug/deps/awgtun-* amnezia --no-capture
 ```
 
 The device integration tests are `#[ignore]`d and need root and a TUN device:
 
 ```bash
-cargo test -p boringtun --lib --features device --no-run
-sudo -E ./target/debug/deps/boringtun-* --ignored --test-threads 1 awg
+cargo test -p awgtun --lib --features device --no-run
+sudo -E ./target/debug/deps/awgtun-* --ignored --test-threads 1 awg
 ```
 
 **Never build them with `--all-features`.** That turns on `mock-instant`, which
 freezes the clock, so no timer ever fires, nothing is ever sent, and every
 device integration test fails in a way that looks like a protocol bug. CI's
 `cargo test -- --ignored` is fine — it picks up `device` through
-`boringtun-cli`'s dependency and leaves `mock-instant` off.
+`awgtun-cli`'s dependency and leaves `mock-instant` off.
 
 ## AmneziaWG Integration Points
 

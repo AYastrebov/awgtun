@@ -9,9 +9,9 @@
 # a comment saying why the advisory does not apply to how we use the crate.
 ignore = [
     # RUSTSEC-2025-0069: `daemonize` is unmaintained, with an unmerged fix for
-    # some UB and no safe upgrade available. It is used by boringtun-cli only,
+    # some UB and no safe upgrade available. It is used by awgtun-cli only,
     # to fork into the background, and never by the library, so nothing that
-    # links libboringtun is exposed to it. Worth replacing — the fork it
+    # links libawgtun is exposed to it. Worth replacing — the fork it
     # performs is also what `FastRandom`'s pthread_atfork guard exists for.
     "RUSTSEC-2025-0069",
 ]

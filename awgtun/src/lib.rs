@@ -5,7 +5,7 @@
 //! obfuscation, with no network or tunnel stack of its own.
 //!
 //! ```text
-//! git clone https://github.com/cloudflare/boringtun.git
+//! git clone https://github.com/AYastrebov/awgtun.git
 //! ```
 
 #[cfg(feature = "device")]

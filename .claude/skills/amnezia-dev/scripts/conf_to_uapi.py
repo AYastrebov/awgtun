@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Translate an AmneziaWG .conf into a boringtun UAPI `set=1` block.
+"""Translate an AmneziaWG .conf into an awgtun UAPI `set=1` block.
 
 A .conf and the UAPI socket are different formats: .conf names the 3.0 fields in
 CamelCase and encodes keys in base64, UAPI uses snake_case and hex. `awg setconf`

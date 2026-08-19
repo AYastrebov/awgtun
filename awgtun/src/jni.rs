@@ -4,7 +4,7 @@
 // temporary, we need to do some verification around these bindings later
 #![allow(clippy::missing_safety_doc)]
 
-/// JNI bindings for BoringTun library
+/// JNI bindings for the awgtun library
 use std::os::raw::c_char;
 use std::ptr;
 
@@ -40,7 +40,7 @@ pub extern "C" fn log_print(_log_string: *const c_char) {
 }
 
 /// Generates new x25519 secret key and converts into java byte array.
-#[export_name = "Java_io_github_ayastrebov_boringtun_BoringTunJNI_x25519_1secret_1key"]
+#[export_name = "Java_io_github_ayastrebov_awgtun_AwgTunJNI_x25519_1secret_1key"]
 pub extern "C" fn generate_secret_key(env: JNIEnv, _class: JClass) -> jbyteArray {
     match env.byte_array_from_slice(&x25519_secret_key().key) {
         Ok(v) => v,
@@ -49,7 +49,7 @@ pub extern "C" fn generate_secret_key(env: JNIEnv, _class: JClass) -> jbyteArray
 }
 
 /// Computes public x25519 key from secret key and converts into java byte array.
-#[export_name = "Java_io_github_ayastrebov_boringtun_BoringTunJNI_x25519_1public_1key"]
+#[export_name = "Java_io_github_ayastrebov_awgtun_AwgTunJNI_x25519_1public_1key"]
 pub unsafe extern "C" fn generate_public_key1(
     env: JNIEnv,
     _class: JClass,
@@ -75,7 +75,7 @@ pub unsafe extern "C" fn generate_public_key1(
 }
 
 /// Converts x25519 key to hex string.
-#[export_name = "Java_io_github_ayastrebov_boringtun_BoringTunJNI_x25519_1key_1to_1hex"]
+#[export_name = "Java_io_github_ayastrebov_awgtun_AwgTunJNI_x25519_1key_1to_1hex"]
 pub unsafe extern "C" fn convert_x25519_key_to_hex(
     env: JNIEnv,
     _class: JClass,
@@ -100,7 +100,7 @@ pub unsafe extern "C" fn convert_x25519_key_to_hex(
 }
 
 /// Converts x25519 key to base64 string.
-#[export_name = "Java_io_github_ayastrebov_boringtun_BoringTunJNI_x25519_1key_1to_1base64"]
+#[export_name = "Java_io_github_ayastrebov_awgtun_AwgTunJNI_x25519_1key_1to_1base64"]
 pub unsafe extern "C" fn convert_x25519_key_to_base64(
     env: JNIEnv,
     _class: JClass,
@@ -126,7 +126,7 @@ pub unsafe extern "C" fn convert_x25519_key_to_base64(
 }
 
 /// Creates new tunnel
-#[export_name = "Java_io_github_ayastrebov_boringtun_BoringTunJNI_new_1tunnel"]
+#[export_name = "Java_io_github_ayastrebov_awgtun_AwgTunJNI_new_1tunnel"]
 pub unsafe extern "C" fn create_new_tunnel(
     env: JNIEnv,
     _class: JClass,
@@ -182,7 +182,7 @@ pub unsafe extern "C" fn create_new_tunnel(
 /// caller must drain `wireguard_poll_outgoing_packet` until it returns 0 and
 /// send each datagram before the handshake initiation. Junk packets and the
 /// I1-I5 signature packets are delivered only through that queue.
-#[export_name = "Java_io_github_ayastrebov_boringtun_BoringTunJNI_new_1tunnel_1amnezia3"]
+#[export_name = "Java_io_github_ayastrebov_awgtun_AwgTunJNI_new_1tunnel_1amnezia3"]
 pub unsafe extern "C" fn create_new_amnezia3_tunnel(
     env: JNIEnv,
     _class: JClass,
@@ -246,7 +246,7 @@ pub unsafe extern "C" fn create_new_amnezia3_tunnel(
 /// Call in a loop until it returns 0 after creating a tunnel and after every
 /// `wireguard_write` / `wireguard_tick`, sending each datagram to the network
 /// before the handshake initiation those calls produced.
-#[export_name = "Java_io_github_ayastrebov_boringtun_BoringTunJNI_wireguard_1poll_1outgoing_1packet"]
+#[export_name = "Java_io_github_ayastrebov_awgtun_AwgTunJNI_wireguard_1poll_1outgoing_1packet"]
 pub unsafe extern "C" fn poll_outgoing_packet(
     env: JNIEnv,
     _class: JClass,
@@ -265,7 +265,7 @@ pub unsafe extern "C" fn poll_outgoing_packet(
 /// Frees a tunnel created by `new_tunnel` or `new_tunnel_amnezia3`.
 ///
 /// The handle must not be used afterwards. Passing 0 is a no-op.
-#[export_name = "Java_io_github_ayastrebov_boringtun_BoringTunJNI_tunnel_1free"]
+#[export_name = "Java_io_github_ayastrebov_awgtun_AwgTunJNI_tunnel_1free"]
 pub unsafe extern "C" fn free_tunnel(_env: JNIEnv, _class: JClass, tunnel: jlong) {
     if tunnel == 0 {
         return;
@@ -274,7 +274,7 @@ pub unsafe extern "C" fn free_tunnel(_env: JNIEnv, _class: JClass, tunnel: jlong
 }
 
 /// Encrypts raw IP packets into WG formatted packets.
-#[export_name = "Java_io_github_ayastrebov_boringtun_BoringTunJNI_wireguard_1write"]
+#[export_name = "Java_io_github_ayastrebov_awgtun_AwgTunJNI_wireguard_1write"]
 pub unsafe extern "C" fn encrypt_raw_packet(
     env: JNIEnv,
     _class: JClass,
@@ -308,7 +308,7 @@ pub unsafe extern "C" fn encrypt_raw_packet(
 }
 
 /// Decrypts WG formatted packets into raw IP packets.
-#[export_name = "Java_io_github_ayastrebov_boringtun_BoringTunJNI_wireguard_1read"]
+#[export_name = "Java_io_github_ayastrebov_awgtun_AwgTunJNI_wireguard_1read"]
 pub unsafe extern "C" fn decrypt_to_raw_packet(
     env: JNIEnv,
     _class: JClass,
@@ -343,7 +343,7 @@ pub unsafe extern "C" fn decrypt_to_raw_packet(
 }
 
 /// Periodic function that writes WG formatted packets into destination buffer
-#[export_name = "Java_io_github_ayastrebov_boringtun_BoringTunJNI_wireguard_1tick"]
+#[export_name = "Java_io_github_ayastrebov_awgtun_AwgTunJNI_wireguard_1tick"]
 pub unsafe extern "C" fn run_periodic_task(
     env: JNIEnv,
     _class: JClass,

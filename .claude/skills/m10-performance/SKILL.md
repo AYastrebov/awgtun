@@ -1,6 +1,6 @@
 ---
 name: m10-performance
-description: Use when a change is motivated by speed or allocation, or when judging whether an optimization is worth its complexity. Measure before optimizing. The hot path here is per-packet — `encapsulate`/`decapsulate` in `noise/mod.rs` and the event loop in `device/mod.rs`, which deliberately reuse 64 KiB per-thread buffers rather than allocating; crypto is benchmarked with criterion under `boringtun/benches/crypto_benches`. Note that AmneziaWG's junk and padding trade bandwidth for obfuscation by design, so "wasteful" allocation there may be the point. Triggers on performance, optimization, benchmark, criterion, profiling, flamegraph, slow, allocation, zero-copy, cache, SIMD, make it faster.
+description: Use when a change is motivated by speed or allocation, or when judging whether an optimization is worth its complexity. Measure before optimizing. The hot path here is per-packet — `encapsulate`/`decapsulate` in `noise/mod.rs` and the event loop in `device/mod.rs`, which deliberately reuse 64 KiB per-thread buffers rather than allocating; crypto is benchmarked with criterion under `awgtun/benches/crypto_benches`. Note that AmneziaWG's junk and padding trade bandwidth for obfuscation by design, so "wasteful" allocation there may be the point. Triggers on performance, optimization, benchmark, criterion, profiling, flamegraph, slow, allocation, zero-copy, cache, SIMD, make it faster.
 ---
 
 # Performance Optimization

@@ -1,8 +1,8 @@
-use boringtun::amnezia::{
+use awgtun::amnezia::{
     Amnezia2Config, Amnezia3Config, HeaderConfig, HeaderRange, JunkConfig, PaddingConfig,
     TimingRanges, U32Range,
 };
-use boringtun::noise::{Tunn, TunnResult};
+use awgtun::noise::{Tunn, TunnResult};
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput};
 use rand_core::OsRng;
 

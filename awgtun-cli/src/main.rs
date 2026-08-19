@@ -1,8 +1,8 @@
 // Copyright (c) 2019 Cloudflare, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
-use boringtun::device::drop_privileges::drop_privileges;
-use boringtun::device::{DeviceConfig, DeviceHandle};
+use awgtun::device::drop_privileges::drop_privileges;
+use awgtun::device::{DeviceConfig, DeviceHandle};
 use clap::builder::PossibleValuesParser;
 use clap::{Arg, ArgAction, Command};
 use daemonize::{Daemonize, Outcome};
@@ -14,7 +14,7 @@ use tracing::Level;
 fn check_tun_name(v: &str) -> Result<String, String> {
     #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
     {
-        if boringtun::device::tun::parse_utun_name(v).is_ok() {
+        if awgtun::device::tun::parse_utun_name(v).is_ok() {
             Ok(v.to_owned())
         } else {
             Err("Tunnel name must have the format 'utun[0-9]+', use 'utun' for automatic assignment".to_owned())
@@ -27,7 +27,7 @@ fn check_tun_name(v: &str) -> Result<String, String> {
 }
 
 fn main() {
-    let matches = Command::new("boringtun")
+    let matches = Command::new("awgtun-cli")
         .version(env!("CARGO_PKG_VERSION"))
         .author("Vlad Krasnov <vlad@cloudflare.com>")
         .args(&[
@@ -70,7 +70,7 @@ fn main() {
                 .short('l')
                 .env("WG_LOG_FILE")
                 .help("Log file")
-                .default_value("/tmp/boringtun.out"),
+                .default_value("/tmp/awgtun.out"),
             Arg::new("disable-drop-privileges")
                 .long("disable-drop-privileges")
                 .env("WG_SUDO")
@@ -146,18 +146,18 @@ fn main() {
             Outcome::Parent(Ok(_)) => {
                 let mut b = [0u8; 1];
                 if sock2.recv(&mut b).is_ok() && b[0] == 1 {
-                    println!("BoringTun started successfully");
+                    println!("awgtun started successfully");
                     exit(0);
                 } else {
-                    eprintln!("BoringTun failed to start");
+                    eprintln!("awgtun failed to start");
                     exit(1);
                 }
             }
             Outcome::Parent(Err(e)) => {
-                eprintln!("BoringTun failed to fork: {e}");
+                eprintln!("awgtun failed to fork: {e}");
                 exit(1);
             }
-            Outcome::Child(Ok(_)) => tracing::info!("BoringTun started successfully"),
+            Outcome::Child(Ok(_)) => tracing::info!("awgtun started successfully"),
             Outcome::Child(Err(e)) => {
                 tracing::error!(error = ?e);
                 exit(1);
@@ -201,7 +201,7 @@ fn main() {
     sock1.send(&[1]).unwrap();
     drop(sock1);
 
-    tracing::info!("BoringTun started successfully");
+    tracing::info!("awgtun started successfully");
 
     device_handle.wait();
 }

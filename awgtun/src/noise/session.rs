@@ -219,7 +219,7 @@ impl Session {
         receiver_index.copy_from_slice(&self.sending_index.to_le_bytes());
         counter.copy_from_slice(&sending_key_counter.to_le_bytes());
 
-        // Note: WireGuard pads content to a multiple of 16; boringtun never has,
+        // Note: WireGuard pads content to a multiple of 16; this implementation never has,
         // and works fine without it. AWG 3.0 content padding is the only content
         // padding applied here, and it is deliberately not 16-aligned.
         let n = {

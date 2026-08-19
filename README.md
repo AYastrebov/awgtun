@@ -1,39 +1,59 @@
-![boringtun logo banner](./banner.png)
+# awgtun
 
-# BoringTun + AmneziaWG 2.0 / 3.0
+[![CI](https://github.com/AYastrebov/awgtun/actions/workflows/on-push.yaml/badge.svg?branch=master)](https://github.com/AYastrebov/awgtun/actions/workflows/on-push.yaml)
+[![License](https://img.shields.io/badge/license-BSD--3--Clause-blue.svg)](LICENSE.md)
+[![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
 
-A fork of [cloudflare/boringtun](https://github.com/cloudflare/boringtun) that speaks [AmneziaWG](https://docs.amnezia.org/documentation/amnezia-wg/) 2.0 and 3.0. WireGuard itself is untouched: leave the AmneziaWG parameters at their defaults and the tunnel is byte-for-byte standard WireGuard.
+AmneziaWG 2.0, 3.0 and 3.1 in Rust, forked from [cloudflare/boringtun](https://github.com/cloudflare/boringtun). WireGuard itself is untouched: leave the AmneziaWG parameters at their defaults and the tunnel is byte-for-byte standard WireGuard.
 
 Both directions work. A tunnel here can initiate a handshake or answer one, so it runs as a client against an AmneziaWG server or as an endpoint two peers connect through.
 
 Two crates:
 
-* **`boringtun`** — the library. WireGuard and AmneziaWG with no network or tunnel stack; you supply the I/O. This is what the FFI and JNI bindings wrap.
-* **`boringtun-cli`** — a [userspace tunnel](https://www.wireguard.com/xplatform/) for Linux and macOS, with AmneziaWG support built in. It listens on the usual WireGuard UAPI socket, so amneziawg-tools' `awg` drives it directly.
+* `awgtun` is the library: WireGuard and AmneziaWG with no network or tunnel stack, so you supply the I/O. The FFI and JNI bindings wrap this.
+* `awgtun-cli` is a [userspace tunnel](https://www.wireguard.com/xplatform/) for Linux and macOS with AmneziaWG built in. It listens on the usual WireGuard UAPI socket, so amneziawg-tools' `awg` drives it directly.
 
 Validated against [amneziawg-go](https://github.com/amnezia-vpn/amneziawg-go), amneziawg-tools and the AmneziaWG kernel module (see [the release of record](AMNEZIA.md#upstream-release-of-record)), and against a live AmneziaWG server.
+
+## Contents
+
+- [Quick start](#quick-start)
+- [What AmneziaWG does](#what-amneziawg-does)
+- [Parameters](#parameters)
+  - [Message headers — H1-H4](#message-headers--h1-h4)
+  - [Message padding — S1-S4](#message-padding--s1-s4)
+  - [Junk packets — Jc, Jmin, Jmax](#junk-packets--jc-jmin-jmax)
+  - [Signature packets — I1-I5](#signature-packets--i1-i5)
+  - [Header protection — 3.0](#header-protection--30)
+  - [Content padding — 3.0](#content-padding--30)
+  - [Timings — 3.0](#timings--30)
+  - [Random trailers and cookie suppression — 3.1](#random-trailers-and-cookie-suppression--31)
+  - [A complete configuration](#a-complete-configuration)
+- [Using the library](#using-the-library)
+- [Supported platforms](#supported-platforms)
+- [License](#license)
 
 ## Quick start
 
 ```bash
 # Build the CLI
-cargo build --bin boringtun-cli --release
+cargo build --bin awgtun-cli --release
 
 # Bring up an interface and hand it an AmneziaWG config
-sudo ./target/release/boringtun-cli awg0
+sudo ./target/release/awgtun-cli awg0
 sudo awg setconf awg0 /etc/amnezia/awg0.conf
 sudo ip addr add 10.0.0.2/32 dev awg0
 sudo ip link set up dev awg0
 sudo awg show awg0
 ```
 
-Building the library instead: `cargo build --lib -p boringtun --release`, adding `--features ffi-bindings` or `--features jni-bindings` for the C and Android surfaces.
+Building the library instead: `cargo build --lib -p awgtun --release`, adding `--features ffi-bindings` or `--features jni-bindings` for the C and Android surfaces.
 
 Tests: the runner uses `sudo` for TUN device tests, so build first and run the binary directly to skip the prompt.
 
 ```bash
-cargo test -p boringtun --lib --no-run
-./target/debug/deps/boringtun-* --no-capture
+cargo test -p awgtun --lib --no-run
+./target/debug/deps/awgtun-* --no-capture
 ```
 
 ## What AmneziaWG does
@@ -96,6 +116,7 @@ Random bytes prepended to each message type, changing packet sizes on the wire. 
 
 Under AmneziaWG 3.0 the first 12 bytes of this prefix double as the header protection nonce, which is why enabling that feature requires every one of S1-S4 to be at least 12.
 
+> [!NOTE]
 > This implementation stores S1-S4 as `u8`, so 255 is the ceiling; upstream parses them as `uint16`. Amnezia's own tooling stays far below either limit.
 
 ### Junk packets — Jc, Jmin, Jmax
@@ -110,6 +131,7 @@ Under AmneziaWG 3.0 the first 12 bytes of this prefix double as the header prote
 
 Because the receiver discards them either way, junk is worth configuring on the client alone. Four to twelve is the usual range.
 
+> [!WARNING]
 > Keep `Jmax` below the system MTU. A junk packet large enough to fragment produces an IP fragment pair, which is itself a distinctive signature, the opposite of what you wanted.
 
 ### Signature packets — I1-I5
@@ -128,7 +150,7 @@ Datagrams built from a tag language, sent ahead of the junk, in order, skipping 
 
 So `I1 = <b 0x160301><r 32><t>` sends a three-byte TLS record header, 32 random bytes and a timestamp. As with junk, the client side alone is enough, and the same MTU warning applies.
 
-### Header protection — AmneziaWG 3.0
+### Header protection — 3.0
 
 Raw ChaCha20 over the low-entropy header fields, so the message type does not appear in the clear even as a random-looking constant. The nonce is the first 12 bytes of the S-padding prefix, which differs per packet.
 
@@ -136,9 +158,15 @@ Raw ChaCha20 over the low-entropy header fields, so the message type does not ap
 
 Handshake, response and cookie messages are encrypted in full, MACs included. Transport packets have only their 16-byte header encrypted, since the AEAD ciphertext already looks like random noise and needs no help. Junk and signature packets are never protected.
 
-Generate a key with `awg genkey`. An all-zero key means disabled. Every one of S1-S4 must be at least 12, since they supply the nonce.
+An all-zero key means disabled.
 
-### Content padding — AmneziaWG 3.0
+> [!TIP]
+> Generate a key with `awg genkey`.
+
+> [!IMPORTANT]
+> Header protection needs every one of S1-S4 to be at least 12, because they supply the nonce.
+
+### Content padding — 3.0
 
 Zero bytes appended to transport content *inside* the AEAD envelope, so the padding is authenticated. No length field is needed: the receiver recovers the real length from the IP total-length field.
 
@@ -146,7 +174,7 @@ Zero bytes appended to transport content *inside* the AEAD envelope, so the padd
 
 The addition is clamped to what remains in the MTU segment, so it never causes fragmentation.
 
-### Timings — AmneziaWG 3.0
+### Timings — 3.0
 
 WireGuard's fixed timing constants become ranges, re-drawn at each use, so a session's rhythm stops being a fingerprint. Any range left unset keeps the standard constant exactly.
 
@@ -161,20 +189,23 @@ All of these are sender-only; they govern this peer's own clock.
 | `MaxHandshakeAttempts` | 18 | retries before giving up |
 | `PersistentKeepalive` | off | per-peer; keepalive interval, re-drawn each time |
 
-### Random trailers and cookie suppression — AmneziaWG 3.1
+### Random trailers and cookie suppression — 3.1
 
-`RandomTrailers = on` puts a random number of bytes on the end of each datagram, so a message with a fixed size stops having one. Initiations, responses and cookie replies carry them outside the MAC, and the receiver trims them by the message's known size. Transport packets instead widen their content padding inside the AEAD, and only when `ContentPaddingAddition` is unset — that one wins if both are set.
-
-**Both ends must set it.** Unlike content padding, a receiver only tolerates a trailing byte when trailers are enabled; otherwise the exact-size test that recognises a handshake message rejects the datagram.
+`RandomTrailers = on` puts a random number of bytes on the end of each datagram, so a message with a fixed size stops having one. Initiations, responses and cookie replies carry them outside the MAC, and the receiver trims them by the message's known size. Transport packets do it differently: they widen their content padding inside the AEAD, and only when `ContentPaddingAddition` is unset, since that one wins when both are configured.
 
 Trailer length is bounded by a sliding window that tracks the largest datagram the tunnel has carried, so packets grow to resemble traffic the peer already sends rather than to a fixed size. The window resets when a peer's endpoint changes.
 
 `DisableCookies = on` stops this end from answering with cookie replies when it is under load. It does not change when a cookie is deemed necessary, only whether one is sent, so a flooding peer gets silence rather than a retry hint. Sender-only.
 
-| Parameter | Default | Both ends? |
-|---|---|---|
-| `RandomTrailers` | off | **yes** |
-| `DisableCookies` | off | no |
+> [!IMPORTANT]
+> `RandomTrailers` has to be set on both ends. Content padding is invisible to a receiver, but a trailer is not: the exact-size test that recognises a handshake message rejects the datagram unless trailers are enabled locally too.
+
+| Parameter | Type | Match | Default |
+|---|---|---|---|
+| `RandomTrailers` | bool | both ends | off |
+| `DisableCookies` | bool | sender only | off |
+
+Booleans accept `0`/`1`, `true`/`false` and `on`/`off`, since the three upstream implementations do not agree on which to write.
 
 ### A complete configuration
 
@@ -219,6 +250,7 @@ AllowedIPs = 0.0.0.0/0
 PersistentKeepalive = 25
 ```
 
+> [!CAUTION]
 > A deployment's parameters are as sensitive as its keys. `H1`-`H4` and `S1`-`S4` are precisely what stop its traffic from resembling WireGuard, so publishing them hands a censor a signature for that server: match the type field, then look for a `148 + S1` byte initiation. Treat a `.conf` accordingly.
 
 Only three rules are enforced, matching upstream: the header ranges must not overlap, S1-S4 must reach 12 when header protection is on, and `Jmin` must not exceed `Jmax`. Everything else Amnezia documents is a recommendation, not a limit.
@@ -228,8 +260,8 @@ Only three rules are enforced, matching upstream: the header ranges must not ove
 ### Rust
 
 ```rust
-use boringtun::amnezia::*;
-use boringtun::noise::Tunn;
+use awgtun::amnezia::*;
+use awgtun::noise::Tunn;
 
 let config = Amnezia2Config {
     headers: HeaderConfig::new(
@@ -264,7 +296,14 @@ let mut tunnel = Tunn::new_with_amnezia3(
 )?;
 ```
 
-One thing to get right: junk and signature packets are queued rather than returned inline. After creating a tunnel, and after every call that can start a handshake, drain the queue and send what it gives you *before* the handshake packet.
+The 3.1 flags live on the same struct and default to off:
+
+```rust
+config.random_trailers = true;   // both peers must agree
+config.disable_cookies = false;  // local
+```
+
+Junk and signature packets are queued rather than returned inline. After creating a tunnel, and after every call that can start a handshake, drain the queue and send what it gives you *before* the handshake packet.
 
 ```rust
 while let Some(packet) = tunnel.poll_outgoing_packet() {
@@ -272,18 +311,19 @@ while let Some(packet) = tunnel.poll_outgoing_packet() {
 }
 ```
 
-Skip it and the tunnel still comes up, which is what makes this so easy to get wrong: `Jc` and `I1`-`I5` just quietly never reach the wire.
+> [!WARNING]
+> Skipping the drain is the easiest mistake to make here, because the tunnel still comes up. `Jc` and `I1`-`I5` simply never reach the wire, and you lose the obfuscation without losing the connection.
 
 ### C FFI
 
-`amnezia_config` and `amnezia3_config` structs with `new_tunnel_amnezia`, `new_tunnel_amnezia3` and `wireguard_poll_outgoing_packet`, declared in `boringtun/src/wireguard_ffi.h`. Full reference in [`AMNEZIA.md`](AMNEZIA.md#c-ffi-api).
+`amnezia_config` and `amnezia3_config` structs with `new_tunnel_amnezia`, `new_tunnel_amnezia3` and `wireguard_poll_outgoing_packet`, declared in `awgtun/src/wireguard_ffi.h`. Full reference in [`AMNEZIA.md`](AMNEZIA.md#c-ffi-api).
 
 ### JNI (Android)
 
-The `jni-bindings` feature exposes the same surface to `VpnService`, through the class `io.github.ayastrebov.boringtun.BoringTunJNI` — the exports are bound to that literal name, so the Kotlin declaration has to match it. Parameters arrive as one UAPI-style block rather than a long argument list:
+The `jni-bindings` feature exposes the same surface to `VpnService`, through the class `io.github.ayastrebov.awgtun.AwgTunJNI`. The exports are bound to that literal name, so the Kotlin declaration has to match it. Parameters arrive as one UAPI-style block rather than a long argument list:
 
 ```kotlin
-val handle = BoringTunJNI.new_tunnel_amnezia3(
+val handle = AwgTunJNI.new_tunnel_amnezia3(
     secretKey, publicKey, presharedKey, keepAlive, index,
     "s1=16\ns2=16\ns3=16\ns4=16\nh1=100-199\nh2=200-299\nh3=300-399\nh4=400-499\n",
 )
@@ -299,12 +339,12 @@ That block uses the UAPI spelling (snake_case names, hex keys), not the CamelCas
 The AmneziaWG behaviour here was written against Amnezia's own implementations,
 which are the authority whenever this fork and they disagree:
 
-- [amneziawg-go](https://github.com/amnezia-vpn/amneziawg-go) — the reference
-  implementation, and the one this fork follows most closely
-- [amneziawg-tools](https://github.com/amnezia-vpn/amneziawg-tools) — `awg` and
-  `awg-quick`, which define the `.conf` and UAPI spellings
-- [amneziawg-linux-kernel-module](https://github.com/amnezia-vpn/amneziawg-linux-kernel-module)
-  — the in-kernel implementation
+- [amneziawg-go](https://github.com/amnezia-vpn/amneziawg-go), the reference
+  implementation and the one this fork follows most closely
+- [amneziawg-tools](https://github.com/amnezia-vpn/amneziawg-tools), which
+  provides `awg` and `awg-quick` and fixes the `.conf` and UAPI spellings
+- [amneziawg-linux-kernel-module](https://github.com/amnezia-vpn/amneziawg-linux-kernel-module),
+  the in-kernel implementation
 
 [`AMNEZIA.md`](AMNEZIA.md#upstream-release-of-record) records the exact release
 of each that this was last audited against.
@@ -324,31 +364,31 @@ armv7s-apple-ios              |      | ✓    |
 aarch64-linux-android         |      | ✓    |
 arm-linux-androideabi         |      | ✓    |
 
-#### Linux
+### Linux
 
 `x86-64`, `aarch64` and `armv7` architectures are supported. The behaviour should be identical to that of [wireguard-go](https://git.zx2c4.com/wireguard-go/about/), with the following difference:
 
-`boringtun` will drop privileges when started. When privileges are dropped it is not possible to set `fwmark`. If `fwmark` is required, such as when using `wg-quick`, run with `--disable-drop-privileges` or set the environment variable `WG_SUDO=1`.
+`awgtun-cli` will drop privileges when started. When privileges are dropped it is not possible to set `fwmark`. If `fwmark` is required, such as when using `wg-quick`, run with `--disable-drop-privileges` or set the environment variable `WG_SUDO=1`.
 
-You will need to give the executable the `CAP_NET_ADMIN` capability using: `sudo setcap cap_net_admin+epi boringtun`. sudo is not needed.
+You will need to give the executable the `CAP_NET_ADMIN` capability using: `sudo setcap cap_net_admin+epi awgtun-cli`. sudo is not needed.
 
-#### macOS
+### macOS
 
 The behaviour is similar to that of [wireguard-go](https://git.zx2c4.com/wireguard-go/about/). Specifically the interface name must be `utun[0-9]+` for an explicit interface name or `utun` to have the kernel select the lowest available. If you choose `utun` as the interface name, and the environment variable `WG_TUN_NAME_FILE` is defined, then the actual name of the interface chosen by the kernel is written to the file specified by that variable.
 
 ---
 
-#### FFI bindings
+### FFI bindings
 
 The library exposes C ABI bindings defined in the `wireguard_ffi.h` header file. These work with C/C++, Swift (bridging header), or C# ([DLLImport](https://docs.microsoft.com/en-us/dotnet/api/system.runtime.interopservices.dllimportattribute?view=netcore-2.2) with `CallingConvention.Cdecl`).
 
-#### JNI bindings
+### JNI bindings
 
 Java Native Interface bindings are defined in `src/jni.rs`.
 
 ## License
 
-The project is licensed under the [3-Clause BSD License](https://opensource.org/licenses/BSD-3-Clause), inherited from boringtun, whose copyright notice is retained in [`LICENSE`](LICENSE).
+The project is licensed under the [3-Clause BSD License](https://opensource.org/licenses/BSD-3-Clause), inherited from BoringTun, whose copyright notice is retained in [`LICENSE.md`](LICENSE.md).
 
 The AmneziaWG support is an independent reimplementation in Rust, written by
 reading [amneziawg-go](https://github.com/amnezia-vpn/amneziawg-go) (MIT) and
@@ -372,4 +412,4 @@ If you want to contribute to this project, please read our [`CONTRIBUTING.md`].
 It is an independent implementation of the AmneziaWG protocol. Please do not
 report problems with it to the Amnezia projects; open an issue here instead.
 
-<sub><sub><sub><sub>WireGuard is a registered trademark of Jason A. Donenfeld. BoringTun is not sponsored or endorsed by Jason A. Donenfeld. AmneziaWG and Amnezia are projects of the Amnezia team; this fork is not affiliated with them.</sub></sub></sub></sub>
+<sub><sub><sub><sub>WireGuard is a registered trademark of Jason A. Donenfeld. awgtun is not sponsored or endorsed by Jason A. Donenfeld. AmneziaWG and Amnezia are projects of the Amnezia team; this fork is not affiliated with them.</sub></sub></sub></sub>

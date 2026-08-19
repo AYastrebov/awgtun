@@ -1,14 +1,16 @@
 [package]
 authors = ["Noah Kennedy <nkennedy@cloudflare.com>", "Andy Grover <agrover@cloudflare.com>", "Jeff Hiner <jhiner@cloudflare.com>"]
-description = "an implementation of the WireGuard® protocol designed for portability and speed"
-documentation = "https://docs.rs/boringtun/0.7.1/boringtun/"
+description = "A userspace AmneziaWG and WireGuard tunnel for Linux and macOS"
+documentation = "https://docs.rs/awgtun"
+keywords = ["wireguard", "amneziawg", "vpn", "obfuscation", "dpi"]
+categories = ["network-programming", "command-line-utilities"]
 edition = "2021"
 # Higher than the library's: clap and the `time` crate beneath it require it.
 rust-version = "1.88"
 license = "BSD-3-Clause"
-name = "boringtun-cli"
+name = "awgtun-cli"
 readme = "../README.md"
-repository = "https://github.com/cloudflare/boringtun"
+repository = "https://github.com/AYastrebov/awgtun"
 version = "0.7.1"
 
 [dependencies]
@@ -18,7 +20,7 @@ tracing = "0.1.40"
 tracing-appender = "0.2.1"
 tracing-subscriber = "0.3.19"
 
-[dependencies.boringtun]
+[dependencies.awgtun]
 features = ["device"]
-path = "../boringtun"
+path = "../awgtun"
 version = "0.7.1"

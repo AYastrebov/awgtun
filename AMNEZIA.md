@@ -1,6 +1,6 @@
 # AmneziaWG Implementation Details
 
-How AmneziaWG 2.0 and 3.0 are implemented in this boringtun fork, how that maps
+How AmneziaWG 2.0 and 3.0 are implemented in this fork of boringtun, how that maps
 to the [amneziawg-go](https://github.com/amnezia-vpn/amneziawg-go) reference, and
 where the two differ.
 
@@ -55,7 +55,7 @@ numbers move, the names do not.
 - [Rust API](#rust-api)
 - [C FFI API](#c-ffi-api)
 - [JNI API (Android)](#jni-api-android)
-- [Device and UAPI (boringtun-cli)](#device-and-uapi-boringtun-cli)
+- [Device and UAPI (awgtun-cli)](#device-and-uapi-awgtun-cli)
 - [Comparison with amneziawg-go](#comparison-with-amneziawg-go)
 - [Known Limitations](#known-limitations)
 
@@ -316,9 +316,9 @@ The WireGuard timing constants become inclusive ranges; an unset (all-zero) rang
 | `MaxTimerHandshakes` (18) | `max_handshake_attempts` | pick per new handshake |
 | Persistent keepalive | `persistent_keepalive` | fresh pick on every fire |
 
-amneziawg-go gives up on a handshake after a **count** of attempts; boringtun bounds retries by time (`REKEY_ATTEMPT_TIME`). The two are expressed here as `rekey_timeout * max_handshake_attempts`, which for default ranges is exactly the classic 90 s.
+amneziawg-go gives up on a handshake after a **count** of attempts; this implementation bounds retries by time (`REKEY_ATTEMPT_TIME`). The two are expressed here as `rekey_timeout * max_handshake_attempts`, which for default ranges is exactly the classic 90 s.
 
-Go also uses `Lo(rekey_timeout)` as the minimum spacing between initiations (`rekeyMinTimeout`), and the kernel module agrees since `51f3bb1` fixed an inverted ternary that had been reading the range only when it was *unset*. boringtun has no equivalent gate, and does not need one: it suppresses duplicate initiations structurally via `is_in_progress()`, and its retransmit interval is a fresh pick from `[Lo, Hi]`, which is never below the floor the other two enforce.
+Go also uses `Lo(rekey_timeout)` as the minimum spacing between initiations (`rekeyMinTimeout`), and the kernel module agrees since `51f3bb1` fixed an inverted ternary that had been reading the range only when it was *unset*. this implementation has no equivalent gate, and does not need one: it suppresses duplicate initiations structurally via `is_in_progress()`, and its retransmit interval is a fresh pick from `[Lo, Hi]`, which is never below the floor the other two enforce.
 
 #### Where the three implementations disagree
 
@@ -366,7 +366,7 @@ negligible term.
 
 What genuinely differs is state duplication. `fork` copies the buffer, so parent
 and child would emit identical bytes — for an `S1`-`S4` prefix that is keystream
-reuse under one key, and it is not hypothetical, since `boringtun-cli` forks to
+reuse under one key, and it is not hypothetical, since `awgtun-cli` forks to
 daemonize and any FFI or JNI embedder may fork for its own reasons. A
 `pthread_atfork` child handler bumps a generation counter, and every thread
 discards its buffer when the value moves. The check runs per draw rather than
@@ -578,8 +578,8 @@ The Noise handshake code (`handshake.rs`, `session.rs`) only gained a `msg_type:
 ### Creating a Tunnel
 
 ```rust
-use boringtun::noise::Tunn;
-use boringtun::amnezia::*;
+use awgtun::noise::Tunn;
+use awgtun::amnezia::*;
 
 // Standard WireGuard (unchanged API)
 let tunnel = Tunn::new(private_key, peer_public, None, None, index, None);
@@ -673,7 +673,7 @@ typedef struct {
 } amnezia3_config;
 ```
 
-Every `*_min`/`*_max` pair is inclusive; a pair of zeros means "unset" and falls back to the WireGuard default. Zeroing the whole struct yields standard WireGuard behavior. The declarations live in `boringtun/src/wireguard_ffi.h`.
+Every `*_min`/`*_max` pair is inclusive; a pair of zeros means "unset" and falls back to the WireGuard default. Zeroing the whole struct yields standard WireGuard behavior. The declarations live in `awgtun/src/wireguard_ffi.h`.
 
 ### Functions
 
@@ -698,7 +698,7 @@ size_t wireguard_poll_outgoing_packet(
 ## JNI API (Android)
 
 The `jni-bindings` feature exposes the tunnel to Android's `VpnService` through
-`io.github.ayastrebov.boringtun.BoringTunJNI`. AmneziaWG is configured with a
+`io.github.ayastrebov.awgtun.AwgTunJNI`. AmneziaWG is configured with a
 single UAPI-style `key=value` block rather than a long scalar signature:
 
 ```kotlin
@@ -720,7 +720,7 @@ val config = """
     persistent_keepalive_interval=20-30
 """.trimIndent()
 
-val handle = BoringTunJNI.new_tunnel_amnezia3(
+val handle = AwgTunJNI.new_tunnel_amnezia3(
     secretKeyBase64, publicKeyBase64, presharedKeyBase64, keepAlive, index, config,
 )
 require(handle != 0L) { "invalid AmneziaWG configuration" }
@@ -750,7 +750,7 @@ datagrams *before* the handshake initiation the call produced:
 fun drainPreHandshake(handle: Long, socket: DatagramChannel, buf: ByteBuffer) {
     while (true) {
         buf.clear()
-        val size = BoringTunJNI.wireguard_poll_outgoing_packet(handle, buf, buf.capacity())
+        val size = AwgTunJNI.wireguard_poll_outgoing_packet(handle, buf, buf.capacity())
         if (size == 0) break
         buf.limit(size)
         socket.write(buf)
@@ -763,23 +763,26 @@ Skipping this does not break the tunnel — the handshake still completes — bu
 
 ### Lifecycle
 
-`BoringTunJNI.tunnel_free(handle)` releases the tunnel. The handle must not be
+`AwgTunJNI.tunnel_free(handle)` releases the tunnel. The handle must not be
 used afterwards; passing 0 is a no-op.
 
 > **Note:** every JNI export is bound to a literal class name via
 > `#[export_name]`, so the Kotlin class must be declared at exactly
-> `io.github.ayastrebov.boringtun.BoringTunJNI` or the runtime will not resolve
+> `io.github.ayastrebov.awgtun.AwgTunJNI` or the runtime will not resolve
 > the natives. A consumer shipping its own package has to patch the export
-> prefix in `boringtun/src/jni.rs` and rebuild.
+> prefix in `awgtun/src/jni.rs` and rebuild.
 >
-> This used to be `com.cloudflare.app.boringtun.BoringTunJNI`, inherited from
-> upstream. That names Cloudflare's own Android application package, which is
-> wrong for a fork they do not publish, so it was changed. Any consumer built
-> against the old prefix must update its class declaration.
+> The prefix has changed twice. Upstream it was
+> `com.cloudflare.app.boringtun.BoringTunJNI`, which names Cloudflare's own
+> Android application package and is wrong for a fork they do not publish. It
+> became `io.github.ayastrebov.boringtun.BoringTunJNI`, and then
+> `io.github.ayastrebov.awgtun.AwgTunJNI` when the project was renamed. Each
+> change breaks the ABI: a consumer built against an older prefix has to update
+> its class declaration.
 
-## Device and UAPI (boringtun-cli)
+## Device and UAPI (awgtun-cli)
 
-With the `device` feature, `boringtun-cli` is a full AmneziaWG endpoint. It is
+With the `device` feature, `awgtun-cli` is a full AmneziaWG endpoint. It is
 configured over the usual WireGuard UAPI socket at
 `/var/run/wireguard/<iface>.sock`, so the amneziawg-tools `awg` binary drives it
 directly.
@@ -827,7 +830,7 @@ full key list.
 
 ```bash
 # Start the device (creates /var/run/wireguard/awg0.sock)
-sudo boringtun-cli awg0
+sudo awgtun-cli awg0
 
 # Push the configuration
 sudo awg setconf awg0 /etc/amnezia/awg0.conf
@@ -878,7 +881,7 @@ independent AmneziaWG server implementations:
 
 | Server | Configuration | Client path |
 |---|---|---|
-| amneziawg-go | AmneziaWG 2.0 — `H1`–`H4`, `S1`–`S4`, junk, `I1`–`I5` | `boringtun-cli` over the UAPI socket, exactly as `awg setconf` drives it |
+| amneziawg-go | AmneziaWG 2.0 — `H1`–`H4`, `S1`–`S4`, junk, `I1`–`I5` | `awgtun-cli` over the UAPI socket, exactly as `awg setconf` drives it |
 | amneziawg kernel module | AmneziaWG 3.0 — the 2.0 layers plus header protection, content padding and randomized timings | `Tunn` driven directly over a UDP socket |
 
 The 3.0 run is what puts header protection and content padding on the wire
@@ -1092,7 +1095,7 @@ peer's timer tick 680 ns, almost all of it `getrandom` syscalls.
 
 ### Key Difference: Send Atomicity
 
-The Go implementation sends I-packets, junk, and the handshake init in a single `SendBuffers` call, ensuring they arrive as a burst. Our implementation queues them separately and relies on the caller to drain and send them in order before sending the init. This is by design — boringtun's API is "give me a buffer, I'll fill it" rather than "I'll send packets for you." The caller must follow this protocol:
+The Go implementation sends I-packets, junk, and the handshake init in a single `SendBuffers` call, ensuring they arrive as a burst. Our implementation queues them separately and relies on the caller to drain and send them in order before sending the init. This is by design — this library's API is "give me a buffer, I'll fill it" rather than "I'll send packets for you." The caller must follow this protocol:
 
 ```rust
 // 1. Trigger handshake (returns the init packet)
@@ -1145,13 +1148,13 @@ handshakes kept working, which is a miserable symptom to debug backwards.
   A bare `Tunn` has to be recreated by its caller.
 
 UAPI configuration is no longer on this list — see
-[Device and UAPI](#device-and-uapi-boringtun-cli).
+[Device and UAPI](#device-and-uapi-awgtun-cli).
 
 ## Known Limitations
 
 1. **No batched I/O**: amneziawg-go reads and writes up to 128 packets per syscall and uses GSO on Linux; this does one `recv_from` per datagram. At high packet rates that difference outweighs everything else on this page. (This entry used to read "client-only". That was wrong: `handle_handshake_init` answers an initiation with an H2 type, an S2 prefix and header protection, and `test_awg3_handshake_between_two_devices` has a working responder.)
 
-2. **Interop is verified manually, not automatically**: this fork has completed handshakes and passed traffic against both amneziawg-go and the amneziawg kernel module, the latter with the full 3.0 feature set (see [Verified interoperability](#verified-interoperability)) — but those were manual runs. Automated coverage is still unit tests, a differential test against an independent reimplementation of the Go keystream, and integration tests between two boringtun devices — none of which would catch a misreading of the Go source shared by our implementation and our tests. A Docker-based test against amneziawg-go is not yet written, so interop can regress silently.
+2. **Interop is verified manually, not automatically**: this fork has completed handshakes and passed traffic against both amneziawg-go and the amneziawg kernel module, the latter with the full 3.0 feature set (see [Verified interoperability](#verified-interoperability)) — but those were manual runs. Automated coverage is still unit tests, a differential test against an independent reimplementation of the Go keystream, and integration tests between two awgtun devices — none of which would catch a misreading of the Go source shared by our implementation and our tests. A Docker-based test against amneziawg-go is not yet written, so interop can regress silently.
 
 3. **Buffer size responsibility**: With padding active, callers must allocate larger output buffers than standard WireGuard. The `encapsulate()` and `format_handshake_initiation()` docs specify the required sizes.
 
@@ -1159,12 +1162,12 @@ UAPI configuration is no longer on this list — see
 
 5. **Legacy fields rejected**: AmneziaWG 1.0/1.5 fields (`j1`, `j2`, `j3`, `itime`) are explicitly rejected.
 
-6. **No 16-byte content alignment**: boringtun has never padded transport content to a multiple of 16, and AWG 3.0 does not change that. amneziawg-go does so whenever content padding is unset, so wire sizes differ from the Go implementation in that configuration — an observable fingerprint difference, though not an interop failure. With content padding configured, upstream skips the alignment too and the implementations agree.
+6. **No 16-byte content alignment**: this implementation has never padded transport content to a multiple of 16, and AWG 3.0 does not change that. amneziawg-go does so whenever content padding is unset, so wire sizes differ from the Go implementation in that configuration — an observable fingerprint difference, though not an interop failure. With content padding configured, upstream skips the alignment too and the implementations agree.
 
 7. **Timing randomization is per-tunnel**: amneziawg-go stores timing ranges on the device and the persistent-keepalive range on the peer. Here everything lives on `Tunn`, so each tunnel picks independently.
 
-8. **No retransmit jitter**: amneziawg-go adds a random 0-334 ms (`RekeyTimeoutJitterMaxMs`) to the handshake retransmit and new-handshake timers, as stock wireguard-go does. boringtun has never added this jitter and AWG 3.0 does not change that. The `rekey_timeout` range supplies coarser randomization at second granularity, so retransmit timing is still randomized — just quantized to whole seconds rather than milliseconds.
+8. **No retransmit jitter**: amneziawg-go adds a random 0-334 ms (`RekeyTimeoutJitterMaxMs`) to the handshake retransmit and new-handshake timers, as stock wireguard-go does. this implementation has never added this jitter and AWG 3.0 does not change that. The `rekey_timeout` range supplies coarser randomization at second granularity, so retransmit timing is still randomized — just quantized to whole seconds rather than milliseconds.
 
 9. **No lower bound on the decapsulated IP total-length field**: amneziawg-go drops a packet whose declared length is below the IP header size (`int(length) < ipv4.HeaderLen`); `validate_decapsulated_packet` checks only that the declared length does not exceed the buffer. A peer that declares a total length under 20 therefore yields a truncated slice to the caller rather than being dropped. Reaching this requires an already-authenticated peer — the payload has passed AEAD verification — so it is a hostile-peer concern, not a network-attacker one. It predates the AWG work and is inherited from upstream boringtun.
 
-10. **Persistent keepalive re-arms on fire, not on traffic**: in amneziawg-go, `timersAnyAuthenticatedPacketTraversal` re-arms the persistent-keepalive timer with a fresh range pick after *every* authenticated packet sent or received, so a new interval is drawn constantly and keepalives only fire when the link is idle. boringtun's timer is not reset by other traffic — it fires on a fixed cadence from the last keepalive — so a new interval is drawn only when one fires. This follows from pre-existing boringtun timer behavior rather than the AWG 3.0 work; aligning it would change standard WireGuard behavior too.
+10. **Persistent keepalive re-arms on fire, not on traffic**: in amneziawg-go, `timersAnyAuthenticatedPacketTraversal` re-arms the persistent-keepalive timer with a fresh range pick after *every* authenticated packet sent or received, so a new interval is drawn constantly and keepalives only fire when the link is idle. This implementation's timer is not reset by other traffic — it fires on a fixed cadence from the last keepalive — so a new interval is drawn only when one fires. This follows from pre-existing boringtun timer behavior rather than the AWG 3.0 work; aligning it would change standard WireGuard behavior too.

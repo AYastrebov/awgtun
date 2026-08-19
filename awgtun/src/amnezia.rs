@@ -95,7 +95,7 @@ pub struct FastRandom;
 /// A buffered userspace RNG has one failure mode a `getrandom` syscall does
 /// not: `fork` copies the buffer, so parent and child hand out identical bytes
 /// from it. For padding that is keystream reuse, and it is not hypothetical
-/// here — `boringtun-cli` forks to daemonize, and any FFI or JNI embedder may
+/// here — `awgtun-cli` forks to daemonize, and any FFI or JNI embedder may
 /// fork for its own reasons.
 ///
 /// Each thread records the generation it seeded at and throws its buffer away
@@ -1397,7 +1397,7 @@ pub struct Amnezia3Config {
     /// retry hint.
     pub disable_cookies: bool,
     /// Outer MTU used to clamp content padding (amneziawg-go uses the device
-    /// MTU; boringtun's `Tunn` has no MTU concept, so it is configured here).
+    /// MTU; this crate's `Tunn` has no MTU concept, so it is configured here).
     pub mtu: u32,
 }
 
@@ -1955,7 +1955,7 @@ mod tests {
     /// replays bytes the parent will also emit. For the S1-S4 prefix those
     /// bytes are the header protection nonce, and a repeat is keystream reuse.
     ///
-    /// This is not hypothetical — `boringtun-cli` forks to daemonize.
+    /// This is not hypothetical — `awgtun-cli` forks to daemonize.
     #[cfg(unix)]
     #[test]
     fn fork_does_not_duplicate_the_keystream() {

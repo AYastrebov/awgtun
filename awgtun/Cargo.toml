@@ -1,6 +1,6 @@
 [package]
-name = "boringtun"
-description = "an implementation of the WireGuard® protocol designed for portability and speed"
+name = "awgtun"
+description = "AmneziaWG 2.0/3.0/3.1 and WireGuard in Rust, without a network or tunnel stack"
 version = "0.7.1"
 authors = [
     "Noah Kennedy <nkennedy@cloudflare.com>",
@@ -9,15 +9,17 @@ authors = [
 ]
 license = "BSD-3-Clause"
 readme = "../README.md"
-repository = "https://github.com/cloudflare/boringtun"
-documentation = "https://docs.rs/boringtun/0.7.1/boringtun/"
+repository = "https://github.com/AYastrebov/awgtun"
+documentation = "https://docs.rs/awgtun"
+keywords = ["wireguard", "amneziawg", "vpn", "obfuscation", "dpi"]
+categories = ["network-programming", "cryptography"]
 edition = "2018"
 # Chosen, not discovered. This used to read 1.78 — the floor that fell out of
 # Cargo.lock being format v4 — but that was never a compatibility promise, and
 # holding it meant pinning transitive crates that had moved on (`zeroize` 1.9
 # raised its own floor from 1.60 to 1.85). 1.85 is the lowest version the
 # current dependency graph builds on, it is what the RustCrypto, `x25519-dalek`
-# 3.0 and `jni` 0.22 generations require, and `boringtun-cli` already demands
+# 3.0 and `jni` 0.22 generations require, and `awgtun-cli` already demands
 # 1.88 — so no one building this repo end to end was served by the lower claim.
 # CI pins a job here so it stays true.
 rust-version = "1.85"

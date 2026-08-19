@@ -1,6 +1,6 @@
 # Testing against a live AmneziaWG server
 
-Two boringtun devices talking to each other prove the code is self-consistent.
+Two awgtun devices talking to each other prove the code is self-consistent.
 Only a real server proves it speaks AmneziaWG. This is the test that caught a
 padding cap that made a production server unreachable, and it takes about a
 minute to run.
@@ -43,8 +43,8 @@ The second argument overrides `AllowedIPs` — see the warning in step 3.
 IF=awgtest0
 SOCK=/var/run/wireguard/$IF.sock
 
-sudo WG_SUDO=1 ./target/release/boringtun-cli --disable-drop-privileges \
-    -v debug -l /tmp/boringtun.log "$IF"
+sudo WG_SUDO=1 ./target/release/awgtun-cli --disable-drop-privileges \
+    -v debug -l /tmp/awgtun.log "$IF"
 sleep 1
 
 printf 'set=1\n%s\n\n' "$(cat /tmp/uapi.txt)" | sudo socat - UNIX-CONNECT:"$SOCK"
@@ -52,7 +52,7 @@ printf 'set=1\n%s\n\n' "$(cat /tmp/uapi.txt)" | sudo socat - UNIX-CONNECT:"$SOCK
 ```
 
 `errno=22` is `EINVAL` — the AmneziaWG block was rejected. `errno=71` is
-`EPROTO`, a malformed line. Check `/tmp/boringtun.log` for the specific
+`EPROTO`, a malformed line. Check `/tmp/awgtun.log` for the specific
 `ConfigError`; the device logs it before returning the number.
 
 Then address and route:

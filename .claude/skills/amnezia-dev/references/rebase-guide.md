@@ -78,17 +78,17 @@ sites live inside functions upstream owns.
 
 ```bash
 # Unit tests
-cargo test -p boringtun --lib --no-run
-./target/debug/deps/boringtun-* --no-capture
+cargo test -p awgtun --lib --no-run
+./target/debug/deps/awgtun-* --no-capture
 
 # Device tests. Never --all-features: it enables mock-instant, which freezes the
 # clock so no timer fires and every device test fails looking like a protocol bug.
-cargo test -p boringtun --lib --features device --no-run
-sudo -E ./target/debug/deps/boringtun-* --ignored --test-threads 1 awg
+cargo test -p awgtun --lib --features device --no-run
+sudo -E ./target/debug/deps/awgtun-* --ignored --test-threads 1 awg
 
 # Feature builds
-cargo build --lib -p boringtun --features ffi-bindings
-cargo build --lib -p boringtun --features jni-bindings
+cargo build --lib -p awgtun --features ffi-bindings
+cargo build --lib -p awgtun --features jni-bindings
 ```
 
 All tests must pass — 97 unit tests and 5 AWG device tests as of this writing.

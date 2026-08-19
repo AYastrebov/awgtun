@@ -51,10 +51,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Check Windows
-        run: cargo check --locked -p boringtun
+        run: cargo check --locked -p awgtun
 
       - name: Test Windows
-        run: cargo test --locked -p boringtun
+        run: cargo test --locked -p awgtun
 
   check_features:
     strategy:
@@ -104,7 +104,7 @@ jobs:
       # RUSTDOCFLAGS above turns broken intra-doc links into errors. The docs
       # here lean on `[`Type`]` links heavily, and a rename silently breaks them
       # otherwise.
-      - run: cargo doc --locked --no-deps -p boringtun --features device
+      - run: cargo doc --locked --no-deps -p awgtun --features device
 
   benches:
     runs-on: ubuntu-latest
@@ -121,7 +121,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      # Pinned to `rust-version` in boringtun/Cargo.toml. The library is what
+      # Pinned to `rust-version` in awgtun/Cargo.toml. The library is what
       # FFI, JNI and Rust consumers depend on, so it carries the MSRV; the CLI
       # follows whatever clap and its dependencies require, which is newer.
       - uses: dtolnay/rust-toolchain@1.85.0
@@ -136,8 +136,8 @@ jobs:
       # raise `rust-version` to match; prefer raising it unless a consumer
       # actually needs the older toolchain, since pinning holds the whole graph
       # back to keep a number that nothing depends on.
-      - run: cargo check --locked -p boringtun --lib
-      - run: cargo check --locked -p boringtun --lib --features device
+      - run: cargo check --locked -p awgtun --lib
+      - run: cargo check --locked -p awgtun --lib --features device
 
   deny:
     runs-on: ubuntu-latest
@@ -174,5 +174,5 @@ jobs:
       # Deliberately not --all-features: that enables `mock-instant`, which
       # freezes the clock so no timer fires, nothing is sent, and every device
       # test fails looking exactly like a protocol bug. `device` arrives here
-      # through boringtun-cli's dependency.
+      # through awgtun-cli's dependency.
       - run: cargo test --locked -- --ignored

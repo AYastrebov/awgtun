@@ -118,7 +118,7 @@ impl Timers {
     /// amneziawg-go's `timersHandshakeInitiated`. The attempt budget is picked
     /// once per handshake (`SendHandshakeInitiation` only re-rolls
     /// `maxHandshakeAttempts` when `!isRetry`) and is expressed here as a
-    /// deadline, since boringtun bounds retries by time rather than by count —
+    /// deadline, since this implementation bounds retries by time rather than by count —
     /// with default ranges `5 s * 18` is exactly `REKEY_ATTEMPT_TIME`.
     ///
     /// With all-zero ranges this yields the classic WireGuard constants.
