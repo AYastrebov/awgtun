@@ -9,7 +9,7 @@ This is a fork of [cloudflare/boringtun](https://github.com/cloudflare/boringtun
 ```
 awgtun/                 # Main library crate
   src/
-    amnezia.rs          # AmneziaWG 2.0/3.0 config, CPS generator, junk generation,
+    amnezia.rs          # AmneziaWG 2.0/3.0/3.1 config, CPS generator, junk generation,
                         # header protection primitive
     noise/
       mod.rs            # Tunn struct, encapsulate/decapsulate, packet parsing
@@ -119,8 +119,9 @@ Files modified from upstream boringtun (keep these in mind during rebases):
 | `noise/session.rs` | `msg_type` and `content_padding` parameters for transport packets |
 | `noise/rate_limiter.rs` | HeaderConfig param, dynamic cookie headers |
 | `noise/timers.rs` | Clear network_outgoing queue on reset, AWG 3.0 randomized timings |
-| `ffi/mod.rs` | `amnezia_config`/`amnezia3_config`, `new_tunnel_amnezia`/`new_tunnel_amnezia3` |
-| `wireguard_ffi.h` | AWG 2.0 and 3.0 declarations |
+| `awgtun-ffi/src/lib.rs` | Was `ffi/mod.rs`. `amnezia_config`/`amnezia3_config`, `new_tunnel_amnezia`/`new_tunnel_amnezia3` |
+| `awgtun-ffi/src/jni.rs` | Was `jni.rs`. Android exports, bound to a literal class name |
+| `awgtun-ffi/wireguard_ffi.h` | AWG 2.0, 3.0 and 3.1 declarations |
 | `device/mod.rs` | Device-scoped AWG config, AWG-aware receive, junk/I-packet drain sites |
 | `device/api.rs` | AWG keys over the UAPI socket (`set=1`/`get=1`) |
 | `device/peer.rs` | `drain_outgoing`, per-peer keepalive range |
@@ -134,7 +135,8 @@ Tunn::new(private_key, peer_public, psk, keepalive, index, rate_limiter)
 // AmneziaWG 2.0
 Tunn::new_with_amnezia(private_key, peer_public, psk, keepalive, index, rate_limiter, amnezia_config)
 
-// AmneziaWG 3.0 (header protection, content padding, randomized timings)
+// AmneziaWG 3.0 (header protection, content padding, randomized timings) and
+// 3.1 (`random_trailers`, `disable_cookies` on the same config struct)
 Tunn::new_with_amnezia3(private_key, peer_public, psk, keepalive, index, rate_limiter, amnezia3_config)
 
 // Before sending handshake init, drain pre-handshake packets:
@@ -152,3 +154,5 @@ while let Some(packet) = tunn.poll_outgoing_packet() {
 - Send order: I-packets -> Junk -> Padded handshake init
 - AWG 3.0 header protection is applied LAST on send, and FIRST on receive; the nonce is the first 12 bytes of the S1-S4 prefix, so those must be >= 12
 - AWG 3.0 content padding goes INSIDE the AEAD envelope; the receiver trims it via the IP total-length field
+- AWG 3.1 random trailers go OUTSIDE the message on handshake/response/cookie and are trimmed by the fixed message size; transport packets get no outer trailer and widen content padding instead, only when `content_padding_addition` is unset
+- AWG 3.1 trailer length comes from a per-tunnel UDP window that belongs to the path, so `Tunn::reset_udp_window` must be called when the endpoint changes. `Device` does it; a direct-`Tunn` caller must do it itself

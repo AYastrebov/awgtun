@@ -1,6 +1,6 @@
 # AmneziaWG Implementation Details
 
-How AmneziaWG 2.0 and 3.0 are implemented in this fork of boringtun, how that maps
+How AmneziaWG 2.0, 3.0 and 3.1 are implemented in this fork of boringtun, how that maps
 to the [amneziawg-go](https://github.com/amnezia-vpn/amneziawg-go) reference, and
 where the two differ.
 
@@ -318,7 +318,7 @@ The WireGuard timing constants become inclusive ranges; an unset (all-zero) rang
 
 amneziawg-go gives up on a handshake after a **count** of attempts; this implementation bounds retries by time (`REKEY_ATTEMPT_TIME`). The two are expressed here as `rekey_timeout * max_handshake_attempts`, which for default ranges is exactly the classic 90 s.
 
-Go also uses `Lo(rekey_timeout)` as the minimum spacing between initiations (`rekeyMinTimeout`), and the kernel module agrees since `51f3bb1` fixed an inverted ternary that had been reading the range only when it was *unset*. this implementation has no equivalent gate, and does not need one: it suppresses duplicate initiations structurally via `is_in_progress()`, and its retransmit interval is a fresh pick from `[Lo, Hi]`, which is never below the floor the other two enforce.
+Go also uses `Lo(rekey_timeout)` as the minimum spacing between initiations (`rekeyMinTimeout`), and the kernel module agrees since `51f3bb1` fixed an inverted ternary that had been reading the range only when it was *unset*. This implementation has no equivalent gate, and does not need one: it suppresses duplicate initiations structurally via `is_in_progress()`, and its retransmit interval is a fresh pick from `[Lo, Hi]`, which is never below the floor the other two enforce.
 
 #### Where the three implementations disagree
 
@@ -550,11 +550,15 @@ The Noise handshake code (`handshake.rs`, `session.rs`) only gained a `msg_type:
 
 ### New Files
 
-| File | Lines | Purpose |
-|------|-------|---------|
-| `amnezia.rs` | ~2730 | Every AWG 2.0 and 3.0 config type, validation, the CPS parser and generator, junk generation, the ChaCha20 header protection primitive, `parse`/`to_uapi_block`, and the `RandomSource` implementations |
-| `jni.rs` | ~370 | Android bindings: `new_tunnel_amnezia3`, `wireguard_poll_outgoing_packet`, `tunnel_free` |
-| `benches/crypto_benches/amnezia_benching.rs` | ~245 | Criterion benchmarks for encapsulate, decapsulate, handshake initiation and `update_timers` |
+| File | Purpose |
+|------|---------|
+| `awgtun/src/amnezia.rs` | Every AWG 2.0, 3.0 and 3.1 config type, validation, the CPS parser and generator, junk generation, the ChaCha20 header protection primitive, `parse`/`to_uapi_block`, and the `RandomSource` implementations |
+| `awgtun-ffi/src/jni.rs` | Android bindings: `new_tunnel_amnezia3`, `wireguard_poll_outgoing_packet`, `tunnel_free` |
+| `awgtun/benches/crypto_benches/amnezia_benching.rs` | Criterion benchmarks for encapsulate, decapsulate, handshake initiation and `update_timers` |
+
+Line counts used to be a column here. They drifted every time the files were
+touched and nothing depended on them, so they are gone rather than perpetually
+wrong; `wc -l` answers the question when it matters.
 
 ### Modified Files
 
@@ -1167,7 +1171,7 @@ UAPI configuration is no longer on this list — see
 
 7. **Timing randomization is per-tunnel**: amneziawg-go stores timing ranges on the device and the persistent-keepalive range on the peer. Here everything lives on `Tunn`, so each tunnel picks independently.
 
-8. **No retransmit jitter**: amneziawg-go adds a random 0-334 ms (`RekeyTimeoutJitterMaxMs`) to the handshake retransmit and new-handshake timers, as stock wireguard-go does. this implementation has never added this jitter and AWG 3.0 does not change that. The `rekey_timeout` range supplies coarser randomization at second granularity, so retransmit timing is still randomized — just quantized to whole seconds rather than milliseconds.
+8. **No retransmit jitter**: amneziawg-go adds a random 0-334 ms (`RekeyTimeoutJitterMaxMs`) to the handshake retransmit and new-handshake timers, as stock wireguard-go does. This implementation has never added this jitter and AWG 3.0 does not change that. The `rekey_timeout` range supplies coarser randomization at second granularity, so retransmit timing is still randomized — just quantized to whole seconds rather than milliseconds.
 
 9. **No lower bound on the decapsulated IP total-length field**: amneziawg-go drops a packet whose declared length is below the IP header size (`int(length) < ipv4.HeaderLen`); `validate_decapsulated_packet` checks only that the declared length does not exceed the buffer. A peer that declares a total length under 20 therefore yields a truncated slice to the caller rather than being dropped. Reaching this requires an already-authenticated peer — the payload has passed AEAD verification — so it is a hostile-peer concern, not a network-attacker one. It predates the AWG work and is inherited from upstream boringtun.
 

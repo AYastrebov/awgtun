@@ -1,8 +1,8 @@
 // Copyright (c) 2019 Cloudflare, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
-//! An implementation of the WireGuard protocol, plus AmneziaWG 2.0 and 3.0
-//! obfuscation, with no network or tunnel stack of its own.
+//! An implementation of the WireGuard protocol, plus AmneziaWG 2.0, 3.0 and
+//! 3.1 obfuscation, with no network or tunnel stack of its own.
 //!
 //! ```text
 //! git clone https://github.com/AYastrebov/awgtun.git
