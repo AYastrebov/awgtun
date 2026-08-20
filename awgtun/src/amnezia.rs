@@ -1389,6 +1389,14 @@ pub struct Amnezia3Config {
     /// Both ends must agree: a receiver only tolerates a trailing byte when
     /// this is set, so enabling it on one side alone makes every oversized
     /// datagram unclassifiable.
+    ///
+    /// Trailer length is bounded by a per-tunnel UDP window that belongs to the
+    /// path rather than to the peer, so it has to be reset when the endpoint
+    /// changes. A `Device` does that for you; a caller driving [`Tunn`] itself
+    /// must call [`Tunn::reset_udp_window`] from its own rebind path.
+    ///
+    /// [`Tunn`]: crate::noise::Tunn
+    /// [`Tunn::reset_udp_window`]: crate::noise::Tunn::reset_udp_window
     pub random_trailers: bool,
     /// AmneziaWG 3.1: never emit a cookie reply.
     ///

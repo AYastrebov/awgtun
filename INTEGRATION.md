@@ -54,10 +54,11 @@ The AmneziaWG 3.1 surface is already right for a direct-`Tunn` consumer:
   must call it itself when its endpoint rebinds. shoes will do that from its
   network-change path when it exposes 3.1.
 
-One optional polish: the `random_trailers` doc comment explains the
-both-ends-must-agree rule well; a sentence telling direct-`Tunn` consumers to
-call `reset_udp_window` on endpoint change would save the next consumer the
-archaeology, since the device layer's automatic reset is easy to assume.
-
 Also fine as-is: the `x25519` re-export, empty default features, and the module
 layout surviving the rename unchanged.
+
+*The requested doc polish is done: `Amnezia3Config::random_trailers` now points
+at `Tunn::reset_udp_window`, and that method's own docs say plainly that a
+direct-`Tunn` caller owns the reset. Its previous wording said the `Device`
+layer calls it, which read as "not your problem" to exactly the audience whose
+problem it is.*

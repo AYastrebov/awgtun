@@ -562,9 +562,25 @@ impl Tunn {
 
     /// Reset the AWG 3.1 UDP window to its starting size.
     ///
-    /// Upstream does this when a peer's endpoint changes, so a window learned
-    /// from one path does not carry over to another. `Tunn` has no endpoint, so
-    /// the `Device` layer calls this.
+    /// The window is a high-water mark of the datagram sizes seen on one path,
+    /// so carrying it across a change of endpoint would size trailers against a
+    /// route that no longer exists. Upstream resets it whenever a peer's
+    /// endpoint changes.
+    ///
+    /// **A `Tunn` has no endpoint, so it cannot do this by itself.** With the
+    /// `device` feature, `Device` gets the reset for free, because
+    /// `Peer::set_endpoint` reports the change and the device calls this.
+    /// Anyone driving `Tunn` directly owns that responsibility: call this
+    /// whenever the socket rebinds or the peer's address changes. Skipping it
+    /// costs fidelity rather than correctness — trailers keep being drawn
+    /// against a stale window, which is a fingerprinting difference and not an
+    /// interop failure.
+    ///
+    /// Resetting is unconditional, but has no observable effect while
+    /// [`Amnezia3Config::random_trailers`] is off, since nothing reads the
+    /// window then.
+    ///
+    /// [`Amnezia3Config::random_trailers`]: crate::amnezia::Amnezia3Config::random_trailers
     pub fn reset_udp_window(&mut self) {
         self.udp_window = crate::amnezia::AWG31_DEFAULT_UDP_WINDOW;
     }
