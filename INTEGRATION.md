@@ -12,28 +12,29 @@ shoes consumes awgtun as a git dependency pinned to `tag = "v0.8.0"`, drives
 `Amnezia3Config` field by field from its own YAML config. Everything below was
 verified against both trees on 2026-08-20.
 
-### Requested: move the C/JNI exports out of the library crate
+### Done in 0.9.0: C/JNI exports moved out of the library crate
 
-`awgtun/Cargo.toml` declares `crate-type = ["staticlib", "cdylib", "rlib"]` on
-the library crate, and Cargo cannot feature-gate `crate-type`, so every
-downstream build pays for all three:
+Built as proposed. `awgtun-ffi` owns the export surface with
+`crate-type = ["staticlib", "cdylib"]`, and `awgtun` is a plain rlib. Verified
+in a clean target directory: building the library alone now produces only
+`libawgtun-*.rlib` and `.rmeta` — no `.a`, no `.so`.
 
-- A plain desktop `cargo build` of shoes produces `libawgtun-*.a`, `.rlib`
-  **and** `.so` in `target/debug/deps` — only the rlib is ever used. That is
-  extra link work on every build of every Rust consumer, on every target.
-- On Android, `cargo-ndk` copies every cdylib in the graph into the consumer's
-  AAR. shoes ships three ABIs, so ~330 KB × 3 of `libawgtun-*.so` land where
-  nothing can load them (the hashed filename is not a valid `System.loadLibrary`
-  name). shoes defends itself with a delete step in its build script *and* a CI
-  loop that fails if a foreign `.so` appears in the AAR — two mechanisms
-  compensating for the dependency's crate layout.
+What downstream has to change:
 
-Proposed shape: a workspace member (say `awgtun-ffi`) with
-`crate-type = ["staticlib", "cdylib"]` owning the `ffi-bindings` /
-`jni-bindings` export surface, and `awgtun` itself as a plain rlib. Release
-artifacts stay as they are — the release workflow builds the FFI crate instead
-of the library with a feature. Rust consumers stop building artifacts they
-discard, and the AAR pollution disappears at the source.
+- Build `-p awgtun-ffi` where you built `awgtun` with `--features ffi-bindings`;
+  `--features jni-bindings` still selects the JNI exports, now on that crate.
+- The Android library is `libawgtun_ffi.so`, so `System.loadLibrary("awgtun")`
+  becomes `System.loadLibrary("awgtun_ffi")`. The JNI class name is unchanged.
+- The header is at `awgtun-ffi/wireguard_ffi.h`, contents unchanged.
+
+shoes' delete step and CI guard can go once it moves to 0.9.0, since nothing
+foreign lands in the AAR any more.
+
+One thing the split surfaced: `Amnezia2Config` is `#[non_exhaustive]`, so the
+FFI crate can no longer build it with a struct literal and starts from
+`Amnezia2Config::wireguard_compatible()` instead. That is the attribute working
+as intended rather than a problem, but it is worth knowing if you construct
+that type yourself. `KeyBytes` is now public for the same reason.
 
 ### Suggested, no urgency: publish to crates.io
 

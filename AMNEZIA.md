@@ -571,7 +571,7 @@ The Noise handshake code (`handshake.rs`, `session.rs`) only gained a `msg_type:
 | `device/integration_tests/mod.rs` | The `test_awg*` device tests: a two-device handshake, its plain-WireGuard negative control, UAPI round-trip, incremental update, and padding without custom headers |
 | `ffi/mod.rs` | `amnezia_config` and `amnezia3_config` structs, `new_tunnel_amnezia`, `new_tunnel_amnezia3`, `wireguard_poll_outgoing_packet` |
 | `wireguard_ffi.h` | C declarations for both AmneziaWG surfaces |
-| `lib.rs` | `pub mod amnezia;`, and `serialization` gated on the `device`/`ffi-bindings` features |
+| `lib.rs` | `pub mod amnezia;` and `pub mod serialization;`, the latter public so the `awgtun-ffi` crate can parse keys from outside |
 
 ## Rust API
 
@@ -673,7 +673,7 @@ typedef struct {
 } amnezia3_config;
 ```
 
-Every `*_min`/`*_max` pair is inclusive; a pair of zeros means "unset" and falls back to the WireGuard default. Zeroing the whole struct yields standard WireGuard behavior. The declarations live in `awgtun/src/wireguard_ffi.h`.
+Every `*_min`/`*_max` pair is inclusive; a pair of zeros means "unset" and falls back to the WireGuard default. Zeroing the whole struct yields standard WireGuard behavior. The declarations live in `awgtun-ffi/wireguard_ffi.h`.
 
 ### Functions
 
@@ -770,7 +770,8 @@ used afterwards; passing 0 is a no-op.
 > `#[export_name]`, so the Kotlin class must be declared at exactly
 > `io.github.ayastrebov.awgtun.AwgTunJNI` or the runtime will not resolve
 > the natives. A consumer shipping its own package has to patch the export
-> prefix in `awgtun/src/jni.rs` and rebuild.
+> prefix in `awgtun-ffi/src/jni.rs` and rebuild. The shared library is
+> `libawgtun_ffi.so`, so it loads as `System.loadLibrary("awgtun_ffi")`.
 >
 > The prefix has changed twice. Upstream it was
 > `com.cloudflare.app.boringtun.BoringTunJNI`, which names Cloudflare's own

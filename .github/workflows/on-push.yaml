@@ -185,12 +185,14 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y gcc-arm-linux-gnueabihf
       # The library is the part that has to build everywhere. The CLI needs a
       # TUN stack and is only shipped for the platforms that have one.
-      - name: Build library
+      # Building the FFI crate pulls the library in as a dependency, so this
+      # covers both.
+      - name: Build library and C bindings
         env:
           CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
           CC_armv7_unknown_linux_gnueabihf: clang
           CFLAGS_armv7_unknown_linux_gnueabihf: --target=arm-linux-gnueabihf --sysroot=/usr/arm-linux-gnueabihf
-        run: ${{ matrix.cross && 'cross' || 'cargo' }} build --locked -p awgtun --lib --target ${{ matrix.target }} --features ffi-bindings
+        run: ${{ matrix.cross && 'cross' || 'cargo' }} build --locked -p awgtun-ffi --target ${{ matrix.target }}
       - name: Build CLI
         if: "!contains(matrix.target, 'android')"
         env:
@@ -223,7 +225,7 @@ jobs:
       - name: Build every ABI
         env:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
-        run: cargo ndk -t arm64-v8a -t armeabi-v7a -t x86 -t x86_64 build --locked -p awgtun --features jni-bindings
+        run: cargo ndk -t arm64-v8a -t armeabi-v7a -t x86 -t x86_64 build --locked -p awgtun-ffi --features jni-bindings
 
   deny:
     runs-on: ubuntu-latest

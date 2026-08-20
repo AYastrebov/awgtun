@@ -18,9 +18,12 @@ awgtun/                 # Main library crate
       rate_limiter.rs   # MAC verification, cookie replies
       timers.rs         # Rekey, keepalive, handshake retry timers
     device/             # Optional TUN device integration (feature-gated)
-    ffi/                # C FFI bindings
+    serialization.rs    # KeyBytes: hex/base64 key parsing (public)
     lib.rs
 awgtun-cli/             # Optional CLI binary
+awgtun-ffi/             # C and JNI bindings, plus wireguard_ffi.h. The only
+                        # crate emitting staticlib/cdylib, which is what keeps
+                        # `awgtun` a plain rlib for Rust consumers.
 ```
 
 ## A real server's parameters are secret

@@ -5,22 +5,32 @@
 // pointers and buffers/lengths to these, ok?
 #![allow(clippy::missing_safety_doc)]
 
-//! C bindings for the awgtun library
-use super::noise::{Tunn, TunnResult};
-use crate::amnezia::{
+//! C and Android JNI bindings for the awgtun library.
+//!
+//! This lives in its own crate so that `awgtun` can stay a plain rlib. Cargo
+//! cannot feature-gate `crate-type`, so while these bindings sat in the library
+//! every Rust consumer built and linked a staticlib and a cdylib it never used,
+//! and on Android `cargo-ndk` copied that unusable cdylib into their AAR.
+
+/// Android JNI exports. Off by default: they are bound to a literal Java class
+/// name, which is not something to enable by accident on a desktop build.
+#[cfg(feature = "jni-bindings")]
+pub mod jni;
+
+use awgtun::amnezia::{
     Amnezia2Config, Amnezia3Config, CpsChain, HeaderConfig, HeaderRange, InitPacketConfig,
     JunkConfig, PaddingConfig, TimingRanges, U32Range, HEADER_PROTECTION_KEY_SIZE,
 };
-use crate::x25519::{PublicKey, StaticSecret};
+use awgtun::noise::{Tunn, TunnResult};
+use awgtun::x25519::{PublicKey, StaticSecret};
 use base64::Engine as _;
 use hex::encode as encode_hex;
 use libc::{raise, SIGSEGV};
 use parking_lot::Mutex;
 use rand_core::OsRng;
-use tracing;
 use tracing_subscriber::fmt;
 
-use crate::serialization::KeyBytes;
+use awgtun::serialization::KeyBytes;
 use std::ffi::{CStr, CString};
 use std::io::{Error, Write};
 use std::os::raw::c_char;
@@ -402,18 +412,22 @@ unsafe fn amnezia2_from_c(cfg: &amnezia_config) -> Result<Amnezia2Config, ()> {
         JunkConfig::new(cfg.jc, cfg.jmin, cfg.jmax).map_err(|_| ())?
     };
 
-    Ok(Amnezia2Config {
-        headers,
-        paddings,
-        junk,
-        init_packets: InitPacketConfig {
-            i1: parse_optional_cps(cfg.i1)?,
-            i2: parse_optional_cps(cfg.i2)?,
-            i3: parse_optional_cps(cfg.i3)?,
-            i4: parse_optional_cps(cfg.i4)?,
-            i5: parse_optional_cps(cfg.i5)?,
-        },
-    })
+    // `Amnezia2Config` is `#[non_exhaustive]`, so a struct literal only works
+    // inside `awgtun` itself. From out here it has to start from the published
+    // constructor and have its fields assigned, which is the point of the
+    // attribute: adding a field upstream must not silently break this crate.
+    let mut config = Amnezia2Config::wireguard_compatible();
+    config.headers = headers;
+    config.paddings = paddings;
+    config.junk = junk;
+    config.init_packets = InitPacketConfig {
+        i1: parse_optional_cps(cfg.i1)?,
+        i2: parse_optional_cps(cfg.i2)?,
+        i3: parse_optional_cps(cfg.i3)?,
+        i4: parse_optional_cps(cfg.i4)?,
+        i5: parse_optional_cps(cfg.i5)?,
+    };
+    Ok(config)
 }
 
 /// The keys and keepalive shared by every `new_tunnel*` entry point.

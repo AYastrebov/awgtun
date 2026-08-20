@@ -1,0 +1,42 @@
+[package]
+name = "awgtun-ffi"
+description = "C and Android JNI bindings for awgtun (AmneziaWG and WireGuard)"
+version = "0.9.0"
+authors = [
+    "Noah Kennedy <nkennedy@cloudflare.com>",
+    "Andy Grover <agrover@cloudflare.com>",
+    "Jeff Hiner <jhiner@cloudflare.com>",
+]
+license = "BSD-3-Clause"
+readme = "../README.md"
+repository = "https://github.com/AYastrebov/awgtun"
+documentation = "https://docs.rs/awgtun-ffi"
+keywords = ["wireguard", "amneziawg", "ffi", "jni", "vpn"]
+categories = ["network-programming", "external-ffi-bindings"]
+edition = "2018"
+rust-version = "1.85"
+
+[features]
+default = []
+# Android only. The JNI exports are bound to a literal class name, so this is
+# not something to enable by accident on a desktop build.
+jni-bindings = ["jni"]
+
+[dependencies]
+awgtun = { path = "../awgtun", version = "0.9.0" }
+base64 = "0.22"
+hex = "0.4"
+libc = "0.2"
+parking_lot = "0.12"
+rand_core = { version = "0.6.4", features = ["getrandom"] }
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
+jni = { version = "0.19.0", optional = true }
+
+# The whole point of this crate: the C and JNI artefacts live here, so `awgtun`
+# can stay a plain rlib. `crate-type` cannot be feature-gated, so a consumer of
+# the library used to build and link a staticlib and a cdylib it never used —
+# and on Android, cargo-ndk copied that unusable cdylib into their AAR.
+[lib]
+name = "awgtun_ffi"
+crate-type = ["staticlib", "cdylib"]

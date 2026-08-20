@@ -14,23 +14,23 @@ use jni::sys::{jbyteArray, jint, jlong, jshort, jstring};
 use jni::JNIEnv;
 use parking_lot::Mutex;
 
-use crate::amnezia::Amnezia3Config;
-use crate::ffi::build_amnezia3_tunnel;
-use crate::ffi::new_tunnel;
-use crate::ffi::parse_tunnel_identity;
-use crate::ffi::tunnel_free;
-use crate::ffi::wireguard_poll_outgoing_packet;
-use crate::ffi::wireguard_read;
-use crate::ffi::wireguard_result;
-use crate::ffi::wireguard_tick;
-use crate::ffi::wireguard_write;
-use crate::ffi::x25519_key;
-use crate::ffi::x25519_key_to_base64;
-use crate::ffi::x25519_key_to_hex;
-use crate::ffi::x25519_public_key;
-use crate::ffi::x25519_secret_key;
+use crate::build_amnezia3_tunnel;
+use crate::new_tunnel;
+use crate::parse_tunnel_identity;
+use crate::tunnel_free;
+use crate::wireguard_poll_outgoing_packet;
+use crate::wireguard_read;
+use crate::wireguard_result;
+use crate::wireguard_tick;
+use crate::wireguard_write;
+use crate::x25519_key;
+use crate::x25519_key_to_base64;
+use crate::x25519_key_to_hex;
+use crate::x25519_public_key;
+use crate::x25519_secret_key;
 
-use crate::noise::Tunn;
+use awgtun::amnezia::Amnezia3Config;
+use awgtun::noise::Tunn;
 
 pub extern "C" fn log_print(_log_string: *const c_char) {
     /*

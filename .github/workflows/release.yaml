@@ -161,7 +161,7 @@ jobs:
           CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
           CC_armv7_unknown_linux_gnueabihf: clang
           CFLAGS_armv7_unknown_linux_gnueabihf: --target=arm-linux-gnueabihf --sysroot=/usr/arm-linux-gnueabihf
-        run: ${{ matrix.cross && 'cross' || 'cargo' }} build --locked --release -p awgtun --lib --target ${{ matrix.target }} --features ffi-bindings
+        run: ${{ matrix.cross && 'cross' || 'cargo' }} build --locked --release -p awgtun-ffi --target ${{ matrix.target }}
       # bash on the Windows runner too, so one packaging script covers every
       # target; only the library filenames differ.
       - name: Package
@@ -170,12 +170,12 @@ jobs:
           set -euo pipefail
           name="awgtun-ffi-${{ needs.verify.outputs.version }}-${{ matrix.target }}"
           mkdir -p "dist/$name/include" "dist/$name/lib"
-          cp awgtun/src/wireguard_ffi.h "dist/$name/include/"
+          cp awgtun-ffi/wireguard_ffi.h "dist/$name/include/"
           # A consumer needs the header plus whichever library form suits their
           # link model, so ship whichever of them this platform produces:
           # .a/.so on Linux, .a/.dylib on macOS, .lib/.dll on Windows.
           found=0
-          for f in libawgtun.a libawgtun.so libawgtun.dylib awgtun.lib awgtun.dll; do
+          for f in libawgtun_ffi.a libawgtun_ffi.so libawgtun_ffi.dylib awgtun_ffi.lib awgtun_ffi.dll; do
             p="target/${{ matrix.target }}/release/$f"
             if [ -f "$p" ]; then cp "$p" "dist/$name/lib/"; found=1; fi
           done
@@ -216,7 +216,7 @@ jobs:
           # Android project.
           cargo ndk -t arm64-v8a -t armeabi-v7a -t x86 -t x86_64 \
             -o "dist/$name/jniLibs" \
-            build --locked --release -p awgtun --features jni-bindings
+            build --locked --release -p awgtun-ffi --features jni-bindings
           cp LICENSE.md "dist/$name/"
           tar -C dist -czf "$name.tar.gz" "$name"
       - uses: actions/upload-artifact@v4

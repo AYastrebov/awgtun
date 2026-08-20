@@ -3,6 +3,17 @@
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-08-20
+
+The C and JNI bindings move out of the library into a new `awgtun-ffi` crate.
+Requested by shoes; their report is in `INTEGRATION.md`.
+
+### Changed
+
+- **The library is a plain rlib again.** `awgtun` declared `crate-type = ["staticlib", "cdylib", "rlib"]`, and Cargo cannot feature-gate `crate-type`, so every Rust consumer built and linked a staticlib and a cdylib it never used. On Android it was worse than wasteful: `cargo-ndk` copies every cdylib in the graph into the consumer's AAR, and ours arrived under a hashed filename that `System.loadLibrary` cannot load — downstream carried a delete step and a CI guard to undo what this crate produced.
+- **Migration.** The `ffi-bindings` and `jni-bindings` features are gone from `awgtun`; build `-p awgtun-ffi` instead, with `--features jni-bindings` for the JNI exports. The C header moves to `awgtun-ffi/wireguard_ffi.h` with its contents unchanged. The Android shared library is now `libawgtun_ffi.so`, so `System.loadLibrary("awgtun")` becomes `System.loadLibrary("awgtun_ffi")`. The JNI class name is unchanged.
+- `serialization` is now a public module and `KeyBytes` a public type. The FFI crate parses keys with it from outside the library, and turning a hex or base64 key into 32 bytes is something most consumers need anyway.
+
 ## [0.8.0] - 2026-08-20
 
 The project is now **awgtun**, published from

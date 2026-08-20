@@ -100,7 +100,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "awgtun"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "aead",
  "base64",
@@ -113,7 +113,6 @@ dependencies = [
  "hmac",
  "ip_network",
  "ip_network_table",
- "jni",
  "libc",
  "mock_instant",
  "nix",
@@ -132,13 +131,28 @@ dependencies = [
 
 [[package]]
 name = "awgtun-cli"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "awgtun",
  "clap",
  "daemonize",
  "tracing",
  "tracing-appender",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "awgtun-ffi"
+version = "0.9.0"
+dependencies = [
+ "awgtun",
+ "base64",
+ "hex",
+ "jni",
+ "libc",
+ "parking_lot",
+ "rand_core",
+ "tracing",
  "tracing-subscriber",
 ]
 

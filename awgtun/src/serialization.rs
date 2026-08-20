@@ -1,5 +1,21 @@
 use base64::Engine as _;
-pub(crate) struct KeyBytes(pub [u8; 32]);
+
+/// A 32-byte WireGuard key parsed from its text form.
+///
+/// Accepts both spellings the tooling produces: 64 hex characters, or 43 to 44
+/// characters of base64. A `.conf` and `awg` write base64; the UAPI socket
+/// uses hex.
+///
+/// ```
+/// use awgtun::serialization::KeyBytes;
+///
+/// let key: KeyBytes = "0000000000000000000000000000000000000000000000000000000000000000"
+///     .parse()
+///     .expect("64 hex characters is a valid key");
+/// assert_eq!(key.0, [0u8; 32]);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyBytes(pub [u8; 32]);
 
 impl std::str::FromStr for KeyBytes {
     type Err = &'static str;

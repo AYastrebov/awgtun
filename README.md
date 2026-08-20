@@ -70,7 +70,7 @@ sudo ip link set up dev awg0
 sudo awg show awg0
 ```
 
-Building the library instead: `cargo build --lib -p awgtun --release`, adding `--features ffi-bindings` or `--features jni-bindings` for the C and Android surfaces.
+Building the library instead: `cargo build --lib -p awgtun --release`. The C and Android bindings live in their own crate, so build `-p awgtun-ffi` for those, adding `--features jni-bindings` for the JNI exports.
 
 Tests: the runner uses `sudo` for TUN device tests, so build first and run the binary directly to skip the prompt.
 
@@ -339,11 +339,11 @@ while let Some(packet) = tunnel.poll_outgoing_packet() {
 
 ### C FFI
 
-`amnezia_config` and `amnezia3_config` structs with `new_tunnel_amnezia`, `new_tunnel_amnezia3` and `wireguard_poll_outgoing_packet`, declared in `awgtun/src/wireguard_ffi.h`. Full reference in [`AMNEZIA.md`](AMNEZIA.md#c-ffi-api).
+`amnezia_config` and `amnezia3_config` structs with `new_tunnel_amnezia`, `new_tunnel_amnezia3` and `wireguard_poll_outgoing_packet`, declared in `awgtun-ffi/wireguard_ffi.h`. Full reference in [`AMNEZIA.md`](AMNEZIA.md#c-ffi-api).
 
 ### JNI (Android)
 
-The `jni-bindings` feature exposes the same surface to `VpnService`, through the class `io.github.ayastrebov.awgtun.AwgTunJNI`. The exports are bound to that literal name, so the Kotlin declaration has to match it. Parameters arrive as one UAPI-style block rather than a long argument list:
+`awgtun-ffi`'s `jni-bindings` feature exposes the same surface to `VpnService`, through the class `io.github.ayastrebov.awgtun.AwgTunJNI`. The shared library is `libawgtun_ffi.so`, so load it with `System.loadLibrary("awgtun_ffi")`. The exports are bound to that literal name, so the Kotlin declaration has to match it. Parameters arrive as one UAPI-style block rather than a long argument list:
 
 ```kotlin
 val handle = AwgTunJNI.new_tunnel_amnezia3(

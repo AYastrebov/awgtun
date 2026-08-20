@@ -12,19 +12,15 @@
 pub mod device;
 
 pub mod amnezia;
-#[cfg(feature = "ffi-bindings")]
-pub mod ffi;
-#[cfg(feature = "jni-bindings")]
-pub mod jni;
 pub mod noise;
 
 #[cfg(not(feature = "mock-instant"))]
 pub(crate) mod sleepyinstant;
 
-// Only the `device` UAPI parser and the C FFI parse keys from strings; with
-// neither feature on, the whole module is dead code.
-#[cfg(any(feature = "device", feature = "ffi-bindings"))]
-pub(crate) mod serialization;
+// Public, and no longer feature-gated: the FFI crate parses keys with it from
+// outside, and turning a hex or base64 key into bytes is something most
+// consumers of this library end up needing anyway.
+pub mod serialization;
 
 /// Re-export of the x25519 types
 pub mod x25519 {
