@@ -6,7 +6,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.9.0] - 2026-08-20
 
 The C and JNI bindings move out of the library into a new `awgtun-ffi` crate.
-Requested by shoes; their report is in `INTEGRATION.md`.
+Requested by shoes, whose report is at `git show 9e6e777:INTEGRATION.md`.
 
 ### Changed
 
