@@ -741,14 +741,114 @@ impl Tunn {
         let packet =
             session.format_packet_data(src, &mut dst[s4..], transport_type, content_padding);
         let packet_len = packet.len();
-        if s4 > 0 {
-            FastRandom.fill_bytes(&mut dst[..s4]);
-        }
-        if let Some(hp) = self.header_protection {
-            let (prefix, message) = dst.split_at_mut(s4);
-            hp.apply(prefix, &mut message[..TRANSPORT_HEADER_SZ]);
+
+        // Header protection rewrites the transport header in place, so keep the
+        // cleartext to re-protect it under each fresh prefix below.
+        let mut clear_header = [0u8; TRANSPORT_HEADER_SZ];
+        clear_header.copy_from_slice(&dst[s4..s4 + TRANSPORT_HEADER_SZ]);
+
+        // Redraw the prefix until a peer running the reference classifier would
+        // not take this datagram for a handshake. See
+        // `peer_would_misclassify`: the draw only fails ~3.5% of the time, so
+        // this is one extra ChaCha20 block on ~1 packet in 29, and the loop is
+        // bounded so a pathological configuration cannot stall the send path.
+        const MAX_PREFIX_DRAWS: usize = 8;
+        for _ in 0..MAX_PREFIX_DRAWS {
+            if s4 > 0 {
+                FastRandom.fill_bytes(&mut dst[..s4]);
+            }
+            let hp = match self.header_protection {
+                Some(hp) => hp,
+                // Without header protection the peer reads raw ciphertext, so
+                // redrawing the prefix changes nothing it looks at.
+                None => break,
+            };
+            // One keystream serves both jobs: it protects the header, and its
+            // first four bytes are exactly the mask the peer will apply to
+            // whatever it finds at a candidate's padding offset. Deriving it
+            // here rather than calling `apply` keeps the collision check free
+            // -- same single ChaCha20 setup this path always paid.
+            let keystream = hp.keystream::<TRANSPORT_HEADER_SZ>(&dst[..s4]);
+            for (i, byte) in clear_header.iter().enumerate() {
+                dst[s4 + i] = byte ^ keystream[i];
+            }
+            let mask = [keystream[0], keystream[1], keystream[2], keystream[3]];
+            if !self.peer_would_misclassify(&dst[..s4 + packet_len], mask) {
+                break;
+            }
         }
         &mut dst[..s4 + packet_len]
+    }
+
+    /// Would a peer running the reference classifier mistake this transport
+    /// datagram for a handshake message and drop it?
+    ///
+    /// amneziawg-go's `DeterminePacketTypeAndPadding` tests init, response and
+    /// cookie *before* transport, and AWG 3.1 relaxes each of those size tests
+    /// from `==` to `>` (`device/receive.go`). A full-size transport packet
+    /// therefore passes all three on size alone, and only the type-range test
+    /// stands between it and a misparse -- read at that candidate's padding
+    /// offset, over ciphertext, so uniformly random. With the 50-million-wide
+    /// ranges Amnezia's generator emits that is 3 * 1.16% = ~3.5% of every
+    /// packet we send, dropped by the peer with no diagnostic at either end.
+    /// Measured against a live AmneziaWG 3.1 server it cost ~5% of outbound
+    /// packets and held uploads to ~170 kB/s while downloads ran at 14 MB/s.
+    ///
+    /// This fork fixed the same ordering in its own classifier, but that only
+    /// protects what we receive. A peer's receive path is not ours to change --
+    /// yet the value it reads is masked by a keystream derived from our S4
+    /// prefix, so redrawing that prefix redraws all three candidate values
+    /// without touching the ciphertext, the counter or anything on the wire a
+    /// conforming peer interprets differently.
+    ///
+    /// Mirrors the reference's order and size rules exactly, because the point
+    /// is to predict that implementation's decision rather than to state our
+    /// own. `mask` is the header-protection keystream the peer will derive from
+    /// this datagram's prefix; the caller already has it.
+    ///
+    /// This is a workaround for a defect in the peer, not in this code. The
+    /// real fix is amneziawg-go PR #183 and the matching change to
+    /// `awg_determine_type_and_padding` in the kernel module's `src/receive.c`;
+    /// once peers carry it, this loop simply never redraws.
+    fn peer_would_misclassify(&self, datagram: &[u8], mask: [u8; 4]) -> bool {
+        let candidates = [
+            (
+                self.padding_config.s1 as usize,
+                &self.header_config.init,
+                HANDSHAKE_INIT_SZ,
+            ),
+            (
+                self.padding_config.s2 as usize,
+                &self.header_config.response,
+                HANDSHAKE_RESP_SZ,
+            ),
+            (
+                self.padding_config.s3 as usize,
+                &self.header_config.cookie,
+                COOKIE_REPLY_SZ,
+            ),
+        ];
+        for (padding, range, msg_size) in candidates {
+            let expected = padding + msg_size;
+            let size_ok = datagram.len() == expected
+                || (self.random_trailers && datagram.len() > expected);
+            if !size_ok || padding + 4 > datagram.len() {
+                continue;
+            }
+            let mut type_bytes = [
+                datagram[padding],
+                datagram[padding + 1],
+                datagram[padding + 2],
+                datagram[padding + 3],
+            ];
+            for (byte, mask_byte) in type_bytes.iter_mut().zip(mask.iter()) {
+                *byte ^= mask_byte;
+            }
+            if range.contains(u32::from_le_bytes(type_bytes)) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Receives a UDP datagram from the network and parses it.
@@ -2929,6 +3029,101 @@ mod tests {
             result,
             TunnResult::Err(WireGuardError::InvalidPacket)
         ));
+    }
+}
+
+#[cfg(test)]
+mod awg31_peer_misclassification {
+    use super::*;
+    use crate::amnezia::{Amnezia3Config, HeaderConfig, HeaderRange, PaddingConfig};
+
+    fn cfg() -> Amnezia3Config {
+        let mut c = Amnezia3Config::default();
+        c.paddings = PaddingConfig { s1: 41, s2: 83, s3: 29, s4: 23 };
+        c.headers = HeaderConfig::new(
+            HeaderRange::new(1_100_000_000, 1_150_000_000).unwrap(),
+            HeaderRange::new(1_250_000_000, 1_300_000_000).unwrap(),
+            HeaderRange::new(1_400_000_000, 1_450_000_000).unwrap(),
+            HeaderRange::new(1_550_000_000, 1_600_000_000).unwrap(),
+        )
+        .unwrap();
+        c.random_trailers = true;
+        c.header_protection_key = Some([7u8; 32]);
+        c
+    }
+
+    /// Classify a datagram the way an *unpatched* peer does: init, response and
+    /// cookie before transport, with AWG 3.1's relaxed `>` size tests. This is
+    /// `DeterminePacketTypeAndPadding` from amneziawg-go, not our classifier.
+    fn unpatched_peer_takes_it_for_a_handshake(c: &Amnezia3Config, d: &[u8]) -> bool {
+        let hp = c.header_protection().unwrap();
+        let mask = hp.type_mask(d);
+        for (padding, range, size) in [
+            (c.paddings.s1 as usize, &c.headers.init, HANDSHAKE_INIT_SZ),
+            (c.paddings.s2 as usize, &c.headers.response, HANDSHAKE_RESP_SZ),
+            (c.paddings.s3 as usize, &c.headers.cookie, COOKIE_REPLY_SZ),
+        ] {
+            let expected = padding + size;
+            if d.len() != expected && !(c.random_trailers && d.len() > expected) {
+                continue;
+            }
+            if padding + 4 > d.len() {
+                continue;
+            }
+            let v = u32::from_le_bytes([
+                d[padding] ^ mask[0],
+                d[padding + 1] ^ mask[1],
+                d[padding + 2] ^ mask[2],
+                d[padding + 3] ^ mask[3],
+            ]);
+            if range.contains(v) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The peer's classifier is not ours to fix, so the send path must not hand
+    /// it a datagram it will mistake for a handshake. Without the prefix
+    /// redraw this happens to ~3.5% of packets, which measured as ~5% outbound
+    /// loss against a live server and held uploads to ~170 kB/s.
+    #[test]
+    fn sent_transport_packets_survive_an_unpatched_peer() {
+        let c = cfg();
+        let sk = x25519::StaticSecret::from([3u8; 32]);
+        let pk = x25519::PublicKey::from(&x25519::StaticSecret::from([9u8; 32]));
+        let mut tunn =
+            Tunn::new_with_amnezia3(sk, pk, None, None, 0, None, c.clone()).unwrap();
+
+        // A session has to exist before `encapsulate` will emit transport data.
+        let session = crate::noise::session::Session::new(0, 0, [0u8; 32], [0u8; 32]);
+        tunn.sessions[0] = Some(session);
+        tunn.current = 0;
+
+        let payload = {
+            let mut v = vec![0u8; 1200];
+            v[0] = 0x45; // IPv4, so it is treated as a routable packet
+            let total = 1200u16.to_be_bytes();
+            v[2] = total[0];
+            v[3] = total[1];
+            v
+        };
+
+        let mut dst = vec![0u8; 4096];
+        let mut sent = 0usize;
+        for _ in 0..3000 {
+            match tunn.encapsulate(&payload, &mut dst) {
+                TunnResult::WriteToNetwork(d) => {
+                    assert!(
+                        !unpatched_peer_takes_it_for_a_handshake(&c, d),
+                        "emitted a datagram an unpatched peer would drop as a handshake"
+                    );
+                    sent += 1;
+                }
+                other => panic!("expected a transport packet, got {other:?}"),
+            }
+        }
+        assert_eq!(sent, 3000);
     }
 }
 
