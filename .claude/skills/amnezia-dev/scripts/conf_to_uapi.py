@@ -46,6 +46,8 @@ INTERFACE_KEYS = {
     "keepalivetimeout": "keepalive_timeout",
     "maxhandshakeattempts": "max_handshake_attempts",
     "headerprotectionkey": "header_protection_key",
+    "randomtrailers": "random_trailers",
+    "disablecookies": "disable_cookies",
     # Deliberately absent: MTU. It is not a UAPI key in wg or amneziawg-go — the
     # device uses its interface MTU — and sending it earns EINVAL. Set it with
     # `ip link set mtu`, as wg-quick does.
@@ -95,6 +97,12 @@ def main():
                 elif key == "address":
                     address = value
                 elif key in INTERFACE_KEYS:
+                    # `I2 =` with nothing after it means the chain is unset. The
+                    # device parses an empty CPS chain as an error, not as
+                    # "absent", so the line has to be dropped rather than
+                    # forwarded empty.
+                    if not value:
+                        continue
                     if key in KEY_FIELDS:
                         value = to_hex(value, key)
                     interface.append(f"{INTERFACE_KEYS[key]}={value}")
