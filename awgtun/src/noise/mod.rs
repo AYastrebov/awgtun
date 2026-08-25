@@ -216,32 +216,53 @@ impl<'a> PacketClassifier<'a> {
     /// Returns `None` if no message type matches. See [`Classified`] for what a
     /// match carries.
     pub fn classify(&self, src: &[u8]) -> Option<Classified> {
-        let checks: [(usize, &crate::amnezia::HeaderRange, usize, bool); 4] = [
-            (
-                self.paddings.s1 as usize,
-                &self.headers.init,
-                HANDSHAKE_INIT_SZ,
-                true,
-            ),
-            (
-                self.paddings.s2 as usize,
-                &self.headers.response,
-                HANDSHAKE_RESP_SZ,
-                true,
-            ),
-            (
-                self.paddings.s3 as usize,
-                &self.headers.cookie,
-                COOKIE_REPLY_SZ,
-                true,
-            ),
-            (
-                self.paddings.s4 as usize,
-                &self.headers.transport,
-                DATA_OVERHEAD_SZ,
-                false,
-            ),
-        ];
+        let init = (
+            self.paddings.s1 as usize,
+            &self.headers.init,
+            HANDSHAKE_INIT_SZ,
+            true,
+        );
+        let response = (
+            self.paddings.s2 as usize,
+            &self.headers.response,
+            HANDSHAKE_RESP_SZ,
+            true,
+        );
+        let cookie = (
+            self.paddings.s3 as usize,
+            &self.headers.cookie,
+            COOKIE_REPLY_SZ,
+            true,
+        );
+        let transport = (
+            self.paddings.s4 as usize,
+            &self.headers.transport,
+            DATA_OVERHEAD_SZ,
+            false,
+        );
+
+        // AWG 3.1 relaxes the handshake size tests from `==` to `>=` (see the
+        // `size_ok` comment below), which makes every one of them match a
+        // full-size transport packet on size alone. All that then stands
+        // between a data packet and a handshake misparse is the type-value
+        // range test, read at that candidate's padding offset -- over
+        // ciphertext, so it is uniformly random. A range spanning n of the
+        // 2^32 values therefore steals n / 2^32 of all data packets, and the
+        // three handshake ranges are tried first: with the 50-million-wide
+        // ranges Amnezia's own generator emits, that is 3 * 1.16% = ~3.5% of
+        // every transport packet silently dropped, which collapses a TCP
+        // sender (Mathis: ~0.35 Mbps at a 170 ms RTT).
+        //
+        // Classification is a local decision -- nothing about it is on the
+        // wire -- so trying transport first costs no interoperability. It moves
+        // the same collision onto handshake messages, which are rare and
+        // retried, instead of onto every data packet.
+        let checks: [(usize, &crate::amnezia::HeaderRange, usize, bool); 4] = if self.random_trailers
+        {
+            [transport, init, response, cookie]
+        } else {
+            [init, response, cookie, transport]
+        };
 
         // Every candidate shares this datagram's nonce, so the keystream is
         // derived once here and reused: for the type check below, and — for a
@@ -2908,5 +2929,86 @@ mod tests {
             result,
             TunnResult::Err(WireGuardError::InvalidPacket)
         ));
+    }
+}
+
+#[cfg(test)]
+mod awg31_transport_classification {
+    use super::*;
+    use crate::amnezia::{Amnezia3Config, HeaderConfig, HeaderRange, PaddingConfig};
+
+    /// A realistic AWG 3.1 parameter set: 50-million-wide header ranges, which
+    /// is the width Amnezia's own config generator emits.
+    fn cfg(random_trailers: bool) -> Amnezia3Config {
+        let mut c = Amnezia3Config::default();
+        c.paddings = PaddingConfig {
+            s1: 41,
+            s2: 83,
+            s3: 29,
+            s4: 23,
+        };
+        c.headers = HeaderConfig::new(
+            HeaderRange::new(1_100_000_000, 1_150_000_000).unwrap(),
+            HeaderRange::new(1_250_000_000, 1_300_000_000).unwrap(),
+            HeaderRange::new(1_400_000_000, 1_450_000_000).unwrap(),
+            HeaderRange::new(1_550_000_000, 1_600_000_000).unwrap(),
+        )
+        .unwrap();
+        c.random_trailers = random_trailers;
+        c
+    }
+
+    /// A well-formed transport datagram: S4 padding prefix, a type value drawn
+    /// from h4, then ciphertext-shaped bytes.
+    fn transport_datagram(seed: u64, payload_len: usize) -> Vec<u8> {
+        let mut v = vec![0u8; 23 + TRANSPORT_HEADER_SZ + payload_len];
+        let mut x = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        for b in v.iter_mut() {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *b = (x >> 33) as u8;
+        }
+        let t: u32 = 1_550_000_000 + (seed as u32 % 50_000_000);
+        v[23..27].copy_from_slice(&t.to_le_bytes());
+        v
+    }
+
+    fn misclassified(random_trailers: bool, n: usize) -> usize {
+        let c = cfg(random_trailers);
+        let classifier = PacketClassifier::from_config(&c);
+        (0..n)
+            .filter(|i| {
+                let d = transport_datagram(*i as u64, 1400);
+                !matches!(
+                    classifier.classify(&d),
+                    Some(cl) if cl.msg_size.is_none() && cl.padding == 23
+                )
+            })
+            .count()
+    }
+
+    /// AWG 3.1 relaxes the three handshake size tests to `>=`, so each one
+    /// matches a full-size transport packet on size alone and only the type
+    /// range test — read over ciphertext, so uniformly random — keeps a data
+    /// packet from being taken for a handshake. Three 50-million-wide ranges
+    /// tried ahead of transport stole ~3.5% of every transport packet, which
+    /// is enough to collapse a TCP sender to a few hundred kbit/s over a
+    /// 170 ms path. Transport is now tried first when trailers are on.
+    #[test]
+    fn transport_is_not_stolen_by_the_relaxed_handshake_size_tests() {
+        const N: usize = 50_000;
+        assert_eq!(
+            misclassified(true, N),
+            0,
+            "transport packets were misclassified as handshakes with random trailers on"
+        );
+    }
+
+    /// The unrelaxed path was never affected, and must stay that way.
+    #[test]
+    fn transport_classification_is_exact_without_random_trailers() {
+        const N: usize = 50_000;
+        assert_eq!(misclassified(false, N), 0);
     }
 }
