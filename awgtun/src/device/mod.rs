@@ -783,7 +783,18 @@ impl Device {
                         _ => {}
                     }
 
-                    let packet = &t.src_buf[padding..packet_len];
+                    // AWG 3.1: drop the random trailer before parsing, as
+                    // `Tunn::decapsulate` does. The types that carry one have a
+                    // fixed size, so anything past it is bytes the peer appended
+                    // outside the MAC — and `parse_incoming_packet_config` tests
+                    // those sizes with `==`, so leaving the trailer on makes
+                    // every trailered handshake message parse as InvalidPacket
+                    // and get dropped without a log line.
+                    let msg_end = match classified.and_then(|c| c.msg_size) {
+                        Some(size) if padding + size <= packet_len => padding + size,
+                        _ => packet_len,
+                    };
+                    let packet = &t.src_buf[padding..msg_end];
                     // A cookie reply is built in a scratch buffer so the S3
                     // padding can be prepended around it, as in
                     // `Tunn::decapsulate`.

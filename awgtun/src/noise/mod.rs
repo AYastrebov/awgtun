@@ -2933,6 +2933,79 @@ mod tests {
 }
 
 #[cfg(test)]
+mod awg31_trailer_trimming {
+    use super::*;
+    use crate::amnezia::{Amnezia3Config, HeaderConfig, HeaderRange, PaddingConfig};
+
+    fn cfg() -> Amnezia3Config {
+        let mut c = Amnezia3Config::default();
+        c.paddings = PaddingConfig { s1: 41, s2: 83, s3: 29, s4: 23 };
+        c.headers = HeaderConfig::new(
+            HeaderRange::new(1_100_000_000, 1_150_000_000).unwrap(),
+            HeaderRange::new(1_250_000_000, 1_300_000_000).unwrap(),
+            HeaderRange::new(1_400_000_000, 1_450_000_000).unwrap(),
+            HeaderRange::new(1_550_000_000, 1_600_000_000).unwrap(),
+        )
+        .unwrap();
+        c.random_trailers = true;
+        c
+    }
+
+    /// A handshake response as an AWG 3.1 peer puts it on the wire: S2 padding,
+    /// the fixed 92-byte message, then a random trailer outside it.
+    fn trailered_response(cfg: &Amnezia3Config, trailer: usize) -> Vec<u8> {
+        let s2 = cfg.paddings.s2 as usize;
+        let mut v = vec![0u8; s2 + HANDSHAKE_RESP_SZ + trailer];
+        for (i, b) in v.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(31).wrapping_add(7);
+        }
+        let t = cfg.headers.response.start;
+        v[s2..s2 + 4].copy_from_slice(&t.to_le_bytes());
+        v
+    }
+
+    /// The bug this pins: `parse_incoming_packet_config` tests the handshake
+    /// sizes with `==`, so a receiver that strips only the S1-S4 padding and
+    /// leaves the AWG 3.1 trailer on hands the parser 92 + trailer bytes and
+    /// gets `InvalidPacket`. Every handshake response from a trailered peer is
+    /// then dropped without a log line and the tunnel never comes up -- which
+    /// is exactly what a live AmneziaWG 3.1 server did to the device receive
+    /// path in `device/mod.rs`.
+    #[test]
+    fn trailer_must_be_trimmed_before_parsing() {
+        let cfg = cfg();
+        let classifier = PacketClassifier::from_config(&cfg);
+        let s2 = cfg.paddings.s2 as usize;
+
+        for trailer in [1usize, 17, 128, 351] {
+            let datagram = trailered_response(&cfg, trailer);
+            let classified = classifier
+                .classify(&datagram)
+                .expect("a trailered response must still classify");
+            assert_eq!(classified.padding, s2);
+            assert_eq!(classified.msg_size, Some(HANDSHAKE_RESP_SZ));
+
+            // Untrimmed: padding stripped but the trailer left on -- rejected.
+            let untrimmed = &datagram[classified.padding..];
+            assert!(
+                Tunn::parse_incoming_packet_config(untrimmed, &cfg.headers).is_err(),
+                "trailer {trailer}: an untrimmed response must not parse"
+            );
+
+            // Trimmed to `msg_size`, as both receive paths must do.
+            let trimmed = &untrimmed[..classified.msg_size.unwrap()];
+            assert!(
+                matches!(
+                    Tunn::parse_incoming_packet_config(trimmed, &cfg.headers),
+                    Ok(Packet::HandshakeResponse(_))
+                ),
+                "trailer {trailer}: a trimmed response must parse"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod awg31_transport_classification {
     use super::*;
     use crate::amnezia::{Amnezia3Config, HeaderConfig, HeaderRange, PaddingConfig};
