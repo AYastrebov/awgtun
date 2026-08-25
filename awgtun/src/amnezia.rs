@@ -10,7 +10,21 @@ use std::fmt;
 use std::num::ParseIntError;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const AWG2_MAX_CPS_RANDOM_LEN: usize = 1000;
+/// Upper bound on a `<r>`/`<rc>`/`<rd>` length, in bytes.
+///
+/// This is the largest possible UDP datagram, which is the only bound
+/// amneziawg-go has: `newRandObf` is `strconv.Atoi` and no range check
+/// (`device/obf_rand.go`), and the same holds for every other length-taking
+/// tag. A chain longer than a datagram simply cannot be sent, so the limit is
+/// a statement about the transport rather than a policy about configuration.
+///
+/// It used to be 1000, which was invented rather than mirrored, and it made
+/// real deployments unreachable: production `I1` chains use a random-bytes tag
+/// well over 1000 bytes long, padding the initiation up to the size of a TLS
+/// record, and this fork answered `errno=22` and never handshook. See the ground rule in the `amnezia-dev`
+/// skill — a rule stricter than the reference is an interop bug, not
+/// hardening.
+pub const AWG2_MAX_CPS_RANDOM_LEN: usize = u16::MAX as usize;
 
 // ---------------------------------------------------------------------------
 // RandomSource — injectable RNG for deterministic testing
@@ -2138,7 +2152,10 @@ mod tests {
         assert!(CpsChain::parse("").is_err());
         assert!(CpsChain::parse("<b 0102>").is_err());
         assert!(CpsChain::parse("<b 0x123>").is_err());
-        assert!(CpsChain::parse("<r 1001>").is_err());
+        // Bounded by the largest UDP datagram, not by an invented limit.
+        // Lengths in this range are what real deployments use.
+        assert!(CpsChain::parse("<r 1200>").is_ok());
+        assert!(CpsChain::parse("<r 65536>").is_err());
         assert!(CpsChain::parse("<c>").is_err());
         assert!(CpsChain::parse("prefix <r 1>").is_err());
         assert!(CpsChain::parse("<t 1>").is_err());
