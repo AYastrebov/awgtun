@@ -204,6 +204,64 @@ content when it is unset.
 handshake message rejects the datagram. Turning it on for one peer alone breaks
 the handshake in the direction that grew.
 
+### Random trailers make peers drop transport packets
+
+Relaxing the handshake size tests is what random trailers require, and it is
+also what breaks them. A receiver identifies a message by trying each type in
+turn — initiation, response, cookie, then transport — and with trailers on, the
+three handshake size tests widen from `==` to `>`. A full-size transport packet
+is longer than every handshake message, so it passes all three on size alone,
+and the only thing left standing between it and a misparse is the type-range
+test — read at that candidate's padding offset, over ciphertext, so uniformly
+random.
+
+A range spanning `n` of the 2^32 values therefore claims `n / 2^32` of all data
+packets. Amnezia's own generator emits H1-H4 ranges 50,000,000 wide, or 1.16%
+each, and three of them are tried before transport:
+
+```
+3 x 1.16% = ~3.5% of every transport packet, dropped with no counter and no log
+```
+
+That is enough to collapse a TCP sender. The loss scales with header-range
+width, so deployments with narrow H1-H4 see less of it.
+
+**This fork is fixed on both sides, for different reasons.**
+
+*Receiving* is ours to fix outright: `PacketClassifier::classify` tries transport
+first when random trailers are on. Classification never appears on the wire, so
+the order costs no interoperability — it moves the same collision onto handshake
+messages, which are rare and retried.
+
+*Sending* is not, because the peer's classifier is the peer's. But the value it
+reads is masked by a keystream derived from our own S4 prefix, so
+`format_transport_packet` redraws that prefix until a peer running the reference
+order would not misparse the datagram. Nothing on the wire changes for a
+conforming peer — the prefix is random either way — and the keystream that
+protects the transport header *is* the mask, so the check costs one already-paid
+ChaCha20 setup and a redraw on ~1 packet in 29.
+
+Measured against a live AmneziaWG 3.1 server, with the receive fix in place but
+before the send-side workaround: inbound loss 0.0%, outbound loss 5.0-5.2%,
+downloads at 14.5 MB/s and uploads at 0.17 MB/s. With the workaround, upload
+went to 12.55 MB/s — parity with an AWG 2.0 tunnel to the same host.
+
+**Upstream.** The defect is in every implementation's receive path, and the fix
+is local to each, so all of them need it independently and each one only
+protects the traffic *it* receives: amneziawg-go PR #183, and the same change to
+`awg_determine_type_and_padding` in the kernel module's `src/receive.c`. A
+sender cannot tell which classifier a peer runs — there is no version
+negotiation — so a link is only safe once both have shipped.
+
+Which is why the send-side workaround is not scheduled for removal. It cannot be
+retired on a condition, only on a guess about how old the oldest peer is, and it
+costs almost nothing to keep; against a fixed peer it simply never redraws. The
+assumption it encodes lives in
+`awg31_peer_misclassification::sent_transport_packets_survive_an_unpatched_peer`,
+which reimplements the *unpatched* `DeterminePacketTypeAndPadding` so the model
+is executable rather than implicit. Revisit if the reference classifier changes
+shape — to re-derive the prediction, not to delete it.
+
 ### The sliding UDP window
 
 What bounds a trailer's length. It is a per-peer high-water mark of observed
