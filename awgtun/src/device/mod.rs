@@ -649,6 +649,23 @@ impl Device {
                 if let Some(r) = d.rate_limiter.as_ref() {
                     r.reset_count()
                 }
+
+                // The interface MTU is read once when the device is built, but
+                // it is not settled then: `wg-quick` brings the interface up
+                // and sets its MTU *after* the device exists, so the startup
+                // value is routinely wrong, and a user can change it later.
+                // amneziawg-go reads `device.tun.mtu` live on every packet; a
+                // `Tunn` holds a copy, so poll here and push any change down.
+                // Content padding is clamped against this, and the interface
+                // read buffer is sliced to it.
+                if let Ok(mtu) = d.iface.mtu() {
+                    if mtu != d.mtu.swap(mtu, Ordering::Relaxed) {
+                        tracing::info!(mtu, "Interface MTU changed");
+                        for peer in d.peers.values() {
+                            peer.lock().tunnel.set_mtu(mtu as u32);
+                        }
+                    }
+                }
                 Action::Continue
             }),
             std::time::Duration::from_secs(1),

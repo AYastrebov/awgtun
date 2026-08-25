@@ -1124,6 +1124,27 @@ impl Tunn {
         Ok(self.validate_decapsulated_packet(decapsulated_packet))
     }
 
+    /// Update the MTU that content padding is sized against.
+    ///
+    /// A `Tunn` captures its configuration at construction, but an interface's
+    /// MTU is not fixed at that moment: `wg-quick` sets it after the device
+    /// exists, and a user can change it at any time. amneziawg-go sidesteps
+    /// this by reading `device.tun.mtu` live on every packet
+    /// (`RoutineEncryption` in `device/send.go`); a `Tunn` holds a copy, so the
+    /// owner of the interface has to push changes in.
+    ///
+    /// Sizing padding against a stale MTU does not break interoperability --
+    /// the receiver trims by the inner packet's own length field either way --
+    /// but it does mean padding is clamped to the wrong per-packet space, so
+    /// full-size packets can be padded past the real MTU and fragment.
+    ///
+    /// Deliberately does not touch sessions or timers: an MTU change is not a
+    /// reason to renegotiate, and rebuilding the peer would drop a working
+    /// tunnel.
+    pub fn set_mtu(&mut self, mtu: u32) {
+        self.mtu = mtu;
+    }
+
     /// Returns the next queued pre-handshake datagram (I-packet or junk), if any.
     /// The caller should send these datagrams to the network before the handshake
     /// initiation packet. Call repeatedly until `None` is returned.
@@ -3029,6 +3050,44 @@ mod tests {
             result,
             TunnResult::Err(WireGuardError::InvalidPacket)
         ));
+    }
+}
+
+#[cfg(test)]
+mod awg3_mtu_tracking {
+    use super::*;
+    use crate::amnezia::{Amnezia3Config, U32Range};
+
+    fn tunn_with_mtu(mtu: u32) -> Tunn {
+        let mut c = Amnezia3Config::default();
+        c.content_padding_addition = Some(U32Range::new(30, 114).unwrap());
+        c.mtu = mtu;
+        let sk = x25519::StaticSecret::from([5u8; 32]);
+        let pk = x25519::PublicKey::from(&x25519::StaticSecret::from([6u8; 32]));
+        Tunn::new_with_amnezia3(sk, pk, None, None, 0, None, c).unwrap()
+    }
+
+    /// Content padding is clamped to the space left in the last MTU-sized unit,
+    /// so a packet that already fills the MTU must get none. An interface whose
+    /// MTU is set after the device is built -- what `wg-quick` does -- would
+    /// otherwise keep padding full-size packets past the real MTU and fragment
+    /// them.
+    #[test]
+    fn set_mtu_changes_how_content_padding_is_clamped() {
+        let mut tunn = tunn_with_mtu(1420);
+
+        // Believing the MTU is 1420, a 1280-byte packet has 140 bytes of room,
+        // so the full 30..114 range applies.
+        assert!(tunn.transport_padding(1280, 65536) >= 30);
+
+        // Told the truth, the same packet exactly fills the interface and must
+        // not be padded at all.
+        tunn.set_mtu(1280);
+        assert_eq!(tunn.transport_padding(1280, 65536), 0);
+
+        // A smaller packet still gets padding, clamped to what is left.
+        let add = tunn.transport_padding(1200, 65536);
+        assert!(add > 0 && add <= 80, "expected a clamped addition, got {add}");
     }
 }
 
