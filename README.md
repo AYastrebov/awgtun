@@ -195,7 +195,7 @@ Zero bytes appended to transport content *inside* the AEAD envelope, so the padd
 
 `ContentPaddingAddition` is a u32 range of bytes added to each transport packet. Because the receiver needs no configuration to undo it, this one really is sender-only, though setting it at both ends obscures both directions.
 
-The addition is clamped to what remains in the MTU segment, so it never causes fragmentation.
+The addition is bounded by the sliding UDP window, the same measure that sizes random trailers, so a small packet grows towards the sizes the tunnel already carries rather than towards the MTU. The MTU still bounds it as well, which is what stops padding sized against an older, wider window from fragmenting after the interface MTU drops.
 
 ### Timings — 3.0
 

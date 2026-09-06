@@ -574,11 +574,16 @@ impl Tunn {
         want.min(dst_len.saturating_sub(packet_size))
     }
 
-    /// AWG 3.1: raise the sliding UDP window to cover a datagram of this size.
+    /// Raise the sliding UDP window to cover a datagram of this size.
+    ///
+    /// Unconditional, as it is upstream. This used to be gated on
+    /// `random_trailers`, which was harmless while the window only sized
+    /// trailers, and became wrong once AWG 3.0 content padding started being
+    /// measured against it too: with trailers off the window would have stayed
+    /// at its starting value forever, quietly capping content padding to a few
+    /// hundred bytes regardless of what the tunnel actually carries.
     fn observe_datagram(&mut self, size: usize) {
-        if self.random_trailers {
-            self.udp_window = self.udp_window.max(size.min(u32::MAX as usize) as u32);
-        }
+        self.udp_window = self.udp_window.max(size.min(u32::MAX as usize) as u32);
     }
 
     /// Reset the AWG 3.1 UDP window to its starting size.
@@ -683,43 +688,62 @@ impl Tunn {
     /// random trailers widen the content instead. A transport packet never
     /// carries an *outer* trailer — its length is self-describing, so bytes on
     /// the end would be indistinguishable from ciphertext.
+    /// Both sources are measured against the size of the whole datagram —
+    /// S4 prefix, transport header, payload and AEAD tag — rather than against
+    /// the payload alone, which is what upstream switched to in `da11c9f`.
     fn transport_padding(&self, packet_size: usize, dst_len: usize) -> usize {
-        if self.content_padding.is_some() {
-            return self.content_padding_addition(packet_size, dst_len);
-        }
         let s4 = self.padding_config.s4 as usize;
-        self.trailer_for(s4 + DATA_OVERHEAD_SZ + packet_size, dst_len)
+        let datagram = s4 + DATA_OVERHEAD_SZ + packet_size;
+        if self.content_padding.is_some() {
+            return self.content_padding_addition(datagram, dst_len);
+        }
+        self.trailer_for(datagram, dst_len)
     }
 
     /// AWG 3.0 content padding addition: a random pick from the configured
-    /// range, clamped to the space left in the last MTU segment. Mirrors
-    /// amneziawg-go's `randomPaddingAddition`; this implementation never pads content to a
-    /// multiple of 16, so the addition applies as-is.
-    fn content_padding_addition(&self, packet_size: usize, dst_len: usize) -> usize {
+    /// range, bounded by the sliding UDP window.
+    ///
+    /// The bound used to be the space left in the last MTU-sized unit.
+    /// amneziawg-go moved it to the window in `da11c9f` (kernel module
+    /// `7fc0145`), which makes a padded packet grow towards the sizes this
+    /// tunnel already carries instead of towards the MTU — the same reasoning
+    /// that gives random trailers their length.
+    ///
+    /// `datagram_size` is the whole datagram, not just the payload.
+    fn content_padding_addition(&self, datagram_size: usize, dst_len: usize) -> usize {
         let range = match self.content_padding {
             Some(range) => range,
             None => return 0,
         };
-        let mut add = range.generate(&mut FastRandom) as usize;
 
+        // Already at or past the window: no room to grow.
+        let window = self.udp_window as usize;
+        let space = match window.checked_sub(datagram_size) {
+            Some(space) => space,
+            None => return 0,
+        };
+        let mut add = (range.generate(&mut FastRandom) as usize).min(space);
+
+        // Upstream drops the MTU from this calculation entirely. Keeping it as
+        // a second bound costs nothing in the normal case, because the window
+        // only ever grows to sizes this tunnel has actually carried and those
+        // are already under the MTU. It matters when the MTU *shrinks* after
+        // the window has grown: without this, padding sized against the old
+        // window would push the packet past the new MTU and fragment it, which
+        // is a louder signal than any amount of padding is worth.
         let mtu = self.mtu as usize;
         if mtu != 0 {
-            let last_unit = if packet_size > mtu {
-                packet_size % mtu
-            } else {
-                packet_size
-            };
-            add = add.min(mtu - last_unit);
+            // `saturating_sub`, not a `<` guard: a datagram that exactly fills
+            // the MTU has no room either, and testing for strictly-less would
+            // let that case through.
+            add = add.min(mtu.saturating_sub(datagram_size));
         }
 
-        // amneziawg-go writes into pooled 64 KiB buffers, so its MTU clamp is
-        // enough to keep a padded packet in bounds. `Tunn` writes into a buffer
-        // the caller owns, so the space actually left in `dst` is a third term
-        // in the same clamp: after the S4 prefix, the transport header, the
-        // payload and the AEAD tag. Padding is best-effort — a tight buffer
-        // yields less of it rather than a panic.
-        let s4 = self.padding_config.s4 as usize;
-        add.min(dst_len.saturating_sub(s4 + DATA_OVERHEAD_SZ + packet_size))
+        // amneziawg-go writes into pooled 64 KiB buffers, so it needs no
+        // equivalent. `Tunn` writes into a buffer the caller owns, so the space
+        // actually left in `dst` is the last bound. Padding is best-effort — a
+        // tight buffer yields less of it rather than a panic.
+        add.min(dst_len.saturating_sub(datagram_size))
     }
 
     /// Format a transport (data or keepalive) packet: dynamic H4 header,
@@ -2663,23 +2687,26 @@ mod tests {
     }
 
     #[test]
-    fn awg3_content_padding_wraps_packets_larger_than_the_mtu() {
-        // packet_size > mtu takes the modulo branch; without it the clamp would
-        // underflow. mtu 100, payload 250 -> last unit 50, space 50.
+    fn awg3_content_padding_stops_at_the_window() {
+        // A datagram that already fills the window gets nothing: the window is
+        // the largest this tunnel has carried, so there is nothing to grow
+        // towards. Upstream `da11c9f` made this the rule instead of the MTU.
         let (mut my_tun, mut their_tun) = create_two_tuns_awg3_cpa(80, 80);
-        my_tun.mtu = 100;
         complete_awg3_handshake(&mut my_tun, &mut their_tun);
 
+        // 600 bytes of payload makes a 648-byte datagram, past the 500-byte
+        // starting window, so the window moves up to it and leaves no room.
         let mut ip = ipv4_packet();
-        ip.resize(250, 0);
-        ip[2..4].copy_from_slice(&250u16.to_be_bytes());
+        ip.resize(600, 0);
+        ip[2..4].copy_from_slice(&600u16.to_be_bytes());
 
         let mut enc = vec![0u8; 2048];
         let wire_len = match my_tun.encapsulate(&ip, &mut enc) {
             TunnResult::WriteToNetwork(packet) => packet.len(),
             other => panic!("expected WriteToNetwork, got {:?}", other),
         };
-        assert_eq!(wire_len, 16 + 16 + 250 + 50 + 16);
+        // S4 + header + payload + tag, and no padding.
+        assert_eq!(wire_len, 16 + 16 + 600 + 16);
 
         let mut dec = vec![0u8; 2048];
         match their_tun.decapsulate(None, &enc[..wire_len], &mut dec) {
@@ -2867,30 +2894,48 @@ mod tests {
     }
 
     #[test]
-    fn awg3_content_padding_is_clamped_to_mtu() {
+    fn awg3_content_padding_grows_small_packets_towards_the_window() {
+        // The point of the change in `da11c9f`: a small packet is padded
+        // towards the sizes this tunnel already carries, so traffic converges
+        // on one size instead of on the MTU.
         let (mut my_tun, mut their_tun) = create_two_tuns_awg3_cpa(200, 200);
         complete_awg3_handshake(&mut my_tun, &mut their_tun);
 
-        // An IP packet 100 bytes short of the MTU leaves room for only 100
-        // padding bytes, so the 200-byte addition is clamped.
-        let mtu = crate::amnezia::AWG3_DEFAULT_MTU as usize;
-        let mut ip = ipv4_packet();
-        ip.resize(mtu - 100, 0);
-        let len = ip.len() as u16;
-        ip[2..4].copy_from_slice(&len.to_be_bytes());
-
+        // A large packet first, which is what widens the window.
+        let mut big = ipv4_packet();
+        big.resize(1000, 0);
+        big[2..4].copy_from_slice(&1000u16.to_be_bytes());
         let mut enc_buf = vec![0u8; 4096];
-        let wire_len = match my_tun.encapsulate(&ip, &mut enc_buf) {
+        assert!(matches!(
+            my_tun.encapsulate(&big, &mut enc_buf),
+            TunnResult::WriteToNetwork(_)
+        ));
+
+        // Now a small one. The window is 16 + 32 + 1000, leaving plenty of
+        // room, so the full 200-byte addition applies.
+        let small = ipv4_packet();
+        let wire_len = match my_tun.encapsulate(&small, &mut enc_buf) {
             TunnResult::WriteToNetwork(packet) => packet.len(),
             other => panic!("expected WriteToNetwork, got {:?}", other),
         };
-        assert_eq!(wire_len, 16 + 16 + ip.len() + 100 + 16);
+        assert_eq!(wire_len, 16 + 16 + small.len() + 200 + 16);
     }
 
     #[test]
     fn awg3_content_padding_is_clamped_to_the_destination_buffer() {
         let (mut my_tun, mut their_tun) = create_two_tuns_awg3_cpa(500, 500);
         complete_awg3_handshake(&mut my_tun, &mut their_tun);
+
+        // Widen the window first, so the padding this test clamps is bounded by
+        // the destination buffer rather than by the window.
+        let mut big = ipv4_packet();
+        big.resize(1200, 0);
+        big[2..4].copy_from_slice(&1200u16.to_be_bytes());
+        let mut warm = vec![0u8; 4096];
+        assert!(matches!(
+            my_tun.encapsulate(&big, &mut warm),
+            TunnResult::WriteToNetwork(_)
+        ));
 
         let ip = ipv4_packet();
         // Room for the packet plus only 40 bytes of padding. amneziawg-go would
@@ -3098,29 +3143,38 @@ mod awg3_mtu_tracking {
         Tunn::new_with_amnezia3(sk, pk, None, None, 0, None, c).unwrap()
     }
 
-    /// Content padding is clamped to the space left in the last MTU-sized unit,
-    /// so a packet that already fills the MTU must get none. An interface whose
-    /// MTU is set after the device is built -- what `wg-quick` does -- would
-    /// otherwise keep padding full-size packets past the real MTU and fragment
-    /// them.
+    /// The MTU is no longer the primary bound on content padding — upstream
+    /// `da11c9f` moved that to the sliding UDP window — but it is kept as a
+    /// second one, and this is the case where it earns its place: the window
+    /// grew while the interface was believed to be larger than it is, and
+    /// without the MTU bound the padding sized against that window would push
+    /// the packet past the real MTU and fragment it.
     #[test]
-    fn set_mtu_changes_how_content_padding_is_clamped() {
+    fn set_mtu_still_bounds_content_padding() {
         let mut tunn = tunn_with_mtu(1420);
 
-        // Believing the MTU is 1420, a 1280-byte packet has 140 bytes of room,
-        // so the full 30..114 range applies.
-        assert!(tunn.transport_padding(1280, 65536) >= 30);
+        // This config leaves S4 at zero, so a datagram is the payload plus the
+        // transport header and the AEAD tag.
+        let payload_for = |datagram: usize| datagram - DATA_OVERHEAD_SZ;
 
-        // Told the truth, the same packet exactly fills the interface and must
-        // not be padded at all.
+        // Open the window well past any MTU used below.
+        tunn.observe_datagram(1448);
+
+        // At an MTU of 1420 a 1200-byte datagram has room under both bounds, so
+        // the configured 30..114 range applies in full.
+        assert!(tunn.transport_padding(payload_for(1200), 65536) >= 30);
+
+        // Now the interface turns out to be 1280. The window still says 1448,
+        // so only the MTU keeps this packet from being padded past the link.
         tunn.set_mtu(1280);
-        assert_eq!(tunn.transport_padding(1280, 65536), 0);
+        let add = tunn.transport_padding(payload_for(1280), 65536);
+        assert_eq!(add, 0, "a datagram that fills the MTU must not be padded");
 
-        // A smaller packet still gets padding, clamped to what is left.
-        let add = tunn.transport_padding(1200, 65536);
+        // A smaller one is padded, but never past the MTU.
+        let add = tunn.transport_padding(payload_for(1200), 65536);
         assert!(
             add > 0 && add <= 80,
-            "expected a clamped addition, got {}",
+            "expected a bounded addition, got {}",
             add
         );
     }

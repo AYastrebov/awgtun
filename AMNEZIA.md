@@ -354,7 +354,9 @@ An all-zero key means "disabled", matching `HeaderProtectionCipher`'s `key.IsZer
 
 A random number of zero bytes, picked per packet from the configured range, appended to the transport content **inside** the AEAD envelope. Because the padding is authenticated, no length field is needed: the receiver trims it using the IP total-length field and needs no configuration of its own.
 
-The addition is clamped to the space left in the last MTU segment: `add = min(add, mtu - packet_size % mtu)`. `Tunn` has no MTU concept of its own, so the MTU used for clamping is an `Amnezia3Config` field (default 1420, matching the Go device default).
+The addition is bounded by the sliding UDP window: `add = min(add, window - datagram_size)`, and zero once the datagram already fills the window. amneziawg-go moved this off the MTU in `da11c9f` (kernel module `7fc0145`), which makes content padding grow a packet towards the sizes this tunnel has actually carried instead of towards the link size — the same measure that gives random trailers their length. Note that the size compared against is the whole datagram, S4 prefix and AEAD tag included, not the payload.
+
+The MTU is kept as a second bound, which upstream drops. It costs nothing while the window stays under the MTU, which is the normal case since the window only grows to datagrams that have already been sent or received. It earns its place when the MTU *shrinks* after the window has widened: padding sized against the old window would otherwise push the packet past the new MTU and fragment it. `Tunn` has no MTU concept of its own, so the value is an `Amnezia3Config` field (default 1420) that `Device` refreshes through `Tunn::set_mtu`.
 
 Keepalives are content-padded too, which is one of the two ways a padded
 keepalive can stop looking like a keepalive. See [Keepalives](#keepalives).
@@ -1108,7 +1110,7 @@ so a library caller changing parameters must build a new one.
 | Header protection spans | 148 / 92 / 64 / 16 | Same | Exact |
 | MACs before encryption | Yes | Yes | Exact |
 | All-zero header key = off | Yes | Yes (`Option`/NULL/all-zero) | Exact |
-| Content padding inside AEAD | Yes, clamped to MTU segment | Same, plus a clamp to the caller's buffer | Exact when `dst` has room |
+| Content padding inside AEAD | Yes, bounded by the UDP window | Same, plus bounds on the MTU and the caller's buffer | Exact when `dst` has room and the MTU is current |
 | All-zero payload on receive | Keepalive: `elem.packet[0] == 0` | `packet[0] == 0` | Exact |
 | Other non-IP payload on receive | Dropped, counted as data received | Same | Exact |
 | Timing range pick rules | Per-arm (see table above) | Same | Exact |
