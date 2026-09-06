@@ -257,12 +257,12 @@ impl<'a> PacketClassifier<'a> {
         // wire -- so trying transport first costs no interoperability. It moves
         // the same collision onto handshake messages, which are rare and
         // retried, instead of onto every data packet.
-        let checks: [(usize, &crate::amnezia::HeaderRange, usize, bool); 4] = if self.random_trailers
-        {
-            [transport, init, response, cookie]
-        } else {
-            [init, response, cookie, transport]
-        };
+        let checks: [(usize, &crate::amnezia::HeaderRange, usize, bool); 4] =
+            if self.random_trailers {
+                [transport, init, response, cookie]
+            } else {
+                [init, response, cookie, transport]
+            };
 
         // Every candidate shares this datagram's nonce, so the keystream is
         // derived once here and reused: for the type check below, and — for a
@@ -830,8 +830,8 @@ impl Tunn {
         ];
         for (padding, range, msg_size) in candidates {
             let expected = padding + msg_size;
-            let size_ok = datagram.len() == expected
-                || (self.random_trailers && datagram.len() > expected);
+            let size_ok =
+                datagram.len() == expected || (self.random_trailers && datagram.len() > expected);
             if !size_ok || padding + 4 > datagram.len() {
                 continue;
             }
@@ -934,16 +934,13 @@ impl Tunn {
             stripped,
             &mut cookie,
             &self.header_config,
+            self.disable_cookies,
         ) {
             Ok(packet) => packet,
             Err(TunnResult::WriteToNetwork(cookie)) => {
-                // AWG 3.1: the rate limiter still decided a cookie was
-                // warranted; `disable_cookies` only suppresses the reply, so
-                // the sender gets silence instead of a retry hint.
-                if self.disable_cookies {
-                    tracing::debug!("Cookie reply suppressed by disable_cookies");
-                    return TunnResult::Done;
-                }
+                // Reaching here means the rate limiter entered the under-load
+                // path, which `disable_cookies` prevents outright, so there is
+                // nothing to suppress at this point.
                 // Add S3 padding to cookie reply
                 let s3 = self.padding_config.s3 as usize;
                 if s3 > 0 {
@@ -2468,17 +2465,27 @@ mod tests {
         }
     }
 
+    /// AmneziaWG 3.1 `disable_cookies` turns off the under-load path as a
+    /// whole, not just the reply. With it on, an initiation arriving at a
+    /// saturated device is handled exactly as it would be on an idle one.
+    ///
+    /// Suppressing only the reply, which this used to do, is worse than doing
+    /// nothing: the rate limiter still demands a valid MAC2, and the peer never
+    /// gets the cookie it would need to build one, so every handshake under
+    /// load dies in silence. Upstream made the same mistake and fixed it in
+    /// amneziawg-go `b5928ef` and kernel module `3c38e16`.
     #[test]
-    fn awg31_disable_cookies_suppresses_the_reply() {
+    fn awg31_disable_cookies_lets_handshakes_through_under_load() {
         let key = [0x42u8; 32];
-        let their_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
-        let their_public_key = x25519_dalek::PublicKey::from(&their_secret_key);
 
-        // Same zero-limit rate limiter as the cookie test: every packet is
-        // "under load", so a reply is always warranted.
-        for (disable, expect_reply) in [(false, true), (true, false)] {
+        // A zero-limit rate limiter reports "under load" on the very first
+        // packet, so this is the saturated case in both runs.
+        for disable_cookies in [false, true] {
+            let their_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+            let their_public_key = x25519_dalek::PublicKey::from(&their_secret_key);
             let my_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
             let my_public_key = x25519_dalek::PublicKey::from(&my_secret_key);
+
             let mut my_tun = Tunn::new_with_amnezia3(
                 my_secret_key,
                 their_public_key,
@@ -2486,35 +2493,57 @@ mod tests {
                 None,
                 1,
                 None,
-                awg31_test_config(key, false, disable),
+                awg31_test_config(key, false, disable_cookies),
             )
             .expect("valid config");
             let mut their_tun = Tunn::new_with_amnezia3(
-                their_secret_key.clone(),
+                their_secret_key,
                 my_public_key,
                 None,
                 None,
                 2,
                 Some(Arc::new(RateLimiter::new(&their_public_key, 0))),
-                awg31_test_config(key, false, disable),
+                awg31_test_config(key, false, disable_cookies),
             )
             .expect("valid config");
 
             let init = create_handshake_init(&mut my_tun);
             let mut dst = vec![0u8; 2048];
-            let result =
-                their_tun.decapsulate(Some(std::net::IpAddr::from([1, 2, 3, 4])), &init, &mut dst);
-            if expect_reply {
+            let reply = match their_tun.decapsulate(
+                Some(std::net::IpAddr::from([1, 2, 3, 4])),
+                &init,
+                &mut dst,
+            ) {
+                TunnResult::WriteToNetwork(packet) => packet.to_vec(),
+                other => panic!(
+                    "disable_cookies={}: expected a datagram back, got {:?}",
+                    disable_cookies, other
+                ),
+            };
+
+            // S3 + 64 is a cookie reply; S2 + 92 is a real handshake response.
+            // The sizes differ, so the two outcomes cannot be confused.
+            if disable_cookies {
+                assert_eq!(
+                    reply.len(),
+                    16 + HANDSHAKE_RESP_SZ,
+                    "with cookies disabled the initiation must be answered normally, \
+                     not turned into a cookie challenge"
+                );
+                // And the answer has to be a response the initiator accepts.
+                let mut my_dst = vec![0u8; 2048];
                 assert!(
-                    matches!(result, TunnResult::WriteToNetwork(_)),
-                    "expected a cookie reply, got {:?}",
-                    result
+                    matches!(
+                        my_tun.decapsulate(None, &reply, &mut my_dst),
+                        TunnResult::WriteToNetwork(_)
+                    ),
+                    "the initiator should accept the response and arm a keepalive"
                 );
             } else {
-                assert!(
-                    matches!(result, TunnResult::Done),
-                    "disable_cookies should suppress the reply, got {:?}",
-                    result
+                assert_eq!(
+                    reply.len(),
+                    16 + COOKIE_REPLY_SZ,
+                    "with cookies enabled a saturated device must answer with a cookie"
                 );
             }
         }
@@ -3059,9 +3088,11 @@ mod awg3_mtu_tracking {
     use crate::amnezia::{Amnezia3Config, U32Range};
 
     fn tunn_with_mtu(mtu: u32) -> Tunn {
-        let mut c = Amnezia3Config::default();
-        c.content_padding_addition = Some(U32Range::new(30, 114).unwrap());
-        c.mtu = mtu;
+        let c = Amnezia3Config {
+            content_padding_addition: Some(U32Range::new(30, 114).unwrap()),
+            mtu,
+            ..Default::default()
+        };
         let sk = x25519::StaticSecret::from([5u8; 32]);
         let pk = x25519::PublicKey::from(&x25519::StaticSecret::from([6u8; 32]));
         Tunn::new_with_amnezia3(sk, pk, None, None, 0, None, c).unwrap()
@@ -3087,7 +3118,11 @@ mod awg3_mtu_tracking {
 
         // A smaller packet still gets padding, clamped to what is left.
         let add = tunn.transport_padding(1200, 65536);
-        assert!(add > 0 && add <= 80, "expected a clamped addition, got {add}");
+        assert!(
+            add > 0 && add <= 80,
+            "expected a clamped addition, got {}",
+            add
+        );
     }
 }
 
@@ -3097,18 +3132,24 @@ mod awg31_peer_misclassification {
     use crate::amnezia::{Amnezia3Config, HeaderConfig, HeaderRange, PaddingConfig};
 
     fn cfg() -> Amnezia3Config {
-        let mut c = Amnezia3Config::default();
-        c.paddings = PaddingConfig { s1: 41, s2: 83, s3: 29, s4: 23 };
-        c.headers = HeaderConfig::new(
-            HeaderRange::new(1_100_000_000, 1_150_000_000).unwrap(),
-            HeaderRange::new(1_250_000_000, 1_300_000_000).unwrap(),
-            HeaderRange::new(1_400_000_000, 1_450_000_000).unwrap(),
-            HeaderRange::new(1_550_000_000, 1_600_000_000).unwrap(),
-        )
-        .unwrap();
-        c.random_trailers = true;
-        c.header_protection_key = Some([7u8; 32]);
-        c
+        Amnezia3Config {
+            paddings: PaddingConfig {
+                s1: 41,
+                s2: 83,
+                s3: 29,
+                s4: 23,
+            },
+            headers: HeaderConfig::new(
+                HeaderRange::new(1_100_000_000, 1_150_000_000).unwrap(),
+                HeaderRange::new(1_250_000_000, 1_300_000_000).unwrap(),
+                HeaderRange::new(1_400_000_000, 1_450_000_000).unwrap(),
+                HeaderRange::new(1_550_000_000, 1_600_000_000).unwrap(),
+            )
+            .unwrap(),
+            random_trailers: true,
+            header_protection_key: Some([7u8; 32]),
+            ..Default::default()
+        }
     }
 
     /// Classify a datagram the way an *unpatched* peer does: init, response and
@@ -3119,7 +3160,11 @@ mod awg31_peer_misclassification {
         let mask = hp.type_mask(d);
         for (padding, range, size) in [
             (c.paddings.s1 as usize, &c.headers.init, HANDSHAKE_INIT_SZ),
-            (c.paddings.s2 as usize, &c.headers.response, HANDSHAKE_RESP_SZ),
+            (
+                c.paddings.s2 as usize,
+                &c.headers.response,
+                HANDSHAKE_RESP_SZ,
+            ),
             (c.paddings.s3 as usize, &c.headers.cookie, COOKIE_REPLY_SZ),
         ] {
             let expected = padding + size;
@@ -3151,8 +3196,7 @@ mod awg31_peer_misclassification {
         let c = cfg();
         let sk = x25519::StaticSecret::from([3u8; 32]);
         let pk = x25519::PublicKey::from(&x25519::StaticSecret::from([9u8; 32]));
-        let mut tunn =
-            Tunn::new_with_amnezia3(sk, pk, None, None, 0, None, c.clone()).unwrap();
+        let mut tunn = Tunn::new_with_amnezia3(sk, pk, None, None, 0, None, c.clone()).unwrap();
 
         // A session has to exist before `encapsulate` will emit transport data.
         let session = crate::noise::session::Session::new(0, 0, [0u8; 32], [0u8; 32]);
@@ -3179,7 +3223,7 @@ mod awg31_peer_misclassification {
                     );
                     sent += 1;
                 }
-                other => panic!("expected a transport packet, got {other:?}"),
+                other => panic!("expected a transport packet, got {:?}", other),
             }
         }
         assert_eq!(sent, 3000);
@@ -3192,17 +3236,23 @@ mod awg31_trailer_trimming {
     use crate::amnezia::{Amnezia3Config, HeaderConfig, HeaderRange, PaddingConfig};
 
     fn cfg() -> Amnezia3Config {
-        let mut c = Amnezia3Config::default();
-        c.paddings = PaddingConfig { s1: 41, s2: 83, s3: 29, s4: 23 };
-        c.headers = HeaderConfig::new(
-            HeaderRange::new(1_100_000_000, 1_150_000_000).unwrap(),
-            HeaderRange::new(1_250_000_000, 1_300_000_000).unwrap(),
-            HeaderRange::new(1_400_000_000, 1_450_000_000).unwrap(),
-            HeaderRange::new(1_550_000_000, 1_600_000_000).unwrap(),
-        )
-        .unwrap();
-        c.random_trailers = true;
-        c
+        Amnezia3Config {
+            paddings: PaddingConfig {
+                s1: 41,
+                s2: 83,
+                s3: 29,
+                s4: 23,
+            },
+            headers: HeaderConfig::new(
+                HeaderRange::new(1_100_000_000, 1_150_000_000).unwrap(),
+                HeaderRange::new(1_250_000_000, 1_300_000_000).unwrap(),
+                HeaderRange::new(1_400_000_000, 1_450_000_000).unwrap(),
+                HeaderRange::new(1_550_000_000, 1_600_000_000).unwrap(),
+            )
+            .unwrap(),
+            random_trailers: true,
+            ..Default::default()
+        }
     }
 
     /// A handshake response as an AWG 3.1 peer puts it on the wire: S2 padding,
@@ -3243,7 +3293,8 @@ mod awg31_trailer_trimming {
             let untrimmed = &datagram[classified.padding..];
             assert!(
                 Tunn::parse_incoming_packet_config(untrimmed, &cfg.headers).is_err(),
-                "trailer {trailer}: an untrimmed response must not parse"
+                "trailer {}: an untrimmed response must not parse",
+                trailer
             );
 
             // Trimmed to `msg_size`, as both receive paths must do.
@@ -3253,7 +3304,8 @@ mod awg31_trailer_trimming {
                     Tunn::parse_incoming_packet_config(trimmed, &cfg.headers),
                     Ok(Packet::HandshakeResponse(_))
                 ),
-                "trailer {trailer}: a trimmed response must parse"
+                "trailer {}: a trimmed response must parse",
+                trailer
             );
         }
     }
@@ -3267,22 +3319,23 @@ mod awg31_transport_classification {
     /// A realistic AWG 3.1 parameter set: 50-million-wide header ranges, which
     /// is the width Amnezia's own config generator emits.
     fn cfg(random_trailers: bool) -> Amnezia3Config {
-        let mut c = Amnezia3Config::default();
-        c.paddings = PaddingConfig {
-            s1: 41,
-            s2: 83,
-            s3: 29,
-            s4: 23,
-        };
-        c.headers = HeaderConfig::new(
-            HeaderRange::new(1_100_000_000, 1_150_000_000).unwrap(),
-            HeaderRange::new(1_250_000_000, 1_300_000_000).unwrap(),
-            HeaderRange::new(1_400_000_000, 1_450_000_000).unwrap(),
-            HeaderRange::new(1_550_000_000, 1_600_000_000).unwrap(),
-        )
-        .unwrap();
-        c.random_trailers = random_trailers;
-        c
+        Amnezia3Config {
+            paddings: PaddingConfig {
+                s1: 41,
+                s2: 83,
+                s3: 29,
+                s4: 23,
+            },
+            headers: HeaderConfig::new(
+                HeaderRange::new(1_100_000_000, 1_150_000_000).unwrap(),
+                HeaderRange::new(1_250_000_000, 1_300_000_000).unwrap(),
+                HeaderRange::new(1_400_000_000, 1_450_000_000).unwrap(),
+                HeaderRange::new(1_550_000_000, 1_600_000_000).unwrap(),
+            )
+            .unwrap(),
+            random_trailers,
+            ..Default::default()
+        }
     }
 
     /// A well-formed transport datagram: S4 padding prefix, a type value drawn

@@ -822,6 +822,7 @@ impl Device {
                         packet,
                         &mut cookie,
                         &d.amnezia.headers,
+                        d.amnezia.disable_cookies,
                     ) {
                         Ok(packet) => packet,
                         Err(TunnResult::WriteToNetwork(cookie_reply)) => {

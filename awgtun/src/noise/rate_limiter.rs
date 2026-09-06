@@ -152,13 +152,25 @@ impl RateLimiter {
         Ok(&mut dst[..super::COOKIE_REPLY_SZ])
     }
 
-    /// Verify the MAC fields on the datagram, and apply rate limiting if needed
+    /// Verify the MAC fields on the datagram, and apply rate limiting if needed.
+    ///
+    /// `disable_cookies` is the AmneziaWG 3.1 switch. It turns off the
+    /// under-load path as a whole rather than only the reply: MAC2 is not
+    /// checked and no cookie is produced, so an initiation is handled exactly
+    /// as it would be with the device idle.
+    ///
+    /// Suppressing only the reply, which is what this used to do, is worse than
+    /// useless. The rate limiter still demands a valid MAC2, the peer never
+    /// receives the cookie it would need to produce one, and every handshake
+    /// under load is dropped in silence. Upstream fixed the same mistake in
+    /// amneziawg-go `b5928ef` and kernel module `3c38e16`.
     pub fn verify_packet<'a, 'b>(
         &self,
         src_addr: Option<IpAddr>,
         src: &'a [u8],
         dst: &'b mut [u8],
         header_config: &HeaderConfig,
+        disable_cookies: bool,
     ) -> Result<Packet<'a>, TunnResult<'b>> {
         let packet = Tunn::parse_incoming_packet_config(src, header_config)?;
 
@@ -174,7 +186,7 @@ impl RateLimiter {
                 return Err(TunnResult::Err(WireGuardError::InvalidMac));
             }
 
-            if self.is_under_load() {
+            if !disable_cookies && self.is_under_load() {
                 let addr = match src_addr {
                     None => return Err(TunnResult::Err(WireGuardError::UnderLoad)),
                     Some(addr) => addr,
@@ -264,6 +276,7 @@ mod tests {
                 &packet,
                 &mut dst,
                 &HeaderConfig::wireguard_compatible(),
+                false,
             )
             .expect("a genuine initiation must verify");
         assert!(matches!(parsed, Packet::HandshakeInit(_)));
@@ -289,6 +302,7 @@ mod tests {
                 &forged,
                 &mut dst,
                 &HeaderConfig::wireguard_compatible(),
+                false,
             );
             assert!(
                 matches!(result, Err(TunnResult::Err(WireGuardError::InvalidMac))),
@@ -313,6 +327,7 @@ mod tests {
             &packet,
             &mut dst,
             &HeaderConfig::wireguard_compatible(),
+            false,
         ) {
             Err(TunnResult::WriteToNetwork(reply)) => {
                 assert_eq!(reply.len(), super::super::COOKIE_REPLY_SZ);
@@ -339,7 +354,7 @@ mod tests {
         // Several draws, since the type is random within the range.
         for _ in 0..16 {
             let mut dst = [0u8; super::super::COOKIE_REPLY_SZ];
-            match limiter.verify_packet(Some(addr), &packet, &mut dst, &headers) {
+            match limiter.verify_packet(Some(addr), &packet, &mut dst, &headers, false) {
                 Err(TunnResult::WriteToNetwork(reply)) => {
                     let msg_type = u32::from_le_bytes(reply[..4].try_into().unwrap());
                     assert!(
@@ -366,6 +381,7 @@ mod tests {
             &packet,
             &mut dst,
             &HeaderConfig::wireguard_compatible(),
+            false,
         );
         assert!(matches!(
             result,
@@ -386,6 +402,7 @@ mod tests {
             &packet,
             &mut dst,
             &HeaderConfig::wireguard_compatible(),
+            false,
         );
         assert!(matches!(
             result,
