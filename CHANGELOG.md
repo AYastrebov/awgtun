@@ -3,6 +3,29 @@
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0] - 2026-09-07
+
+AmneziaWG 3.1 interoperability. Everything here came out of running against a
+live 3.1 server and against the three upstream implementations; several of these
+bugs made a 3.1 link either impossible or quietly lossy, and none of them
+produced a log line at either end.
+
+### Fixed
+
+- **Transport packets were classified after handshakes, losing ~3.5% of them.** AWG 3.1 relaxes the three handshake size tests from `==` to `>=`, so a full-size data packet passes all three on size alone and only the type-range test stands between it and a misparse. That field is read over ciphertext, so it is uniformly random: with the 50-million-wide ranges Amnezia's own generator emits, each range steals ~1.16% of data packets and all three were tried first. Measured against a live server, throughput went from ~4.2 MB/s to ~14.5 MB/s once transport is classified first, and the loss was unstable across runs rather than a flat slowdown.
+- **The same collision on the send side.** Fixing our own classifier only protects what we receive; a peer running an unpatched classifier still drops what we send. Outbound loss measured 5.0-5.2% against a live server while inbound was 0.0%, with uploads at 0.17 MB/s against downloads at 14.5 MB/s. Transport packets that would collide with a handshake range are no longer emitted. This has no removal criterion: there is no version negotiation, so a sender cannot tell which classifier a peer runs.
+- **The device never trimmed the 3.1 random trailer.** `Tunn::decapsulate` did; the device's UDP receive path passed message-plus-trailer to the rate limiter, where the `==` size tests rejected it and `Err(_) => continue` dropped it silently. A device could not complete a handshake with a trailered peer in either role.
+- **CPS random lengths were capped at an invented 1000 bytes.** `newRandObf` in amneziawg-go applies no range check, and production `I1` chains pad an initiation to the size of a TLS record with a random-bytes tag well past that. A live 3.1 server's configuration was rejected outright with `errno=22`. The only real bound is the datagram.
+- **`DisableCookies` suppressed the reply instead of the whole under-load path.** The rate limiter still demanded a valid MAC2 while the peer never received the cookie needed to build one, so every handshake against a busy device died in silence — worse than not having the switch. Matches amneziawg-go `b5928ef` and kernel module `3c38e16`.
+- **The device read the interface MTU once and kept it.** `wg-quick` sets the MTU after handing over the interface, so the value was routinely wrong — 1500 on a macOS utun whose tunnel is really 1420 — and content padding sized against it would fragment. The MTU is now polled and pushed into each peer through the new `Tunn::set_mtu`.
+- `conf_to_uapi.py` dropped `RandomTrailers` and `DisableCookies` silently, and forwarded `I2 =` as an empty `i2=`, which the device rejects.
+
+### Changed
+
+- **`RateLimiter::verify_packet` takes a `disable_cookies` argument.** This is the breaking change in this release. It gates entry to the under-load path, which is what `DisableCookies` has to do.
+- **AWG 3.0 content padding is bounded by the sliding UDP window, not the MTU**, following amneziawg-go `da11c9f` and kernel module `7fc0145`. A packet now grows towards the sizes the tunnel has actually carried rather than towards the link size, and the size compared against is the whole datagram rather than the payload. The MTU is kept as a second bound, which upstream drops: it costs nothing while the window stays under the MTU, and prevents fragmentation when the MTU shrinks after the window has widened.
+- The UDP window is now widened unconditionally rather than only when `random_trailers` is on. That was harmless while the window sized nothing but trailers; once content padding is measured against it, a tunnel with trailers off would have kept its starting window forever.
+
 ## [0.9.0] - 2026-08-20
 
 The C and JNI bindings move out of the library into a new `awgtun-ffi` crate.

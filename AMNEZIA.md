@@ -150,9 +150,9 @@ releases. All three are the current `master` and the newest tag of their repo.
 
 | Repo | Release | Commit | Date |
 |---|---|---|---|
-| [amneziawg-go](https://github.com/amnezia-vpn/amneziawg-go) | `v3.1.20260814` | `1b86b2a` | 2026-08-13 |
-| [amneziawg-tools](https://github.com/amnezia-vpn/amneziawg-tools) | `v3.1.20260812` | `ee0f0a9` | 2026-08-13 |
-| [amneziawg-linux-kernel-module](https://github.com/amnezia-vpn/amneziawg-linux-kernel-module) | `v3.1.20260812` | `4680320` | 2026-08-13 |
+| [amneziawg-go](https://github.com/amnezia-vpn/amneziawg-go) | `v3.1.20260828` | `b5928ef` | 2026-08-28 |
+| [amneziawg-tools](https://github.com/amnezia-vpn/amneziawg-tools) | `v3.1.20260812` | `ee0f0a9` | 2026-08-12 |
+| [amneziawg-linux-kernel-module](https://github.com/amnezia-vpn/amneziawg-linux-kernel-module) | `v3.1.20260906` | `4569c4c` | 2026-09-06 |
 
 To check for drift, clone each and `git log <commit>..HEAD` from the row above;
 an empty result on all three means there is nothing to do. Read all three when
@@ -169,9 +169,9 @@ to 2025-11-04), so it is a stale experiment rather than the next release.
 
 ## AmneziaWG 3.1
 
-Two device-scoped booleans, both off by default. Audited and implemented
-2026-08-13 against amneziawg-go `1b86b2a`, which is the reference the wire
-behaviour below follows.
+Two device-scoped booleans, both off by default. Implemented 2026-08-13 against
+amneziawg-go `1b86b2a` and re-audited 2026-09-06 against `b5928ef`, which is the
+reference the wire behaviour below follows.
 
 | Parameter | `.conf` | UAPI | `awg set` |
 |---|---|---|---|
@@ -948,6 +948,7 @@ independent AmneziaWG server implementations:
 |---|---|---|
 | amneziawg-go | AmneziaWG 2.0 — `H1`–`H4`, `S1`–`S4`, junk, `I1`–`I5` | `awgtun-cli` over the UAPI socket, exactly as `awg setconf` drives it |
 | amneziawg kernel module | AmneziaWG 3.0 — the 2.0 layers plus header protection, content padding and randomized timings | `Tunn` driven directly over a UDP socket |
+| AmneziaWG 3.1 server | AmneziaWG 3.1 — the 3.0 layers plus random trailers | `awgtun-cli` over the UAPI socket |
 
 The 3.0 run is what puts header protection and content padding on the wire
 against something other than ourselves. Header protection in particular gives a
@@ -956,6 +957,14 @@ with the nonce taken from the padding prefix, so a keystream or nonce derivation
 that disagreed with the reference by a single byte would make every datagram
 unclassifiable and nothing would handshake at all. Both sides handshook in
 roughly 25 ms.
+
+The 3.1 run is what found the trailer and classification bugs this fork carried:
+a device that never trimmed the trailer could not handshake at all, and once it
+could, the two directions lost packets at different rates because a peer's
+classifier is not ours to fix. Both are described under [Random
+trailers](#random-trailers). Interop against a 3.1 peer with trailers on is
+therefore verified, but only for a peer running amneziawg-go — the kernel module
+has not been tested with trailers.
 
 Packet captures of those runs confirmed, against each server's own parameters:
 
@@ -1219,7 +1228,7 @@ UAPI configuration is no longer on this list — see
 
 1. **No batched I/O**: amneziawg-go reads and writes up to 128 packets per syscall and uses GSO on Linux; this does one `recv_from` per datagram. At high packet rates that difference outweighs everything else on this page. (This entry used to read "client-only". That was wrong: `handle_handshake_init` answers an initiation with an H2 type, an S2 prefix and header protection, and `test_awg3_handshake_between_two_devices` has a working responder.)
 
-2. **Interop is verified manually, not automatically**: this fork has completed handshakes and passed traffic against both amneziawg-go and the amneziawg kernel module, the latter with the full 3.0 feature set (see [Verified interoperability](#verified-interoperability)) — but those were manual runs. Automated coverage is still unit tests, a differential test against an independent reimplementation of the Go keystream, and integration tests between two awgtun devices — none of which would catch a misreading of the Go source shared by our implementation and our tests. A Docker-based test against amneziawg-go is not yet written, so interop can regress silently.
+2. **Interop is verified manually, not automatically**: this fork has completed handshakes and passed traffic against amneziawg-go, against the amneziawg kernel module with the full 3.0 feature set, and against a live AmneziaWG 3.1 server with random trailers on (see [Verified interoperability](#verified-interoperability)) — but those were manual runs. Automated coverage is still unit tests, a differential test against an independent reimplementation of the Go keystream, and integration tests between two awgtun devices — none of which would catch a misreading of the Go source shared by our implementation and our tests. A Docker-based test against amneziawg-go is not yet written, so interop can regress silently.
 
 3. **Buffer size responsibility**: With padding active, callers must allocate larger output buffers than standard WireGuard. The `encapsulate()` and `format_handshake_initiation()` docs specify the required sizes.
 
