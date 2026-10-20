@@ -1595,7 +1595,13 @@ mod tests {
         let packet = Tunn::parse_incoming_packet(&init).unwrap();
         assert!(matches!(packet, Packet::HandshakeInit(_)));
 
-        mock_instant::MockClock::advance(REKEY_TIMEOUT);
+        // The retransmit waits up to 334 ms of jitter past REKEY_TIMEOUT.
+        mock_instant::MockClock::advance(
+            REKEY_TIMEOUT
+                + Duration::from_millis(u64::from(
+                    crate::noise::timers::REKEY_TIMEOUT_JITTER_MAX_MS,
+                )),
+        );
         update_timer_results_in_handshake(&mut my_tun)
     }
 
@@ -2056,7 +2062,13 @@ mod tests {
         mock_instant::MockClock::advance(Duration::from_secs(1));
         assert!(matches!(my_tun.update_timers(&mut dst), TunnResult::Done));
 
-        mock_instant::MockClock::advance(Duration::from_secs(1));
+        // Past 2 s and the reference's jitter of up to 334 ms.
+        mock_instant::MockClock::advance(
+            Duration::from_secs(1)
+                + Duration::from_millis(u64::from(
+                    crate::noise::timers::REKEY_TIMEOUT_JITTER_MAX_MS,
+                )),
+        );
         update_timer_results_in_handshake(&mut my_tun);
     }
 
@@ -2122,11 +2134,16 @@ mod tests {
         ));
 
         // Last authenticated receive was the handshake response at t=0, so the
-        // new-handshake timer is due at t=8.
+        // new-handshake timer is due at t=8, plus up to 334 ms of jitter.
         mock_instant::MockClock::advance(Duration::from_secs(6));
         assert!(matches!(my_tun.update_timers(&mut dst), TunnResult::Done));
 
-        mock_instant::MockClock::advance(Duration::from_secs(1));
+        mock_instant::MockClock::advance(
+            Duration::from_secs(1)
+                + Duration::from_millis(u64::from(
+                    crate::noise::timers::REKEY_TIMEOUT_JITTER_MAX_MS,
+                )),
+        );
         update_timer_results_in_handshake(&mut my_tun);
     }
 

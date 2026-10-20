@@ -3,6 +3,12 @@
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Handshake retransmits had no jitter.** wireguard-go and amneziawg-go arm the retransmit and new-handshake timers for their timeout plus a random 0-334 ms (`RekeyTimeoutJitterMaxMs`); this fork only said so in a comment, so every retry fired on a whole second. Both timers now carry the jitter, drawn per initiation as the reference does.
+
 ## [0.10.0] - 2026-09-07
 
 AmneziaWG 3.1 interoperability. Everything here came out of running against a

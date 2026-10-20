@@ -33,6 +33,10 @@ const REJECT_AFTER_TIME: Duration = Duration::from_secs(REJECT_AFTER_TIME_SECS a
 const REKEY_ATTEMPT_TIME: Duration =
     Duration::from_secs((REKEY_TIMEOUT_SECS * MAX_TIMER_HANDSHAKES) as u64);
 pub(crate) const REKEY_TIMEOUT: Duration = Duration::from_secs(REKEY_TIMEOUT_SECS as u64);
+/// The retransmit timer is armed for `REKEY_TIMEOUT` plus `[0, 334)` ms
+/// (wireguard-go `RekeyTimeoutJitterMaxMs`, `fastrandn` in
+/// `timersHandshakeInitiated`; amneziawg-go keeps it on its picked timeout).
+pub(crate) const REKEY_TIMEOUT_JITTER_MAX_MS: u32 = 334;
 const COOKIE_EXPIRATION_TIME: Duration = Duration::from_secs(120);
 
 #[derive(Debug)]
@@ -121,6 +125,9 @@ impl Timers {
     /// deadline, since this implementation bounds retries by time rather than by count —
     /// with default ranges `5 s * 18` is exactly `REKEY_ATTEMPT_TIME`.
     ///
+    /// Every pick carries the reference's `[0, 334)` ms of jitter, which only
+    /// the comment at the retransmit check used to claim (WG-A2).
+    ///
     /// With all-zero ranges this yields the classic WireGuard constants.
     pub(super) fn roll_handshake_timings(
         &mut self,
@@ -131,7 +138,9 @@ impl Timers {
             .timing_ranges
             .rekey_timeout
             .pick_or(rng, REKEY_TIMEOUT_SECS);
-        self.rekey_timeout_current = Duration::from_secs(u64::from(rekey_timeout));
+        let jitter_ms = rng.gen_range_u32(0, REKEY_TIMEOUT_JITTER_MAX_MS - 1);
+        self.rekey_timeout_current = Duration::from_secs(u64::from(rekey_timeout))
+            + Duration::from_millis(u64::from(jitter_ms));
 
         if starting_new_handshake {
             let max_attempts = self
@@ -318,7 +327,7 @@ impl Tunn {
                     // Once `checked_duration_since` is stable we can use that.
                     // A handshake initiation is retried after REKEY_TIMEOUT + jitter ms,
                     // if a response has not been received, where jitter is some random
-                    // value between 0 and 333 ms.
+                    // value between 0 and 333 ms, drawn in `roll_handshake_timings`.
                     tracing::warn!("HANDSHAKE(REKEY_TIMEOUT)");
                     handshake_initiation_required = true;
                 }
@@ -374,7 +383,8 @@ impl Tunn {
                 // packet after from that peer for (KEEPALIVE + REKEY_TIMEOUT) ms,
                 // we initiate a new handshake.
                 // AWG 3.0: `newHandshakeTimeout` — `Hi` of the keepalive range
-                // plus a fresh pick of the rekey range
+                // plus a fresh pick of the rekey range, plus the same jitter
+                // as the retransmit (`timersDataSent`)
                 let new_handshake_after = {
                     let ranges = &self.timers.timing_ranges;
                     Duration::from_secs(u64::from(
@@ -382,6 +392,8 @@ impl Tunn {
                             + ranges
                                 .rekey_timeout
                                 .pick_or(&mut FastRandom, REKEY_TIMEOUT_SECS),
+                    )) + Duration::from_millis(u64::from(
+                        FastRandom.gen_range_u32(0, REKEY_TIMEOUT_JITTER_MAX_MS - 1),
                     ))
                 };
                 if data_packet_sent > aut_packet_received
@@ -510,12 +522,39 @@ mod tests {
         }
     }
 
+    /// `timeout` is `base` plus `[0, 334)` ms.
+    fn assert_jittered(timeout: Duration, base: Duration) {
+        assert!(
+            timeout >= base
+                && timeout < base + Duration::from_millis(u64::from(REKEY_TIMEOUT_JITTER_MAX_MS)),
+            "{:?} is not {:?} + [0, {}) ms",
+            timeout,
+            base,
+            REKEY_TIMEOUT_JITTER_MAX_MS
+        );
+    }
+
+    /// WG-A2: the retransmit timeout carries jitter that differs between
+    /// picks and stays below 334 ms.
+    #[test]
+    fn the_retransmit_timeout_carries_jitter() {
+        let mut timers = Timers::new(None, false, TimingRanges::default());
+        let mut rng = SeqRng::new(3);
+        let mut jitters = std::collections::HashSet::new();
+        for _ in 0..64 {
+            timers.roll_handshake_timings(&mut rng, false);
+            assert_jittered(timers.rekey_timeout_current, REKEY_TIMEOUT);
+            jitters.insert(timers.rekey_timeout_current - REKEY_TIMEOUT);
+        }
+        assert!(jitters.len() > 1, "the jitter never varied");
+    }
+
     #[test]
     fn roll_handshake_timings_defaults_to_wg_constants() {
         let mut timers = Timers::new(None, false, TimingRanges::default());
         let mut rng = SeqRng::new(0xAA);
         timers.roll_handshake_timings(&mut rng, true);
-        assert_eq!(timers.rekey_timeout_current, REKEY_TIMEOUT);
+        assert_jittered(timers.rekey_timeout_current, REKEY_TIMEOUT);
         assert_eq!(timers.rekey_attempt_deadline, REKEY_ATTEMPT_TIME);
     }
 
@@ -529,7 +568,7 @@ mod tests {
         let mut timers = Timers::new(None, false, ranges);
         let mut rng = SeqRng::new(0xAA);
         timers.roll_handshake_timings(&mut rng, true);
-        assert_eq!(timers.rekey_timeout_current, Duration::from_secs(7));
+        assert_jittered(timers.rekey_timeout_current, Duration::from_secs(7));
         assert_eq!(timers.rekey_attempt_deadline, Duration::from_secs(21));
     }
 
