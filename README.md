@@ -132,15 +132,12 @@ Random bytes prepended to each message type, changing packet sizes on the wire. 
 
 | Parameter | Type | Match | Applies to |
 |---|---|---|---|
-| `S1` | u8 | both ends | handshake initiation → `148 + S1` bytes |
-| `S2` | u8 | both ends | handshake response → `92 + S2` bytes |
-| `S3` | u8 | both ends | cookie reply → `64 + S3` bytes |
-| `S4` | u8 | both ends | transport data, keepalives included |
+| `S1` | u16 | both ends | handshake initiation → `148 + S1` bytes |
+| `S2` | u16 | both ends | handshake response → `92 + S2` bytes |
+| `S3` | u16 | both ends | cookie reply → `64 + S3` bytes |
+| `S4` | u16 | both ends | transport data, keepalives included |
 
 Under AmneziaWG 3.0 the first 12 bytes of this prefix double as the header protection nonce, which is why enabling that feature requires every one of S1-S4 to be at least 12.
-
-> [!NOTE]
-> This implementation stores S1-S4 as `u8`, so 255 is the ceiling; upstream parses them as `uint16`. Amnezia's own tooling stays far below either limit.
 
 ### Junk packets — Jc, Jmin, Jmax
 
@@ -148,7 +145,7 @@ Under AmneziaWG 3.0 the first 12 bytes of this prefix double as the header prote
 
 | Parameter | Type | Match | Description |
 |---|---|---|---|
-| `Jc` | u8 | sender only | how many junk datagrams; `0` disables |
+| `Jc` | u16 | sender only | how many junk datagrams; `0` disables |
 | `Jmin` | u16 | sender only | minimum size, inclusive |
 | `Jmax` | u16 | sender only | maximum size, exclusive |
 

@@ -45,6 +45,7 @@ What has already been removed after breaking real servers:
 | `Jc <= 10`, junk sizes 64-1024 | Upstream bounds none of them |
 | Headers may not be 1-4 when any AWG feature is on | Upstream *defaults* H1-H4 to exactly 1,2,3,4 |
 | I1-I5 must be contiguous, I1 required | Upstream sends every non-nil chain, gaps included |
+| S1-S4 and `Jc` stored as `u8` | All three references parse them as 16-bit; a live server's `S2` exceeded 255 |
 
 The entire device-level validation in amneziawg-go is `mergeWithDevice` in
 `device/uapi.go`, and it is two rules:
@@ -75,7 +76,7 @@ WireGuard behavior is preserved.
 | Group | Params | What they do |
 |-------|--------|-------------|
 | Headers | H1-H4 (u32 ranges) | Replace WG type constants 1/2/3/4 with random values. Written BEFORE MAC — authenticated. |
-| Padding | S1-S4 (u8, bytes) | Random prefix bytes. Added AFTER MAC — not authenticated. Applies to keepalives too. With header protection, all must be >= 12. |
+| Padding | S1-S4 (u16, bytes) | Random prefix bytes. Added AFTER MAC — not authenticated. Applies to keepalives too. With header protection, all must be >= 12. |
 | Junk | Jc/Jmin/Jmax | Random decoy UDP datagrams sent before handshake init. Sizes drawn from the half-open range `[Jmin, Jmax)`. |
 | Init | I1-I5 (CPS chains) | Structured camouflage datagrams sent before junk. Any subset, gaps allowed. |
 | **3.0** Header protection | 32-byte key | Raw ChaCha20 over the header fields, nonced from the first 12 bytes of the padding prefix. |

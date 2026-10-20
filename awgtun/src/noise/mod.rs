@@ -1819,6 +1819,69 @@ mod tests {
         (my_tun, their_tun)
     }
 
+    /// End to end with every S above the old `u8` ceiling: the wire code takes
+    /// the paddings as `usize`, so widening the config is all a server with
+    /// S2 > 255 needed (issue #1). Synthetic values.
+    #[test]
+    fn awg3_handshake_and_data_with_padding_above_255() {
+        let my_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let my_public_key = x25519_dalek::PublicKey::from(&my_secret_key);
+        let their_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let their_public_key = x25519_dalek::PublicKey::from(&their_secret_key);
+        let config = || {
+            let mut config = awg3_test_config([0x42; 32]);
+            config.paddings = PaddingConfig::new(271, 613, 258, 300).expect("valid paddings");
+            config.junk = JunkConfig::new(300, 40, 90).expect("valid junk");
+            config
+        };
+        let mut my_tun = Tunn::new_with_amnezia3(
+            my_secret_key,
+            their_public_key,
+            None,
+            None,
+            1,
+            None,
+            config(),
+        )
+        .expect("valid awg3 config");
+        let mut their_tun = Tunn::new_with_amnezia3(
+            their_secret_key,
+            my_public_key,
+            None,
+            None,
+            2,
+            None,
+            config(),
+        )
+        .expect("valid awg3 config");
+
+        let init = create_handshake_init(&mut my_tun);
+        assert_eq!(init.len(), 271 + HANDSHAKE_INIT_SZ);
+        let mut junk = 0;
+        while my_tun.poll_outgoing_packet().is_some() {
+            junk += 1;
+        }
+        assert_eq!(junk, 300, "Jc above 255 sends that many junk datagrams");
+
+        let resp = create_handshake_response(&mut their_tun, &init);
+        assert_eq!(resp.len(), 613 + HANDSHAKE_RESP_SZ);
+        let keepalive = parse_handshake_resp(&mut my_tun, &resp);
+        assert_eq!(keepalive.len(), 300 + DATA_OVERHEAD_SZ);
+        parse_keepalive(&mut their_tun, &keepalive);
+
+        let sent = create_ipv4_udp_packet();
+        let mut dst = vec![0u8; 2048];
+        let data = match my_tun.encapsulate(&sent, &mut dst) {
+            TunnResult::WriteToNetwork(data) => data.to_vec(),
+            other => panic!("expected a transport packet, got {:?}", other),
+        };
+        let mut recv = vec![0u8; 2048];
+        match their_tun.decapsulate(None, &data, &mut recv) {
+            TunnResult::WriteToTunnelV4(packet, _) => assert_eq!(packet, &sent[..]),
+            other => panic!("expected the payload back, got {:?}", other),
+        }
+    }
+
     #[test]
     fn awg3_handshake_init_is_header_protected() {
         let (mut my_tun, _) = create_two_tuns_awg3();

@@ -94,11 +94,14 @@ struct amnezia_config {
     uint32_t h3_end;
     uint32_t h4_start;
     uint32_t h4_end;
-    uint8_t s1;
-    uint8_t s2;
-    uint8_t s3;
-    uint8_t s4;
-    uint8_t jc;
+    // s1-s4 and jc are uint16_t since 0.11.0 (previously uint8_t), matching
+    // amneziawg-go, the kernel module and amneziawg-tools. Rebuild against
+    // this header: the struct layout changed.
+    uint16_t s1;
+    uint16_t s2;
+    uint16_t s3;
+    uint16_t s4;
+    uint16_t jc;
     uint16_t jmin;
     uint16_t jmax;
     const char *i1;

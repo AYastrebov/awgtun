@@ -80,11 +80,11 @@ AmneziaWG 3.0 adds three more layers on top, described in [AmneziaWG 3.0](#amnez
 | H2 | u32 range | Any non-overlapping | Handshake response header |
 | H3 | u32 range | Any non-overlapping | Cookie reply header |
 | H4 | u32 range | Any non-overlapping | Transport data header |
-| S1 | u8 | 0-255 | Init padding bytes |
-| S2 | u8 | 0-255 | Response padding bytes |
-| S3 | u8 | 0-255 | Cookie padding bytes |
-| S4 | u8 | 0-255 | Transport padding bytes |
-| Jc | u8 | 0-255 | Junk packet count (0 = disabled) |
+| S1 | u16 | 0-65535 | Init padding bytes |
+| S2 | u16 | 0-65535 | Response padding bytes |
+| S3 | u16 | 0-65535 | Cookie padding bytes |
+| S4 | u16 | 0-65535 | Transport padding bytes |
+| Jc | u16 | 0-65535 | Junk packet count (0 = disabled) |
 | Jmin | u16 | 0-65535 | Minimum junk size (inclusive) |
 | Jmax | u16 | 0-65535 | Maximum junk size (exclusive, as in amneziawg-go) |
 | I1-I5 | CPS string | See below | Init packet chain specs |
@@ -92,10 +92,11 @@ AmneziaWG 3.0 adds three more layers on top, described in [AmneziaWG 3.0](#amnez
 The ranges above are the field types, not protocol rules — upstream imposes no
 maximum on any of them, and treating its *recommended* values as limits is what
 once made real servers unreachable from here. See [Validation
-Rules](#validation-rules). The one real ceiling is that S1-S4 are `u8` here
-against upstream's `uint16`, so a padding value above 255 is rejected; widening
-it would break the `amnezia_config` C ABI and Amnezia's tooling stays far below
-that.
+Rules](#validation-rules). The field types match the references: S1-S4 are
+16-bit in amneziawg-go, the kernel module and amneziawg-tools, and `Jc` is
+16-bit in the latter two (Go parses it as 32-bit, but a kernel peer could not be
+configured past 65535 either). Before 0.11.0, S1-S4 and `Jc` were `u8` here,
+which refused a real server whose S2 exceeded 255.
 
 ### CPS Chain Format
 
@@ -725,8 +726,8 @@ typedef struct {
     uint32_t h2_start, h2_end;  // H2 range
     uint32_t h3_start, h3_end;  // H3 range
     uint32_t h4_start, h4_end;  // H4 range
-    uint8_t  s1, s2, s3, s4;    // Padding sizes
-    uint8_t  jc;                // Junk count
+    uint16_t s1, s2, s3, s4;    // Padding sizes (uint8_t before 0.11.0)
+    uint16_t jc;                // Junk count (uint8_t before 0.11.0)
     uint16_t jmin, jmax;        // Junk size range
     const char *i1, *i2, *i3, *i4, *i5;  // CPS chains (NULL to skip)
 } amnezia_config;
@@ -1079,9 +1080,10 @@ What is still enforced: header ranges must not overlap, S1–S4 must be ≥ 12 w
 header protection key is set, and `Jmin` must not exceed `Jmax` — the last one
 being stricter than upstream, which would underflow computing `Jmax - Jmin`.
 
-One divergence remains: S1–S4 are `u8` here and `uint16` upstream, so a padding
-value above 255 is accepted by amneziawg-go and rejected here. Widening it would
-break the `amnezia_config` C ABI, and Amnezia's own tooling stays far below that.
+S1–S4 and `Jc` used to be `u8` here against upstream's 16 bits, and "Amnezia's
+tooling stays far below 255" was the reason given for keeping them narrow. A
+real server with S2 above 255 disproved it, so since 0.11.0 they are `u16`, at
+the cost of a change to the `amnezia_config` C layout.
 
 ### Endpoint hostnames are not resolved
 
