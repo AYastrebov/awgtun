@@ -831,7 +831,7 @@ impl Tunn {
     /// this datagram's prefix; the caller already has it.
     ///
     /// This is a workaround for a defect in the peer, not in this code. The
-    /// real fix is amneziawg-go PR #183 and the matching change to
+    /// real fix is amneziawg-go PR #183 and kernel module PR #242 against
     /// `awg_determine_type_and_padding` in the kernel module's `src/receive.c`;
     /// once peers carry it, this loop simply never redraws.
     fn peer_would_misclassify(&self, datagram: &[u8], mask: [u8; 4]) -> bool {

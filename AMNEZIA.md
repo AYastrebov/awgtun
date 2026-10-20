@@ -146,7 +146,9 @@ Configure with `Amnezia3Config` and `Tunn::new_with_amnezia3`.
 ### Upstream release of record
 
 This implementation is aligned with, and was audited against, these three
-releases. All three are the current `master` and the newest tag of their repo.
+releases. All three are the current `master` and the newest tag of their repo
+(last re-checked 2026-10-20: no commits on any `master` since, and no open PR
+that changes wire behavior this fork does not already match).
 
 | Repo | Release | Commit | Date |
 |---|---|---|---|
@@ -248,8 +250,14 @@ went to 12.55 MB/s — parity with an AWG 2.0 tunnel to the same host.
 
 **Upstream.** The defect is in every implementation's receive path, and the fix
 is local to each, so all of them need it independently and each one only
-protects the traffic *it* receives: amneziawg-go PR #183, and the same change to
-`awg_determine_type_and_padding` in the kernel module's `src/receive.c`. A
+protects the traffic *it* receives: amneziawg-go PR #183, and kernel module PR
+#242 against `awg_determine_type_and_padding` in `src/receive.c`. Both are
+open as of 2026-10-20. #242 takes a narrower route than this fork: it keeps the
+handshake-first order and reclassifies a handshake hit as transport only when
+the datagram also matches H4 at S4 *and* its receiver index names a live
+keypair. That also avoids the residual cost of trying transport first here,
+where a handshake message whose S4 offset happens to land in H4 (~1 in 86 with
+50M-wide ranges) is taken for transport and dropped. A
 sender cannot tell which classifier a peer runs — there is no version
 negotiation — so a link is only safe once both have shipped.
 
@@ -392,7 +400,7 @@ Keypair expiry (`zeroKeyMaterial`, armed at `reject_after_time * 3`) is the one 
 
 `Hi` is the safe reading. Sessions expire at a value drawn from the range, so key material has to outlive the longest session that could still be in flight; a fresh pick can land below a live session's own draw and zero the keys while it is still in use. Go's choice is also the conservative one, so following it costs nothing.
 
-The kernel module has a second, clearer slip in the same area: `wg_expired_retransmit_handshake` arms `timer_zero_key_material` from `rekey_after_time` rather than `reject_after_time` (`timers.c`, still present at `c78a89e`). Both are upstream bugs to watch rather than behavior to copy — which is the reason to read all three implementations when auditing, not just the Go one.
+The kernel module has a second, clearer slip in the same area: `wg_expired_retransmit_handshake` arms `timer_zero_key_material` from `rekey_after_time` rather than `reject_after_time` (`timers.c`, still present at `4569c4c`; kernel PR #238 fixes it, still drawing `PickOne`). Kernel PR #240 likewise moves the data-path expiry checks from the `REJECT_AFTER_TIME` constant to `Hi(reject_after_time)`, which is what this fork already does. Both are upstream bugs to watch rather than behavior to copy — which is the reason to read all three implementations when auditing, not just the Go one.
 
 ### Randomness: which source, and why
 
