@@ -334,13 +334,16 @@ pub struct amnezia_config {
     pub h3_end: u32,
     pub h4_start: u32,
     pub h4_end: u32,
-    /// Padding sizes (S1-S4)
-    pub s1: u8,
-    pub s2: u8,
-    pub s3: u8,
-    pub s4: u8,
-    /// Junk packet config
-    pub jc: u8,
+    /// Padding sizes (S1-S4). `u16`, as in all three reference
+    /// implementations; these were `u8` before 0.11.0, so a caller compiled
+    /// against an older `wireguard_ffi.h` passes a mismatched layout.
+    pub s1: u16,
+    pub s2: u16,
+    pub s3: u16,
+    pub s4: u16,
+    /// Junk packet config. `jc` is `u16` since 0.11.0, matching the kernel
+    /// module and amneziawg-tools.
+    pub jc: u16,
     pub jmin: u16,
     pub jmax: u16,
     /// CPS init packet chain strings (null-terminated UTF-8, or NULL to skip).

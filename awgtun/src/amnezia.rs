@@ -284,8 +284,8 @@ pub enum ConfigError {
     },
     HeaderProtectionPaddingTooSmall {
         field: PaddingKind,
-        value: u8,
-        min: u8,
+        value: u16,
+        min: u16,
     },
 }
 
@@ -595,14 +595,14 @@ impl fmt::Display for HeaderRange {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PaddingConfig {
-    pub s1: u8,
-    pub s2: u8,
-    pub s3: u8,
-    pub s4: u8,
+    pub s1: u16,
+    pub s2: u16,
+    pub s3: u16,
+    pub s4: u16,
 }
 
 impl PaddingConfig {
-    pub fn new(s1: u8, s2: u8, s3: u8, s4: u8) -> Result<Self, ConfigError> {
+    pub fn new(s1: u16, s2: u16, s3: u16, s4: u16) -> Result<Self, ConfigError> {
         let config = PaddingConfig { s1, s2, s3, s4 };
         config.validate()?;
         Ok(config)
@@ -613,9 +613,10 @@ impl PaddingConfig {
     /// [`HEADER_PROTECTION_MIN_PADDING`] when header protection is enabled,
     /// which [`Amnezia3Config::validate`] checks.
     ///
-    /// The field type caps these at 255. amneziawg-go parses them as `uint16`,
-    /// so a configuration using S1-S4 above 255 is accepted there and rejected
-    /// here. Amnezia's own tooling stays well below that.
+    /// The fields are `u16` because that is what all three reference
+    /// implementations parse: amneziawg-go (`ParseUint(.., 16)`), the kernel
+    /// module and amneziawg-tools. They were once `u8` here, which refused a
+    /// real server's S2 above 255.
     pub fn validate(&self) -> Result<(), ConfigError> {
         Ok(())
     }
@@ -623,7 +624,7 @@ impl PaddingConfig {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct JunkConfig {
-    pub count: u8,
+    pub count: u16,
     pub min_size: u16,
     pub max_size: u16,
 }
@@ -637,7 +638,7 @@ impl JunkConfig {
         }
     }
 
-    pub fn new(count: u8, min_size: u16, max_size: u16) -> Result<Self, ConfigError> {
+    pub fn new(count: u16, min_size: u16, max_size: u16) -> Result<Self, ConfigError> {
         let config = JunkConfig {
             count,
             min_size,
@@ -1114,7 +1115,7 @@ pub const AWG31_DEFAULT_UDP_WINDOW: u32 = 500;
 
 /// Minimum S1-S4 padding when header protection is enabled: the ChaCha20
 /// nonce is read from the first 12 bytes of the random padding prefix.
-pub const HEADER_PROTECTION_MIN_PADDING: u8 = 12;
+pub const HEADER_PROTECTION_MIN_PADDING: u16 = 12;
 
 /// AmneziaWG 3.1 random trailer length for a datagram that is `packet_size`
 /// bytes before the trailer, given a UDP window.
@@ -1527,13 +1528,13 @@ impl Amnezia3Config {
             let value = value.trim();
 
             match key.as_str() {
-                "jc" => config.junk.count = parse_field_u8(&key, value)?,
+                "jc" => config.junk.count = parse_field_u16(&key, value)?,
                 "jmin" => config.junk.min_size = parse_field_u16(&key, value)?,
                 "jmax" => config.junk.max_size = parse_field_u16(&key, value)?,
-                "s1" => config.paddings.s1 = parse_field_u8(&key, value)?,
-                "s2" => config.paddings.s2 = parse_field_u8(&key, value)?,
-                "s3" => config.paddings.s3 = parse_field_u8(&key, value)?,
-                "s4" => config.paddings.s4 = parse_field_u8(&key, value)?,
+                "s1" => config.paddings.s1 = parse_field_u16(&key, value)?,
+                "s2" => config.paddings.s2 = parse_field_u16(&key, value)?,
+                "s3" => config.paddings.s3 = parse_field_u16(&key, value)?,
+                "s4" => config.paddings.s4 = parse_field_u16(&key, value)?,
                 "h1" => {
                     headers.init = HeaderRange::parse(value)?;
                     saw_header = true;
@@ -1744,15 +1745,6 @@ fn parse_field_bool(field: &str, value: &str) -> Result<bool, ConfigError> {
             reason: "expected a boolean (0/1, true/false, on/off)",
         }),
     }
-}
-
-fn parse_field_u8(field: &str, value: &str) -> Result<u8, ConfigError> {
-    value
-        .parse::<u8>()
-        .map_err(|_| ConfigError::InvalidFieldValue {
-            field: field.to_owned(),
-            reason: "expected a decimal value in 0-255",
-        })
 }
 
 fn parse_field_u16(field: &str, value: &str) -> Result<u16, ConfigError> {
@@ -2078,8 +2070,11 @@ mod tests {
         PaddingConfig::new(64, 64, 64, 32).unwrap();
         // The shape that a live server handed us and this used to refuse.
         PaddingConfig::new(53, 65, 17, 16).unwrap();
+        // Above the old `u8` ceiling: every reference implementation parses
+        // S1-S4 as 16-bit, so this is valid protocol.
+        PaddingConfig::new(256, 513, 300, 1024).unwrap();
         // Bounded only by the field type.
-        PaddingConfig::new(255, 255, 255, 255).unwrap();
+        PaddingConfig::new(u16::MAX, u16::MAX, u16::MAX, u16::MAX).unwrap();
     }
 
     #[test]
@@ -2747,6 +2742,53 @@ mod tests {
         );
         assert!(config.header_protection_key.is_none());
         assert!(config.init_packets.i5.is_some());
+    }
+
+    /// S1-S4 and Jc are 16-bit in amneziawg-go, the kernel module and
+    /// amneziawg-tools. They were `u8` here, which refused a real server whose
+    /// S2 exceeded 255 with `InvalidFieldValue` (issue #1). The numbers are
+    /// synthetic; only the shape — every key set, S and Jc past 255, header
+    /// protection on — follows that config.
+    #[test]
+    fn amnezia3_parses_padding_and_junk_count_above_255() {
+        let block = "jc=300\n\
+             jmin=40\n\
+             jmax=90\n\
+             s1=271\n\
+             s2=613\n\
+             s3=258\n\
+             s4=1100\n\
+             h1=1000000-1000999\n\
+             h2=2000000-2000999\n\
+             h3=3000000-3000999\n\
+             h4=4000000-4000999\n\
+             header_protection_key=4242424242424242424242424242424242424242424242424242424242424242\n";
+        let config = Amnezia3Config::parse(block)
+            .expect("S1-S4 and Jc above 255 must be accepted, as upstream does");
+
+        assert_eq!(
+            config.paddings,
+            PaddingConfig::new(271, 613, 258, 1100).unwrap()
+        );
+        assert_eq!(config.junk.count, 300);
+
+        // `get=1` must report what `set=1` accepted.
+        let reparsed =
+            Amnezia3Config::parse(&config.to_uapi_block()).expect("the emitted block parses back");
+        assert_eq!(reparsed.paddings, config.paddings);
+        assert_eq!(reparsed.junk.count, 300);
+
+        // The field type is still the limit, exactly as upstream's 16-bit parse.
+        for key in ["s1", "s2", "s3", "s4", "jc"] {
+            assert!(
+                matches!(
+                    Amnezia3Config::parse(&format!("{}=65536\n", key)),
+                    Err(ConfigError::InvalidFieldValue { .. })
+                ),
+                "{} must reject a value past u16::MAX",
+                key
+            );
+        }
     }
 
     /// A plain WireGuard device must not grow AmneziaWG lines in `get=1`.

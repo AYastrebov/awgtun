@@ -828,6 +828,11 @@ impl Device {
                         Err(TunnResult::WriteToNetwork(cookie_reply)) => {
                             let s3 = d.amnezia.paddings.s3 as usize;
                             let len = cookie_reply.len();
+                            // A 16-bit S3 can exceed the fixed buffer; such
+                            // a reply could never be sent, so drop it.
+                            if s3 + len > t.dst_buf.len() {
+                                continue;
+                            }
                             if s3 > 0 {
                                 FastRandom.fill_bytes(&mut t.dst_buf[..s3]);
                             }
