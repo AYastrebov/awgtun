@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **Handshake retransmits had no jitter.** wireguard-go and amneziawg-go arm the retransmit and new-handshake timers for their timeout plus a random 0-334 ms (`RekeyTimeoutJitterMaxMs`); this fork only said so in a comment, so every retry fired on a whole second. Both timers now carry the jitter, drawn per initiation as the reference does.
-- **S1-S4 and `Jc` above 255 were rejected.** They were stored as `u8`, while amneziawg-go, the kernel module and amneziawg-tools all parse them as 16-bit. A real server issuing `S2` above 255 could not be configured at all: `InvalidFieldValue { field: "s2" }`, or `errno=22` over the UAPI. They are now `u16` (#1, reported by @szonov). Nothing on the wire changes; every packet path already took them as `usize`.
+- **S1-S4 and `Jc` above 255 were rejected.** They were stored as `u8`, while amneziawg-go, the kernel module and amneziawg-tools all parse them as 16-bit. A real server issuing `S2` above 255 could not be configured at all: `InvalidFieldValue { field: "s2" }`, or `errno=22` over the UAPI. They are now `u16` (#1, reported by @szonov). Nothing on the wire changes; every packet path already took them as `usize`. A prefix too large for the output buffer, which the wider type now allows, gets `DestinationBufferTooSmall` at each padded write site instead of a panic, and the device drops such a cookie reply.
 
 ### Changed
 

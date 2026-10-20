@@ -648,6 +648,13 @@ impl Tunn {
         // AWG 3.1 UDP window below needs `&mut self`, which a live borrow of
         // `self.sessions` would forbid.
         if self.sessions[current % N_SESSIONS].is_some() {
+            // S1-S4 are 16-bit, so a configured prefix can leave no room for
+            // the message in a fixed buffer such as the device's 65535 bytes.
+            // amneziawg-go would fail the send; refuse here rather than panic
+            // in `format_packet_data`.
+            if self.padding_config.s4 as usize + DATA_OVERHEAD_SZ + src.len() > dst.len() {
+                return TunnResult::Err(WireGuardError::DestinationBufferTooSmall);
+            }
             // Send the packet using an established session
             self.observe_datagram(self.padding_config.s4 as usize + DATA_OVERHEAD_SZ + src.len());
             let content_padding = self.transport_padding(src.len(), dst.len());
@@ -967,6 +974,9 @@ impl Tunn {
                 // nothing to suppress at this point.
                 // Add S3 padding to cookie reply
                 let s3 = self.padding_config.s3 as usize;
+                if s3 + cookie.len() > dst.len() {
+                    return TunnResult::Err(WireGuardError::DestinationBufferTooSmall);
+                }
                 if s3 > 0 {
                     FastRandom.fill_bytes(&mut dst[..s3]);
                 }
@@ -1014,6 +1024,9 @@ impl Tunn {
 
         let resp_type = self.header_config.response.generate(&mut FastRandom);
         let s2 = self.padding_config.s2 as usize;
+        if s2 + HANDSHAKE_RESP_SZ > dst.len() {
+            return Err(WireGuardError::DestinationBufferTooSmall);
+        }
         let (packet, session) =
             self.handshake
                 .receive_handshake_initialization(p, &mut dst[s2..], resp_type)?;
@@ -1057,6 +1070,11 @@ impl Tunn {
             remote_idx = p.sender_idx
         );
 
+        // Checked before the handshake consumes its state, so a keepalive that
+        // cannot fit leaves the response retryable rather than panicking.
+        if self.padding_config.s4 as usize + DATA_OVERHEAD_SZ > dst.len() {
+            return Err(WireGuardError::DestinationBufferTooSmall);
+        }
         let session = self.handshake.receive_handshake_response(p)?;
 
         let content_padding = self.content_padding_addition(0, dst.len());
@@ -1184,7 +1202,8 @@ impl Tunn {
     /// Before sending the returned packet, the caller must drain `poll_outgoing_packet()` and
     /// send those datagrams first (I-packets and junk).
     ///
-    /// dst must be at least `148 + S1` bytes (handshake init size + padding).
+    /// dst must be at least `148 + S1` bytes (handshake init size + padding);
+    /// a smaller one gets `DestinationBufferTooSmall` and nothing is queued.
     pub fn format_handshake_initiation<'a>(
         &mut self,
         dst: &'a mut [u8],
@@ -1192,6 +1211,12 @@ impl Tunn {
     ) -> TunnResult<'a> {
         if self.handshake.is_in_progress() && !force_resend {
             return TunnResult::Done;
+        }
+
+        // Before any I-packets or junk are queued, so an initiation that cannot
+        // fit sends nothing at all.
+        if self.padding_config.s1 as usize + HANDSHAKE_INIT_SZ > dst.len() {
+            return TunnResult::Err(WireGuardError::DestinationBufferTooSmall);
         }
 
         if self.handshake.is_expired() {
@@ -1879,6 +1904,118 @@ mod tests {
         match their_tun.decapsulate(None, &data, &mut recv) {
             TunnResult::WriteToTunnelV4(packet, _) => assert_eq!(packet, &sent[..]),
             other => panic!("expected the payload back, got {:?}", other),
+        }
+    }
+
+    /// A 16-bit S can leave less room than the message needs in a fixed
+    /// buffer (the device's is 65535 bytes). Each padded write site must refuse
+    /// with `DestinationBufferTooSmall` rather than panic, leave its state
+    /// retryable, and still accept a buffer that fits exactly. Small buffers
+    /// stand in for the 65535-byte case, which takes S near 65535 to reach.
+    #[test]
+    fn awg3_oversized_padding_is_refused_not_panicked() {
+        const S: usize = 300;
+        let config = || {
+            let mut config = awg3_test_config([0x42; 32]);
+            config.paddings =
+                PaddingConfig::new(S as u16, S as u16, S as u16, S as u16).expect("valid paddings");
+            config
+        };
+        let pair = |rate_limit: Option<u64>| {
+            let my_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+            let my_public_key = x25519_dalek::PublicKey::from(&my_secret_key);
+            let their_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+            let their_public_key = x25519_dalek::PublicKey::from(&their_secret_key);
+            let limiter =
+                rate_limit.map(|limit| Arc::new(RateLimiter::new(&their_public_key, limit)));
+            let my_tun = Tunn::new_with_amnezia3(
+                my_secret_key,
+                their_public_key,
+                None,
+                None,
+                1,
+                None,
+                config(),
+            )
+            .expect("valid awg3 config");
+            let their_tun = Tunn::new_with_amnezia3(
+                their_secret_key,
+                my_public_key,
+                None,
+                None,
+                2,
+                limiter,
+                config(),
+            )
+            .expect("valid awg3 config");
+            (my_tun, their_tun)
+        };
+        let too_small = |r: &TunnResult| {
+            matches!(
+                r,
+                TunnResult::Err(WireGuardError::DestinationBufferTooSmall)
+            )
+        };
+
+        let (mut my_tun, mut their_tun) = pair(None);
+
+        // Initiation: refused before any I-packet or junk is queued.
+        let mut dst = vec![0u8; S + HANDSHAKE_INIT_SZ - 1];
+        assert!(too_small(
+            &my_tun.format_handshake_initiation(&mut dst, false)
+        ));
+        assert!(!my_tun.has_outgoing_packets());
+        let mut dst = vec![0u8; S + HANDSHAKE_INIT_SZ];
+        let init = match my_tun.format_handshake_initiation(&mut dst, false) {
+            TunnResult::WriteToNetwork(p) => p.to_vec(),
+            other => panic!("an exact fit must send, got {:?}", other),
+        };
+
+        // Response.
+        let mut dst = vec![0u8; S + HANDSHAKE_RESP_SZ - 1];
+        assert!(too_small(&their_tun.decapsulate(None, &init, &mut dst)));
+        let mut dst = vec![0u8; S + HANDSHAKE_RESP_SZ];
+        let resp = match their_tun.decapsulate(None, &init, &mut dst) {
+            TunnResult::WriteToNetwork(p) => p.to_vec(),
+            other => panic!("an exact fit must respond, got {:?}", other),
+        };
+
+        // Keepalive answering the response: this was the panic in
+        // `format_packet_data`. The response must still be usable afterwards.
+        let mut dst = vec![0u8; S + DATA_OVERHEAD_SZ - 1];
+        assert!(too_small(&my_tun.decapsulate(None, &resp, &mut dst)));
+        let mut dst = vec![0u8; S + DATA_OVERHEAD_SZ];
+        let keepalive = match my_tun.decapsulate(None, &resp, &mut dst) {
+            TunnResult::WriteToNetwork(p) => p.to_vec(),
+            other => panic!("the response must still complete, got {:?}", other),
+        };
+        parse_keepalive(&mut their_tun, &keepalive);
+
+        // Transport data.
+        let sent = create_ipv4_udp_packet();
+        let mut dst = vec![0u8; S + DATA_OVERHEAD_SZ + sent.len() - 1];
+        assert!(too_small(&my_tun.encapsulate(&sent, &mut dst)));
+        let mut dst = vec![0u8; S + DATA_OVERHEAD_SZ + sent.len()];
+        let data = match my_tun.encapsulate(&sent, &mut dst) {
+            TunnResult::WriteToNetwork(p) => p.to_vec(),
+            other => panic!("an exact fit must send, got {:?}", other),
+        };
+        let mut recv = vec![0u8; 2048];
+        assert!(matches!(
+            their_tun.decapsulate(None, &data, &mut recv),
+            TunnResult::WriteToTunnelV4(..)
+        ));
+
+        // Cookie reply: a zero-limit rate limiter is "under load" at once.
+        let (mut my_tun, mut their_tun) = pair(Some(0));
+        let init = create_handshake_init(&mut my_tun);
+        let addr = Some(std::net::IpAddr::from([1, 2, 3, 4]));
+        let mut dst = vec![0u8; S + COOKIE_REPLY_SZ - 1];
+        assert!(too_small(&their_tun.decapsulate(addr, &init, &mut dst)));
+        let mut dst = vec![0u8; S + COOKIE_REPLY_SZ];
+        match their_tun.decapsulate(addr, &init, &mut dst) {
+            TunnResult::WriteToNetwork(p) => assert_eq!(p.len(), S + COOKIE_REPLY_SZ),
+            other => panic!("an exact fit must send the cookie, got {:?}", other),
         }
     }
 
