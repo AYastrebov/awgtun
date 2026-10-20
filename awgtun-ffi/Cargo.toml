@@ -1,7 +1,7 @@
 [package]
 name = "awgtun-ffi"
 description = "C and Android JNI bindings for awgtun (AmneziaWG and WireGuard)"
-version = "0.10.0"
+version = "0.11.0"
 authors = [
     "Noah Kennedy <nkennedy@cloudflare.com>",
     "Andy Grover <agrover@cloudflare.com>",
@@ -23,7 +23,7 @@ default = []
 jni-bindings = ["jni"]
 
 [dependencies]
-awgtun = { path = "../awgtun", version = "0.10.0" }
+awgtun = { path = "../awgtun", version = "0.11.0" }
 base64 = "0.22"
 hex = "0.4"
 libc = "0.2"

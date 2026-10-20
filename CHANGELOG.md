@@ -3,7 +3,15 @@
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.11.0] - 2026-10-20
+
+Configurations that real AmneziaWG servers issue but this fork refused. S1-S4
+and `Jc` were 8-bit here and 16-bit in all three reference implementations, so
+a server with `S2` above 255 could not be configured at all. Handshake retries
+also gain the jitter the reference applies.
+
+Minor rather than patch because the `amnezia_config` C struct changed layout and
+several public Rust types widened. Under 0.x that is where a breaking change goes.
 
 ### Fixed
 
