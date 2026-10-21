@@ -3,6 +3,18 @@
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Match kernel WireGuard and wireguard-go's handshake timestamp epoch (+10,
+  not +37). Switching the same peer identity from awgtun to a kernel client
+  no longer introduces a 27-second anti-replay window. A server which has
+  already accepted a timestamp from an older +37 build may still require that
+  window to expire once on upgrade. Add stamper regression tests and an opt-in
+  same-key switch test against actual kernel WireGuard; see
+  [the test instructions](docs/kernel-timestamp-test.md).
+
 ## [0.11.0] - 2026-10-20
 
 Configurations that real AmneziaWG servers issue but this fork refused. S1-S4

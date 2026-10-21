@@ -185,7 +185,10 @@ impl TimeStamper {
 
     /// Take time reading and generate a 12 byte timestamp
     pub fn stamp(&self) -> [u8; 12] {
-        const TAI64_BASE: u64 = (1u64 << 62) + 37;
+        // Match kernel WireGuard and wireguard-go (Unix seconds + 10), rather
+        // than the current TAI-UTC offset. A larger offset makes a subsequent
+        // kernel handshake with the same key look like a replay for 27 seconds.
+        const TAI64_BASE: u64 = (1u64 << 62) + 10;
         let mut ext_stamp = [0u8; 12];
         let stamp = Instant::now().duration_since(self.instant_at_start) + self.duration_at_start;
         ext_stamp[0..8].copy_from_slice(&(stamp.as_secs() + TAI64_BASE).to_be_bytes());
@@ -885,6 +888,41 @@ impl Handshake {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timestamp_matches_kernel_wireguard_clock() {
+        // Bracket the monotonic stamper with real-time readings: this checks
+        // the actual stamp path, including its epoch, without a fake clock.
+        let before = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap();
+        let stamp = TimeStamper::new().stamp();
+        let after = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap();
+        let seconds = u64::from_be_bytes(stamp[..8].try_into().unwrap());
+        let nanos = u32::from_be_bytes(stamp[8..].try_into().unwrap());
+        // linux/drivers/net/wireguard/noise.c::tai64n_now uses this base.
+        let unix_time = Duration::new(seconds - 0x4000_0000_0000_000a, nanos);
+        assert!(unix_time >= before && unix_time <= after);
+    }
+
+    #[test]
+    fn switching_to_kernel_timestamp_does_not_go_backwards() {
+        let stamper = TimeStamper::new();
+        let userspace = stamper.stamp();
+        // Model a kernel initiation one second later. Do not reset the remote
+        // peer's replay state: that would hide the backend-switch regression.
+        let now = stamper.duration_at_start
+            + Instant::now().duration_since(stamper.instant_at_start)
+            + Duration::from_secs(1);
+        let mut kernel = [0u8; 12];
+        kernel[..8].copy_from_slice(&(0x4000_0000_0000_000a + now.as_secs()).to_be_bytes());
+        kernel[8..].copy_from_slice(&now.subsec_nanos().to_be_bytes());
+        assert!(Tai64N::parse(&kernel)
+            .unwrap()
+            .after(&Tai64N::parse(&userspace).unwrap()));
+    }
 
     #[test]
     fn chacha20_seal_rfc7530_test_vector() {
