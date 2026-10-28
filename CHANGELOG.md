@@ -18,7 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `wireguard_poll_outgoing_packet` trusted their size arguments. A `dst_size`
   larger than the direct buffer let native code write past it, and a `src_size`
   larger than the `byte[]` read past the copy. Sizes are now checked against
-  the buffer's capacity and the array's length. See
+  the buffer's capacity and the array's length, a negative size or
+  overlapping `dst` and `op` buffers are refused before the tunnel runs, and a
+  refused call writes nothing. See
   [Buffers and errors](AMNEZIA.md#buffers-and-errors).
 - JNI: `wireguard_write` and `wireguard_read` called `unwrap()` on the array
   copy, so a JNI failure panicked across the FFI boundary.
@@ -43,9 +45,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `mock_instant` 0.6 (its per-thread clock, as 0.3 had without `sync`) and
   `etherparse` 0.21.
 - `jni` 0.22. Every Android export now runs inside `EnvUnowned::with_env`, so a
-  Rust panic is caught and logged instead of unwinding into the JVM, and
-  failures still return 0 or `null`. The exports are `extern "system"`, the
-  JNI calling convention, which matches `extern "C"` on every Android ABI.
+  Rust panic is caught and logged instead of crashing the app, and failures
+  still return 0 or `null`. Two things made that possible: the JNI
+  constructors no longer install the C API's SIGSEGV panic hook, and the JNI
+  exports drive the tunnel directly rather than through the `extern "C"`
+  `wireguard_*` functions, where a panic aborts. The exports are
+  `extern "system"`, the JNI calling convention, which matches `extern "C"` on
+  every Android ABI.
 
 ## [0.11.0] - 2026-10-20
 

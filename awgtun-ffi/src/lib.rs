@@ -254,6 +254,28 @@ pub unsafe extern "C" fn new_tunnel(
     keep_alive: u16,
     index: u32,
 ) -> *mut Mutex<Tunn> {
+    let tunnel = new_tunnel_unhooked(
+        static_private,
+        server_static_public,
+        preshared_key,
+        keep_alive,
+        index,
+    );
+    if !tunnel.is_null() {
+        install_panic_hook();
+    }
+    tunnel
+}
+
+/// `new_tunnel` without the FFI panic hook. The JNI bindings use this: they
+/// catch panics themselves, which the process-wide SIGSEGV hook would preempt.
+pub(crate) unsafe fn new_tunnel_unhooked(
+    static_private: *const c_char,
+    server_static_public: *const c_char,
+    preshared_key: *const c_char,
+    keep_alive: u16,
+    index: u32,
+) -> *mut Mutex<Tunn> {
     let c_str = CStr::from_ptr(static_private);
     let static_private = match c_str.to_str() {
         Err(_) => return ptr::null_mut(),
@@ -306,13 +328,6 @@ pub unsafe extern "C" fn new_tunnel(
         index,
         None,
     )));
-
-    PANIC_HOOK.call_once(|| {
-        // FFI won't properly unwind on panic, but it will if we cause a segmentation fault
-        panic::set_hook(Box::new(move |_| {
-            raise(SIGSEGV);
-        }));
-    });
 
     Box::into_raw(tunnel)
 }
@@ -507,8 +522,9 @@ pub(crate) fn install_panic_hook() {
 }
 
 /// Build a boxed tunnel from an already-parsed identity and AmneziaWG 3.0
-/// configuration, installing the FFI panic hook. Shared by the C and JNI entry
-/// points; returns NULL if the configuration is invalid.
+/// configuration. Shared by the C and JNI entry points; returns NULL if the
+/// configuration is invalid. It does not install the FFI panic hook: the C
+/// caller does, and the JNI caller must not (see `new_tunnel_unhooked`).
 pub(crate) fn build_amnezia3_tunnel(
     identity: TunnelIdentity,
     index: u32,
@@ -526,8 +542,6 @@ pub(crate) fn build_amnezia3_tunnel(
         Ok(tunnel) => tunnel,
         Err(_) => return null_mut(),
     };
-
-    install_panic_hook();
 
     Box::into_raw(Box::new(Mutex::new(tunnel)))
 }
@@ -732,7 +746,11 @@ pub unsafe extern "C" fn new_tunnel_amnezia3(
         Err(()) => return null_mut(),
     };
 
-    build_amnezia3_tunnel(identity, index, amnezia)
+    let tunnel = build_amnezia3_tunnel(identity, index, amnezia);
+    if !tunnel.is_null() {
+        install_panic_hook();
+    }
+    tunnel
 }
 
 /// Returns the next pre-handshake packet (I-packet or junk) that should be sent

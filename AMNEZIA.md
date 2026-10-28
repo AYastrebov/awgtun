@@ -841,12 +841,17 @@ used afterwards; passing 0 is a no-op.
 
 ### Buffers and errors
 
-`dst` and `op` must be direct `ByteBuffer`s, and each size argument must not
-exceed the buffer it describes (`op` needs one byte). A size larger than the
-buffer's capacity, or a negative one, is refused: the call writes nothing and
+`dst` and `op` must be direct `ByteBuffer`s that do not overlap, and each size
+argument must not exceed the buffer it describes (`op` needs one byte). A size
+larger than the buffer's capacity, a negative one, or overlapping `dst` and
+`op` is refused: the call writes nothing, leaves the tunnel untouched and
 returns 0. `src_size` is capped at the length of the `byte[]` actually passed.
 
-No export throws for its own errors, and none lets a Rust panic reach the JVM.
+No export throws for its own errors, and none lets a Rust panic reach the JVM:
+a panic, such as a `dst` smaller than the packet being decrypted, is caught
+and the call returns 0. That holds only while nothing in the process uses the
+C API's tunnel constructors, which install a process-wide hook that turns any
+panic into `SIGSEGV`.
 A failure is logged through the `log` crate, which this library does not wire
 to logcat, so install a `log` backend such as `android_logger` to see it. The
 call returns 0 or `null`.
