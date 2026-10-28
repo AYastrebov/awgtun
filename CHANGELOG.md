@@ -3,7 +3,18 @@
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.12.0] - 2026-10-28
+
+Switching a peer from awgtun to kernel WireGuard, kernel AmneziaWG or either
+Go implementation with the same key no longer stalls new handshakes for 27
+seconds: the handshake timestamp now uses the epoch every reference uses (#4).
+The JNI bindings are ported to `jni` 0.22. With that, a Rust panic no longer
+kills the JVM, and out-of-range buffer sizes no longer write or read out of
+bounds. Dependencies are on their current majors, and the MSRV is 1.97.
+
+Minor rather than patch: `awgtun::x25519` re-exports `x25519-dalek`, which
+moved to 3.0, and the MSRV rose from 1.85 to 1.97. The C header, the C struct
+layouts and the Kotlin-facing JNI signatures are unchanged.
 
 ### Fixed
 
