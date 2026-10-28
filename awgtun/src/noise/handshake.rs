@@ -8,10 +8,10 @@ use crate::noise::session::Session;
 use crate::sleepyinstant::Instant;
 use crate::x25519;
 use aead::{Aead, Payload};
+use blake2::digest::consts::{U16, U24};
 use blake2::digest::{FixedOutput, KeyInit};
 use blake2::{Blake2s256, Blake2sMac, Digest};
-use chacha20poly1305::XChaCha20Poly1305;
-use rand_core::OsRng;
+use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
 use std::convert::TryInto;
 use std::time::{Duration, SystemTime};
@@ -67,21 +67,21 @@ pub(crate) fn b2s_hmac2(key: &[u8], data1: &[u8], data2: &[u8]) -> [u8; 32] {
 
 #[inline]
 pub(crate) fn b2s_keyed_mac_16(key: &[u8], data1: &[u8]) -> [u8; 16] {
-    let mut hmac = Blake2sMac::new_from_slice(key).unwrap();
+    let mut hmac = Blake2sMac::<U16>::new_from_slice(key).unwrap();
     blake2::digest::Update::update(&mut hmac, data1);
     hmac.finalize_fixed().into()
 }
 
 #[inline]
 pub(crate) fn b2s_keyed_mac_16_2(key: &[u8], data1: &[u8], data2: &[u8]) -> [u8; 16] {
-    let mut hmac = Blake2sMac::new_from_slice(key).unwrap();
+    let mut hmac = Blake2sMac::<U16>::new_from_slice(key).unwrap();
     blake2::digest::Update::update(&mut hmac, data1);
     blake2::digest::Update::update(&mut hmac, data2);
     hmac.finalize_fixed().into()
 }
 
 pub(crate) fn b2s_mac_24(key: &[u8], data1: &[u8]) -> [u8; 24] {
-    let mut hmac = Blake2sMac::new_from_slice(key).unwrap();
+    let mut hmac = Blake2sMac::<U24>::new_from_slice(key).unwrap();
     blake2::digest::Update::update(&mut hmac, data1);
     hmac.finalize_fixed().into()
 }
@@ -671,9 +671,13 @@ impl Handshake {
             aad: &mac1[0..16],
             msg: packet.encrypted_cookie,
         };
+        let nonce: &XNonce = packet
+            .nonce
+            .try_into()
+            .map_err(|_| WireGuardError::InvalidPacket)?;
         let plaintext = XChaCha20Poly1305::new_from_slice(&key)
             .unwrap()
-            .decrypt(packet.nonce.into(), payload)
+            .decrypt(nonce, payload)
             .map_err(|_| WireGuardError::InvalidAeadTag)?;
 
         let cookie = plaintext
@@ -734,7 +738,7 @@ impl Handshake {
         let mut hash = INITIAL_CHAIN_HASH;
         hash = b2s_hash(&hash, self.params.peer_static_public.as_bytes());
         // initiator.ephemeral_private = DH_GENERATE()
-        let ephemeral_private = x25519::ReusableSecret::random_from_rng(OsRng);
+        let ephemeral_private = x25519::ReusableSecret::random();
         // msg.message_type = dynamic AmneziaWG header (or standard WG type 1)
         message_type.copy_from_slice(&msg_type.to_le_bytes());
         // msg.sender_index = little_endian(initiator.sender_index)
@@ -820,7 +824,7 @@ impl Handshake {
         let (encrypted_nothing, _) = rest.split_at_mut(16);
 
         // responder.ephemeral_private = DH_GENERATE()
-        let ephemeral_private = x25519::ReusableSecret::random_from_rng(OsRng);
+        let ephemeral_private = x25519::ReusableSecret::random();
         let local_index = self.inc_index();
         // msg.message_type = dynamic AmneziaWG header (or standard WG type 2)
         message_type.copy_from_slice(&msg_type.to_le_bytes());

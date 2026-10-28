@@ -1449,16 +1449,15 @@ mod tests {
 
     use super::*;
     use crate::amnezia::HeaderRange;
-    use rand_core::{OsRng, RngCore};
 
     fn create_two_tuns() -> (Tunn, Tunn) {
-        let my_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let my_secret_key = x25519_dalek::StaticSecret::random();
         let my_public_key = x25519_dalek::PublicKey::from(&my_secret_key);
-        let my_idx = OsRng.next_u32();
+        let my_idx = getrandom::u32().expect("getrandom failure");
 
-        let their_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let their_secret_key = x25519_dalek::StaticSecret::random();
         let their_public_key = x25519_dalek::PublicKey::from(&their_secret_key);
-        let their_idx = OsRng.next_u32();
+        let their_idx = getrandom::u32().expect("getrandom failure");
 
         let my_tun = Tunn::new(my_secret_key, their_public_key, None, None, my_idx, None);
 
@@ -1802,9 +1801,9 @@ mod tests {
 
     #[test]
     fn new_with_amnezia3_constructs() {
-        let my_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let my_secret_key = x25519_dalek::StaticSecret::random();
         let my_public_key = x25519_dalek::PublicKey::from(&my_secret_key);
-        let their_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let their_secret_key = x25519_dalek::StaticSecret::random();
         let their_public_key = x25519_dalek::PublicKey::from(&their_secret_key);
         let config = awg3_test_config([0x42; 32]);
         let tun =
@@ -1815,9 +1814,9 @@ mod tests {
     }
 
     fn create_two_tuns_awg3() -> (Tunn, Tunn) {
-        let my_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let my_secret_key = x25519_dalek::StaticSecret::random();
         let my_public_key = x25519_dalek::PublicKey::from(&my_secret_key);
-        let their_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let their_secret_key = x25519_dalek::StaticSecret::random();
         let their_public_key = x25519_dalek::PublicKey::from(&their_secret_key);
         let key = [0x42; 32];
 
@@ -1849,9 +1848,9 @@ mod tests {
     /// S2 > 255 needed (issue #1). Synthetic values.
     #[test]
     fn awg3_handshake_and_data_with_padding_above_255() {
-        let my_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let my_secret_key = x25519_dalek::StaticSecret::random();
         let my_public_key = x25519_dalek::PublicKey::from(&my_secret_key);
-        let their_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let their_secret_key = x25519_dalek::StaticSecret::random();
         let their_public_key = x25519_dalek::PublicKey::from(&their_secret_key);
         let config = || {
             let mut config = awg3_test_config([0x42; 32]);
@@ -1922,9 +1921,9 @@ mod tests {
             config
         };
         let pair = |rate_limit: Option<u64>| {
-            let my_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+            let my_secret_key = x25519_dalek::StaticSecret::random();
             let my_public_key = x25519_dalek::PublicKey::from(&my_secret_key);
-            let their_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+            let their_secret_key = x25519_dalek::StaticSecret::random();
             let their_public_key = x25519_dalek::PublicKey::from(&their_secret_key);
             let limiter =
                 rate_limit.map(|limit| Arc::new(RateLimiter::new(&their_public_key, limit)));
@@ -2132,9 +2131,8 @@ mod tests {
     }
 
     fn awg3_tun_with_keepalive(keep_alive: Option<u16>, range: crate::amnezia::U32Range) -> Tunn {
-        let my_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
-        let their_public_key =
-            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::random_from_rng(OsRng));
+        let my_secret_key = x25519_dalek::StaticSecret::random();
+        let their_public_key = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::random());
         let mut config = awg3_test_config([0x42; 32]);
         config.timing_ranges = crate::amnezia::TimingRanges {
             persistent_keepalive: range,
@@ -2183,9 +2181,9 @@ mod tests {
     /// obfuscation layers.
     #[cfg(feature = "mock-instant")]
     fn create_two_tuns_with_timings(ranges: crate::amnezia::TimingRanges) -> (Tunn, Tunn) {
-        let my_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let my_secret_key = x25519_dalek::StaticSecret::random();
         let my_public_key = x25519_dalek::PublicKey::from(&my_secret_key);
-        let their_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let their_secret_key = x25519_dalek::StaticSecret::random();
         let their_public_key = x25519_dalek::PublicKey::from(&their_secret_key);
 
         let config = crate::amnezia::Amnezia3Config {
@@ -2386,9 +2384,9 @@ mod tests {
         // A zero-limit rate limiter reports "under load" on the first packet,
         // which is the only path that emits a cookie reply.
         let key = [0x42u8; 32];
-        let my_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let my_secret_key = x25519_dalek::StaticSecret::random();
         let my_public_key = x25519_dalek::PublicKey::from(&my_secret_key);
-        let their_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let their_secret_key = x25519_dalek::StaticSecret::random();
         let their_public_key = x25519_dalek::PublicKey::from(&their_secret_key);
 
         let mut my_tun = Tunn::new_with_amnezia3(
@@ -2456,9 +2454,9 @@ mod tests {
         limiter: Option<Arc<RateLimiter>>,
     ) -> (Tunn, Tunn) {
         let key = [0x42u8; 32];
-        let my_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let my_secret_key = x25519_dalek::StaticSecret::random();
         let my_public_key = x25519_dalek::PublicKey::from(&my_secret_key);
-        let their_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let their_secret_key = x25519_dalek::StaticSecret::random();
         let their_public_key = x25519_dalek::PublicKey::from(&their_secret_key);
 
         let mine = Tunn::new_with_amnezia3(
@@ -2625,9 +2623,9 @@ mod tests {
     #[test]
     fn awg31_cookie_reply_actually_carries_a_trailer() {
         let key = [0x42u8; 32];
-        let their_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let their_secret_key = x25519_dalek::StaticSecret::random();
         let their_public_key = x25519_dalek::PublicKey::from(&their_secret_key);
-        let my_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let my_secret_key = x25519_dalek::StaticSecret::random();
         let my_public_key = x25519_dalek::PublicKey::from(&my_secret_key);
 
         let mut my_tun = Tunn::new_with_amnezia3(
@@ -2722,9 +2720,9 @@ mod tests {
         // A zero-limit rate limiter reports "under load" on the very first
         // packet, so this is the saturated case in both runs.
         for disable_cookies in [false, true] {
-            let their_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+            let their_secret_key = x25519_dalek::StaticSecret::random();
             let their_public_key = x25519_dalek::PublicKey::from(&their_secret_key);
-            let my_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+            let my_secret_key = x25519_dalek::StaticSecret::random();
             let my_public_key = x25519_dalek::PublicKey::from(&my_secret_key);
 
             let mut my_tun = Tunn::new_with_amnezia3(
@@ -2832,9 +2830,9 @@ mod tests {
         };
         assert_eq!(v3.header_protection_key, None);
 
-        let my_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let my_secret_key = x25519_dalek::StaticSecret::random();
         let my_public_key = x25519_dalek::PublicKey::from(&my_secret_key);
-        let their_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let their_secret_key = x25519_dalek::StaticSecret::random();
         let their_public_key = x25519_dalek::PublicKey::from(&their_secret_key);
 
         // 3.0 initiator, 2.0 responder.
@@ -2962,9 +2960,8 @@ mod tests {
         assert_eq!(parsed, awg3_test_config([0x42; 32]));
 
         // And it actually drives a tunnel: same S1 prefix, same protected span.
-        let my_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
-        let their_public_key =
-            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::random_from_rng(OsRng));
+        let my_secret_key = x25519_dalek::StaticSecret::random();
+        let their_public_key = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::random());
         let mut tun =
             Tunn::new_with_amnezia3(my_secret_key, their_public_key, None, None, 1, None, parsed)
                 .expect("valid awg3 config");
@@ -3032,9 +3029,9 @@ mod tests {
     }
 
     fn create_two_tuns_awg3_cpa(cpa_lo: u32, cpa_hi: u32) -> (Tunn, Tunn) {
-        let my_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let my_secret_key = x25519_dalek::StaticSecret::random();
         let my_public_key = x25519_dalek::PublicKey::from(&my_secret_key);
-        let their_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let their_secret_key = x25519_dalek::StaticSecret::random();
         let their_public_key = x25519_dalek::PublicKey::from(&their_secret_key);
         let key = [0x42; 32];
 
@@ -3320,9 +3317,8 @@ mod tests {
     #[test]
     fn awg3_mismatched_header_protection_key_drops() {
         let (mut my_tun, _) = create_two_tuns_awg3();
-        let their_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
-        let my_public_key =
-            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::random_from_rng(OsRng));
+        let their_secret_key = x25519_dalek::StaticSecret::random();
+        let my_public_key = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::random());
         let mut wrong_key_tun = Tunn::new_with_amnezia3(
             their_secret_key,
             my_public_key,

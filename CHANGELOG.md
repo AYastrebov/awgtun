@@ -21,6 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `awgtun-ffi`, and from 1.88 to 1.97 for `awgtun-cli`, so all three crates
   declare the same version. CI's MSRV job now checks the FFI crate and the CLI
   as well as the library.
+- RustCrypto stack moved up a generation: `blake2` 0.11, `hmac` 0.13,
+  `chacha20poly1305` 0.11, `aead` 0.6 and `chacha20` 0.10, which replace
+  `generic-array` with `hybrid-array`. `x25519-dalek` 3.0 moves to
+  `curve25519-dalek` 5 and `rand_core` 0.10, which no longer has `OsRng`. Keys
+  now come from `StaticSecret::random()`, and other OS randomness comes from
+  `getrandom`, the crate x25519-dalek uses for its own key generation. No
+  change on the wire.
 
 ## [0.11.0] - 2026-10-20
 

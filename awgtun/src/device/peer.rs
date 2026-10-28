@@ -224,11 +224,10 @@ mod tests {
     use super::*;
     use crate::amnezia::{Amnezia3Config, CpsChain, HeaderRange, JunkConfig, PaddingConfig};
     use crate::x25519;
-    use rand_core::OsRng;
 
     fn tunn(config: Amnezia3Config, index: u32) -> Tunn {
-        let secret = x25519::StaticSecret::random_from_rng(OsRng);
-        let peer = x25519::PublicKey::from(&x25519::StaticSecret::random_from_rng(OsRng));
+        let secret = x25519::StaticSecret::random();
+        let peer = x25519::PublicKey::from(&x25519::StaticSecret::random());
         Tunn::new_with_amnezia3(secret, peer, None, None, index, None, config)
             .expect("valid tunnel config")
     }

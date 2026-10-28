@@ -4,7 +4,6 @@ use awgtun::amnezia::{
 };
 use awgtun::noise::{Tunn, TunnResult};
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput};
-use rand_core::OsRng;
 
 /// A 1280-byte IPv4 payload: a realistic full-MTU tunnelled packet, big enough
 /// that per-packet fixed costs are not lost in the AEAD but small enough to stay
@@ -50,8 +49,8 @@ fn configs() -> Vec<(&'static str, Amnezia3Config)> {
 /// Build a pair of tunnels that have completed a handshake, so the benchmarks
 /// measure the transport path rather than the Noise handshake.
 fn established_pair(config: &Amnezia3Config) -> (Tunn, Tunn) {
-    let secret_a = x25519_dalek::StaticSecret::random_from_rng(OsRng);
-    let secret_b = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+    let secret_a = x25519_dalek::StaticSecret::random();
+    let secret_b = x25519_dalek::StaticSecret::random();
     let public_a = x25519_dalek::PublicKey::from(&secret_a);
     let public_b = x25519_dalek::PublicKey::from(&secret_b);
 
@@ -155,9 +154,8 @@ pub fn bench_amnezia_handshake_init(c: &mut Criterion) {
     cases.push(("awg3_junk8", with_junk));
 
     for (name, config) in cases {
-        let secret = x25519_dalek::StaticSecret::random_from_rng(OsRng);
-        let peer =
-            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::random_from_rng(OsRng));
+        let secret = x25519_dalek::StaticSecret::random();
+        let peer = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::random());
         let mut tunn = Tunn::new_with_amnezia3(secret, peer, None, None, 1, None, config).unwrap();
         let mut dst = vec![0u8; 4096];
 
@@ -213,9 +211,8 @@ pub fn bench_amnezia_update_timers(c: &mut Criterion) {
 
     for (name, config) in cases {
         // Idle: no session yet. This is most peers most of the time.
-        let secret = x25519_dalek::StaticSecret::random_from_rng(OsRng);
-        let peer =
-            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::random_from_rng(OsRng));
+        let secret = x25519_dalek::StaticSecret::random();
+        let peer = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::random());
         let mut idle =
             Tunn::new_with_amnezia3(secret, peer, None, None, 1, None, config.clone()).unwrap();
         let mut dst = vec![0u8; 2048];

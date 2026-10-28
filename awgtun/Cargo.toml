@@ -39,26 +39,25 @@ ip_network = "0.4.1"
 ip_network_table = "0.2.0"
 ring = "0.17"
 subtle = "2.6"
-x25519-dalek = { version = "2.0.1", features = [
+x25519-dalek = { version = "3.0", features = [
+    "getrandom",
     "reusable_secrets",
     "static_secrets",
 ] }
-rand_core = { version = "0.6.4", features = ["getrandom"] }
-chacha20 = "0.9"
+# The OS RNG. rand_core 0.10 dropped `OsRng`; x25519-dalek's `getrandom`
+# feature draws keys from this same crate.
+getrandom = "0.4"
+chacha20 = "0.10"
 # Stable requirements, not the `0.10.0-pre.1`/`0.5.0-pre.2` these used to name.
 # A pre-release in a requirement opts that dependency into pre-release
 # resolution, so `cargo update` was free to pull an unreleased AEAD into the
 # packet path. Both already resolved to stable; this stops them drifting back.
-chacha20poly1305 = "0.10"
-aead = "0.5"
-# Pinned as a group: `hmac::SimpleHmac<Blake2s256>` computes the WireGuard KDF,
-# so `hmac` and `blake2` must agree on the `digest` major version. `hmac` 0.13
-# is on `digest` 0.11 and `blake2` has no stable 0.11 yet (0.11.0-rc.6 at the
-# time of writing), which holds this pair — and with it `aead` 0.6,
-# `chacha20poly1305` 0.11 and the rest of the RustCrypto wave that drops
-# `generic-array` for `hybrid-array` — at the `digest` 0.10 generation.
-blake2 = "0.10"
-hmac = "0.12"
+chacha20poly1305 = "0.11"
+aead = "0.6"
+# Move as a group: `hmac::SimpleHmac<Blake2s256>` computes the WireGuard KDF,
+# so `hmac` and `blake2` must agree on the `digest` major version (0.11).
+blake2 = "0.11"
+hmac = "0.13"
 mock_instant = { version = "0.3", optional = true }
 socket2 = { version = "0.4.7", features = ["all"], optional = true }
 thiserror = { version = "2", optional = true }
