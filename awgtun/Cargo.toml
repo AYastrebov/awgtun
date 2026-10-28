@@ -14,15 +14,12 @@ documentation = "https://docs.rs/awgtun"
 keywords = ["wireguard", "amneziawg", "vpn", "obfuscation", "dpi"]
 categories = ["network-programming", "cryptography"]
 edition = "2018"
-# Chosen, not discovered. This used to read 1.78 — the floor that fell out of
-# Cargo.lock being format v4 — but that was never a compatibility promise, and
-# holding it meant pinning transitive crates that had moved on (`zeroize` 1.9
-# raised its own floor from 1.60 to 1.85). 1.85 is the lowest version the
-# current dependency graph builds on, it is what the RustCrypto, `x25519-dalek`
-# 3.0 and `jni` 0.22 generations require, and `awgtun-cli` already demands
-# 1.88 — so no one building this repo end to end was served by the lower claim.
-# CI pins a job here so it stays true.
-rust-version = "1.85"
+# Chosen, not discovered. 1.85 was the floor of the RustCrypto, `x25519-dalek`
+# 3.0 and `jni` 0.22 generations; 1.97 is what lets `parking_lot` 0.13 (1.95)
+# in, and puts the library, the FFI crate and the CLI on one number instead of
+# the CLI quietly needing more than the library advertised. CI pins a job here
+# so it stays true.
+rust-version = "1.97"
 
 [features]
 default = []
