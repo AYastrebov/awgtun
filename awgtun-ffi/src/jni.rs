@@ -10,11 +10,18 @@
 //! panics so none unwinds into the JVM, and resolves the outcome with
 //! `LogErrorAndDefault`: a failure is logged and the method returns 0 or
 //! `null`, which is what these bindings have always returned on error.
+//!
+//! For that catch to work, a panic has to reach `with_env` as an unwind. So
+//! the tunnel is driven through plain Rust calls here, not the `extern "C"`
+//! `wireguard_*` functions, which abort when a panic hits their boundary.
+//! The JNI constructors also skip the C ABI's process-wide SIGSEGV panic hook,
+//! which fires before any unwinding can start.
 
 use std::convert::TryFrom;
 use std::fmt;
 use std::os::raw::c_char;
 use std::ptr;
+use std::slice;
 
 use jni::errors::LogErrorAndDefault;
 use jni::objects::{JByteArray, JByteBuffer, JClass, JString};
@@ -24,14 +31,10 @@ use jni::{Env, EnvUnowned};
 use parking_lot::Mutex;
 
 use crate::build_amnezia3_tunnel;
-use crate::new_tunnel;
+use crate::new_tunnel_unhooked;
 use crate::parse_tunnel_identity;
 use crate::tunnel_free;
-use crate::wireguard_poll_outgoing_packet;
-use crate::wireguard_read;
 use crate::wireguard_result;
-use crate::wireguard_tick;
-use crate::wireguard_write;
 use crate::x25519_key;
 use crate::x25519_key_to_base64;
 use crate::x25519_key_to_hex;
@@ -40,7 +43,7 @@ use crate::x25519_public_key;
 use crate::x25519_secret_key;
 
 use awgtun::amnezia::Amnezia3Config;
-use awgtun::noise::Tunn;
+use awgtun::noise::{Tunn, TunnResult};
 
 pub extern "C" fn log_print(_log_string: *const c_char) {
     /*
@@ -53,16 +56,25 @@ pub extern "C" fn log_print(_log_string: *const c_char) {
 #[derive(Debug)]
 enum BindingError {
     Jni(jni::errors::Error),
-    /// A size argument was negative or larger than the direct buffer it
-    /// describes. Trusting it would let native code write past the buffer.
+    /// A size argument was negative.
+    NegativeSize,
+    /// A size argument was larger than the direct buffer it describes.
+    /// Trusting it would let native code write past the buffer.
     BufferTooSmall,
+    /// `dst` and `op` overlap, so they cannot both be written as slices.
+    OverlappingBuffers,
+    /// The tunnel handle was 0.
+    NullTunnel,
 }
 
 impl fmt::Display for BindingError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             BindingError::Jni(err) => write!(f, "{err}"),
+            BindingError::NegativeSize => f.write_str("negative size"),
             BindingError::BufferTooSmall => f.write_str("size exceeds the direct buffer capacity"),
+            BindingError::OverlappingBuffers => f.write_str("dst and op buffers overlap"),
+            BindingError::NullTunnel => f.write_str("null tunnel handle"),
         }
     }
 }
@@ -84,13 +96,79 @@ fn read_key(env: &Env, array: &JByteArray) -> Result<x25519_key, BindingError> {
     })
 }
 
-/// The address of a direct `ByteBuffer`, checked to hold at least `len` bytes.
-fn direct_buffer(env: &Env, buf: &JByteBuffer, len: jint) -> Result<*mut u8, BindingError> {
-    let len = usize::try_from(len).map_err(|_| BindingError::BufferTooSmall)?;
-    if env.get_direct_buffer_capacity(buf)? < len {
-        return Err(BindingError::BufferTooSmall);
+fn size(len: jint) -> Result<usize, BindingError> {
+    usize::try_from(len).map_err(|_| BindingError::NegativeSize)
+}
+
+/// The first `len` bytes of a direct `ByteBuffer`, checked to be within its
+/// capacity. A raw region rather than a slice, so that two of them can be
+/// checked for overlap before either becomes a `&mut [u8]`.
+struct Region {
+    ptr: *mut u8,
+    len: usize,
+}
+
+impl Region {
+    fn new(env: &Env, buf: &JByteBuffer, len: jint) -> Result<Region, BindingError> {
+        let len = size(len)?;
+        if env.get_direct_buffer_capacity(buf)? < len {
+            return Err(BindingError::BufferTooSmall);
+        }
+        Ok(Region {
+            ptr: env.get_direct_buffer_address(buf)?,
+            len,
+        })
     }
-    Ok(env.get_direct_buffer_address(buf)?)
+
+    fn overlaps(&self, other: &Region) -> bool {
+        let (a, b) = (self.ptr as usize, other.ptr as usize);
+        a < b + other.len && b < a + self.len
+    }
+
+    /// # Safety
+    ///
+    /// The buffer the region came from must stay referenced for `'buf`, and no
+    /// other live slice may overlap it.
+    unsafe fn slice<'buf>(self) -> &'buf mut [u8] {
+        if self.len == 0 {
+            return &mut [];
+        }
+        // SAFETY: the JVM guarantees a direct buffer's address is valid for its
+        // capacity, which `new` checked covers `len`; aliasing and lifetime are
+        // the caller's contract.
+        unsafe { slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+/// `dst` and the one-byte `op` buffer, as slices that are known not to alias.
+/// The buffers are taken by `&mut` so the borrow checker stops a second call
+/// from handing out another pair; two Java references to the same memory are
+/// caught by the overlap check.
+fn dst_and_op<'buf>(
+    env: &Env,
+    dst: &'buf mut JByteBuffer,
+    dst_size: jint,
+    op: &'buf mut JByteBuffer,
+) -> Result<(&'buf mut [u8], &'buf mut [u8]), BindingError> {
+    let dst = Region::new(env, dst, dst_size)?;
+    let op = Region::new(env, op, 1)?;
+    if dst.overlaps(&op) {
+        return Err(BindingError::OverlappingBuffers);
+    }
+    // SAFETY: both buffers are exclusively borrowed for `'buf`, and the
+    // regions were just checked to be disjoint.
+    Ok(unsafe { (dst.slice(), op.slice()) })
+}
+
+/// The tunnel behind a handle from `new_tunnel` or `new_tunnel_amnezia3`.
+///
+/// # Safety
+///
+/// A non-zero `handle` must be a live tunnel that `tunnel_free` has not freed.
+unsafe fn tunnel<'a>(handle: jlong) -> Result<&'a Mutex<Tunn>, BindingError> {
+    // SAFETY: per the caller contract, a non-null handle points to a live
+    // `Mutex<Tunn>` from `Box::into_raw`.
+    unsafe { (handle as *const Mutex<Tunn>).as_ref() }.ok_or(BindingError::NullTunnel)
 }
 
 /// Turns a C string from `x25519_key_to_hex`/`_base64` into a Java string and
@@ -191,7 +269,7 @@ pub extern "system" fn create_new_tunnel<'local>(
         // SAFETY: each pointer is NUL-terminated and stays valid while the
         // `MUTF8Chars` above are alive; `new_tunnel` copies what it keeps.
         let tunnel = unsafe {
-            new_tunnel(
+            new_tunnel_unhooked(
                 secret_key.as_ptr(),
                 public_key.as_ptr(),
                 preshared_key.as_ref().map_or(ptr::null(), |k| k.as_ptr()),
@@ -277,18 +355,24 @@ pub extern "system" fn create_new_amnezia3_tunnel<'local>(
 pub unsafe extern "system" fn poll_outgoing_packet<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
-    tunnel: jlong,
+    handle: jlong,
     dst: JByteBuffer<'local>,
     dst_size: jint,
 ) -> jint {
     env.with_env(|env| -> Result<_, BindingError> {
-        let dst_ptr = direct_buffer(env, &dst, dst_size)?;
-        // SAFETY: the caller passes a handle from `new_tunnel*` that has not
-        // been freed, and `dst_ptr` holds `dst_size` bytes (checked above).
-        let len = unsafe {
-            wireguard_poll_outgoing_packet(tunnel as *const Mutex<Tunn>, dst_ptr, dst_size as u32)
-        };
-        Ok(len as jint)
+        // SAFETY: `dst` stays referenced for the whole call, and this is the
+        // only slice made from it.
+        let dst = unsafe { Region::new(env, &dst, dst_size)?.slice() };
+        // SAFETY: the caller passes a live handle (see `tunnel`).
+        let tunnel = unsafe { tunnel(handle) }?;
+        Ok(match tunnel.lock().poll_outgoing_packet() {
+            // Same as the C ABI: a datagram that does not fit is dropped.
+            Some(packet) if packet.len() <= dst.len() => {
+                dst[..packet.len()].copy_from_slice(&packet);
+                packet.len() as jint
+            }
+            _ => 0,
+        })
     })
     .resolve::<LogErrorAndDefault>()
 }
@@ -308,39 +392,44 @@ pub unsafe extern "system" fn free_tunnel<'local>(
     tunnel_free(tunnel as *mut Mutex<Tunn>);
 }
 
+/// Which way `transform_packet` runs a packet through the tunnel.
+#[derive(Clone, Copy)]
+enum Direction {
+    Encapsulate,
+    Decapsulate,
+}
+
 /// Shared body of `wireguard_write` and `wireguard_read`: both take a Java
 /// `byte[]` source, a direct destination buffer and a one-byte `op` buffer.
 #[allow(clippy::too_many_arguments)]
 unsafe fn transform_packet<'local>(
     env: &mut EnvUnowned<'local>,
-    tunnel: jlong,
+    handle: jlong,
     src: JByteArray<'local>,
     src_size: jint,
-    dst: JByteBuffer<'local>,
+    mut dst: JByteBuffer<'local>,
     dst_size: jint,
-    op: JByteBuffer<'local>,
-    f: unsafe extern "C" fn(*const Mutex<Tunn>, *const u8, u32, *mut u8, u32) -> wireguard_result,
+    mut op: JByteBuffer<'local>,
+    direction: Direction,
 ) -> jint {
     env.with_env(|env| -> Result<_, BindingError> {
-        let dst_ptr = direct_buffer(env, &dst, dst_size)?;
-        let op_ptr = direct_buffer(env, &op, 1)?;
+        // Every argument is validated before the tunnel sees anything, so a
+        // rejected call has no side effects.
+        let src_len = size(src_size)?;
+        let (dst, op) = dst_and_op(env, &mut dst, dst_size, &mut op)?;
         let src = env.convert_byte_array(&src)?;
         // `src_size` is the caller's claim; the copy is what was really passed.
-        let src_len = usize::try_from(src_size).unwrap_or(0).min(src.len());
+        let src = &src[..src_len.min(src.len())];
+        // SAFETY: the caller passes a live handle (see `tunnel`).
+        let tunnel = unsafe { tunnel(handle) }?;
 
-        // SAFETY: the tunnel handle is live (caller contract), `src` holds
-        // `src_len` bytes, and both direct buffers were checked above.
-        let output = unsafe {
-            f(
-                tunnel as *const Mutex<Tunn>,
-                src.as_ptr(),
-                src_len as u32,
-                dst_ptr,
-                dst_size as u32,
-            )
+        let mut tunnel = tunnel.lock();
+        let result: TunnResult = match direction {
+            Direction::Encapsulate => tunnel.encapsulate(src, dst),
+            Direction::Decapsulate => tunnel.decapsulate(None, src, dst),
         };
-        // SAFETY: `op_ptr` points into a direct buffer of at least one byte.
-        unsafe { *op_ptr = output.op as u8 };
+        let output = wireguard_result::from(result);
+        op[0] = output.op as u8;
         Ok(output.size as jint)
     })
     .resolve::<LogErrorAndDefault>()
@@ -366,7 +455,7 @@ pub unsafe extern "system" fn encrypt_raw_packet<'local>(
         dst,
         dst_size,
         op,
-        wireguard_write,
+        Direction::Encapsulate,
     )
 }
 
@@ -390,7 +479,7 @@ pub unsafe extern "system" fn decrypt_to_raw_packet<'local>(
         dst,
         dst_size,
         op,
-        wireguard_read,
+        Direction::Decapsulate,
     )
 }
 
@@ -399,20 +488,17 @@ pub unsafe extern "system" fn decrypt_to_raw_packet<'local>(
 pub unsafe extern "system" fn run_periodic_task<'local>(
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
-    tunnel: jlong,
-    dst: JByteBuffer<'local>,
+    handle: jlong,
+    mut dst: JByteBuffer<'local>,
     dst_size: jint,
-    op: JByteBuffer<'local>,
+    mut op: JByteBuffer<'local>,
 ) -> jint {
     env.with_env(|env| -> Result<_, BindingError> {
-        let dst_ptr = direct_buffer(env, &dst, dst_size)?;
-        let op_ptr = direct_buffer(env, &op, 1)?;
-        // SAFETY: the tunnel handle is live (caller contract) and both direct
-        // buffers were checked above.
-        let output =
-            unsafe { wireguard_tick(tunnel as *const Mutex<Tunn>, dst_ptr, dst_size as u32) };
-        // SAFETY: `op_ptr` points into a direct buffer of at least one byte.
-        unsafe { *op_ptr = output.op as u8 };
+        let (dst, op) = dst_and_op(env, &mut dst, dst_size, &mut op)?;
+        // SAFETY: the caller passes a live handle (see `tunnel`).
+        let tunnel = unsafe { tunnel(handle) }?;
+        let output = wireguard_result::from(tunnel.lock().update_timers(dst));
+        op[0] = output.op as u8;
         Ok(output.size as jint)
     })
     .resolve::<LogErrorAndDefault>()
