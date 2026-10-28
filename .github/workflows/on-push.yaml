@@ -124,9 +124,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       # Pinned to `rust-version` in awgtun/Cargo.toml. The library is what
-      # FFI, JNI and Rust consumers depend on, so it carries the MSRV; the CLI
-      # follows whatever clap and its dependencies require, which is newer.
-      - uses: dtolnay/rust-toolchain@1.85.0
+      # FFI, JNI and Rust consumers depend on, so it carries the MSRV. The FFI
+      # crate and the CLI declare the same version.
+      - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
       # `check`, not `test`: the dev-dependencies (criterion, and `time` beneath
       # it) require much newer toolchains, and an MSRV claim is about building
@@ -140,6 +140,7 @@ jobs:
       # back to keep a number that nothing depends on.
       - run: cargo check --locked -p awgtun --lib
       - run: cargo check --locked -p awgtun --lib --features device
+      - run: cargo check --locked -p awgtun-ffi -p awgtun-cli
 
   # Every target the README advertises and the release workflow ships. Without
   # this, a cross-compilation break is only discovered at release time, when the

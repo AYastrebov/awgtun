@@ -5,8 +5,7 @@ documentation = "https://docs.rs/awgtun"
 keywords = ["wireguard", "amneziawg", "vpn", "obfuscation", "dpi"]
 categories = ["network-programming", "command-line-utilities"]
 edition = "2021"
-# Higher than the library's: clap and the `time` crate beneath it require it.
-rust-version = "1.88"
+rust-version = "1.97"
 license = "BSD-3-Clause"
 name = "awgtun-cli"
 readme = "../README.md"
