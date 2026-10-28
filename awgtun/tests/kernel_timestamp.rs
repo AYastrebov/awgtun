@@ -76,8 +76,8 @@ fn userspace_to_kernel_same_key_without_replay_pause() {
         server_link: format!("ats{id}"),
         client_link: format!("atc{id}"),
     };
-    let client_secret = x25519::StaticSecret::random_from_rng(rand_core::OsRng);
-    let server_secret = x25519::StaticSecret::random_from_rng(rand_core::OsRng);
+    let client_secret = x25519::StaticSecret::random();
+    let server_secret = x25519::StaticSecret::random();
     let client_public = x25519::PublicKey::from(&client_secret);
     let server_public = x25519::PublicKey::from(&server_secret);
     for (ns, link) in [

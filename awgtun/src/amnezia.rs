@@ -67,8 +67,7 @@ pub struct OsRandom;
 
 impl RandomSource for OsRandom {
     fn fill_bytes(&mut self, out: &mut [u8]) {
-        use rand_core::{OsRng, RngCore};
-        OsRng.fill_bytes(out);
+        getrandom::fill(out).expect("getrandom failure");
     }
 }
 
@@ -177,8 +176,7 @@ impl FastRngState {
     }
 
     fn reseed(&mut self) {
-        use rand_core::{OsRng, RngCore};
-        OsRng.fill_bytes(&mut self.key);
+        getrandom::fill(&mut self.key).expect("getrandom failure");
         self.block = 0;
         self.since_reseed = 0;
         self.generation = FORK_GENERATION.load(portable_atomic::Ordering::Relaxed);

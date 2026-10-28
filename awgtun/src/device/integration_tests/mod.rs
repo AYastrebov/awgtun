@@ -9,7 +9,6 @@ mod tests {
     use crate::x25519::{PublicKey, StaticSecret};
     use base64::Engine as _;
     use hex::encode;
-    use rand_core::OsRng;
     use ring::rand::{SecureRandom, SystemRandom};
     use std::fmt::Write as _;
     use std::io::{BufRead, BufReader, Read, Write};
@@ -87,7 +86,7 @@ mod tests {
         /// Create a new peer with a given endpoint and a list of allowed IPs
         fn new(endpoint: SocketAddr, allowed_ips: Vec<AllowedIp>) -> Peer {
             Peer {
-                key: StaticSecret::random_from_rng(OsRng),
+                key: StaticSecret::random(),
                 endpoint,
                 allowed_ips,
                 container_name: None,
@@ -484,7 +483,7 @@ mod tests {
     /// Test if wireguard starts and creates a unix socket that we can use to set settings
     fn test_wireguard_set() {
         let port = next_port();
-        let private_key = StaticSecret::random_from_rng(OsRng);
+        let private_key = StaticSecret::random();
         let own_public_key = PublicKey::from(&private_key);
 
         let wg = WGHandle::init("192.0.2.0".parse().unwrap(), "::2".parse().unwrap());
@@ -502,7 +501,7 @@ mod tests {
             )
         );
 
-        let peer_key = StaticSecret::random_from_rng(OsRng);
+        let peer_key = StaticSecret::random();
         let peer_pub_key = PublicKey::from(&peer_key);
         let endpoint = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 0, 0, 1)), 50001);
         let allowed_ips = [
@@ -551,7 +550,7 @@ mod tests {
     #[ignore]
     fn test_wg_start_ipv4_non_connected() {
         let port = next_port();
-        let private_key = StaticSecret::random_from_rng(OsRng);
+        let private_key = StaticSecret::random();
         let public_key = PublicKey::from(&private_key);
         let addr_v4 = next_ip();
         let addr_v6 = next_ip_v6();
@@ -598,7 +597,7 @@ mod tests {
     #[ignore]
     fn test_wg_start_ipv4() {
         let port = next_port();
-        let private_key = StaticSecret::random_from_rng(OsRng);
+        let private_key = StaticSecret::random();
         let public_key = PublicKey::from(&private_key);
         let addr_v4 = next_ip();
         let addr_v6 = next_ip_v6();
@@ -634,7 +633,7 @@ mod tests {
     /// Test if wireguard can handle simple ipv6 connections
     fn test_wg_start_ipv6() {
         let port = next_port();
-        let private_key = StaticSecret::random_from_rng(OsRng);
+        let private_key = StaticSecret::random();
         let public_key = PublicKey::from(&private_key);
         let addr_v4 = next_ip();
         let addr_v6 = next_ip_v6();
@@ -670,7 +669,7 @@ mod tests {
     #[cfg(target_os = "linux")] // Can't make docker work with ipv6 on macOS ATM
     fn test_wg_start_ipv6_endpoint() {
         let port = next_port();
-        let private_key = StaticSecret::random_from_rng(OsRng);
+        let private_key = StaticSecret::random();
         let public_key = PublicKey::from(&private_key);
         let addr_v4 = next_ip();
         let addr_v6 = next_ip_v6();
@@ -709,7 +708,7 @@ mod tests {
     #[cfg(target_os = "linux")] // Can't make docker work with ipv6 on macOS ATM
     fn test_wg_start_ipv6_endpoint_not_connected() {
         let port = next_port();
-        let private_key = StaticSecret::random_from_rng(OsRng);
+        let private_key = StaticSecret::random();
         let public_key = PublicKey::from(&private_key);
         let addr_v4 = next_ip();
         let addr_v6 = next_ip_v6();
@@ -758,7 +757,7 @@ mod tests {
     #[ignore]
     fn test_wg_concurrent() {
         let port = next_port();
-        let private_key = StaticSecret::random_from_rng(OsRng);
+        let private_key = StaticSecret::random();
         let public_key = PublicKey::from(&private_key);
         let addr_v4 = next_ip();
         let addr_v6 = next_ip_v6();
@@ -809,7 +808,7 @@ mod tests {
     #[ignore]
     fn test_wg_concurrent_v6() {
         let port = next_port();
-        let private_key = StaticSecret::random_from_rng(OsRng);
+        let private_key = StaticSecret::random();
         let public_key = PublicKey::from(&private_key);
         let addr_v4 = next_ip();
         let addr_v6 = next_ip_v6();
@@ -952,10 +951,7 @@ mod tests {
     /// decapsulated payload, and this pair passes none.
     fn test_awg3_handshake_between_two_devices() {
         let (port_a, port_b) = (next_port(), next_port());
-        let (key_a, key_b) = (
-            StaticSecret::random_from_rng(OsRng),
-            StaticSecret::random_from_rng(OsRng),
-        );
+        let (key_a, key_b) = (StaticSecret::random(), StaticSecret::random());
         let (pub_a, pub_b) = (PublicKey::from(&key_a), PublicKey::from(&key_b));
         let (ip_a, ip_b) = (next_ip(), next_ip());
 
@@ -998,10 +994,7 @@ mod tests {
     /// handshake happily.
     fn test_awg3_does_not_interoperate_with_plain_wireguard() {
         let (port_a, port_b) = (next_port(), next_port());
-        let (key_a, key_b) = (
-            StaticSecret::random_from_rng(OsRng),
-            StaticSecret::random_from_rng(OsRng),
-        );
+        let (key_a, key_b) = (StaticSecret::random(), StaticSecret::random());
         let (pub_a, pub_b) = (PublicKey::from(&key_a), PublicKey::from(&key_b));
         let (ip_a, ip_b) = (next_ip(), next_ip());
 
@@ -1033,7 +1026,7 @@ mod tests {
     /// `get=1` must report the AmneziaWG configuration back, so `awg showconf`
     /// round-trips.
     fn test_awg3_config_round_trips_through_the_api() {
-        let key = StaticSecret::random_from_rng(OsRng);
+        let key = StaticSecret::random();
         let wg = WGHandle::init(next_ip(), next_ip_v6());
 
         assert_eq!(
@@ -1069,8 +1062,8 @@ mod tests {
     /// A peer is configured first, so the update also runs the peer rebuild
     /// that a device-level change triggers.
     fn test_awg3_config_updates_are_incremental() {
-        let key = StaticSecret::random_from_rng(OsRng);
-        let peer_key = PublicKey::from(&StaticSecret::random_from_rng(OsRng));
+        let key = StaticSecret::random();
+        let peer_key = PublicKey::from(&StaticSecret::random());
         let peer_ip = next_ip();
         let wg = WGHandle::init(next_ip(), next_ip_v6());
 
@@ -1129,7 +1122,7 @@ mod tests {
     /// amneziawg-go defaults H1-H4 to the standard WireGuard types and never
     /// refuses them. This used to return EINVAL.
     fn test_awg_padding_without_custom_headers_is_accepted() {
-        let key = StaticSecret::random_from_rng(OsRng);
+        let key = StaticSecret::random();
         let wg = WGHandle::init(next_ip(), next_ip_v6());
 
         assert_eq!(

@@ -27,7 +27,6 @@ use base64::Engine as _;
 use hex::encode as encode_hex;
 use libc::{raise, SIGSEGV};
 use parking_lot::Mutex;
-use rand_core::OsRng;
 use tracing_subscriber::fmt;
 
 use awgtun::serialization::KeyBytes;
@@ -113,7 +112,7 @@ pub struct x25519_key {
 #[no_mangle]
 pub extern "C" fn x25519_secret_key() -> x25519_key {
     x25519_key {
-        key: StaticSecret::random_from_rng(OsRng).to_bytes(),
+        key: StaticSecret::random().to_bytes(),
     }
 }
 
@@ -863,7 +862,7 @@ mod tests {
     use std::ffi::CString;
 
     fn keypair() -> (CString, CString) {
-        let secret = StaticSecret::random_from_rng(OsRng);
+        let secret = StaticSecret::random();
         let public = PublicKey::from(&secret);
         (
             CString::new(base64::engine::general_purpose::STANDARD.encode(secret.to_bytes()))
