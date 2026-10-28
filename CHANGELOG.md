@@ -14,6 +14,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   window to expire once on upgrade. Add stamper regression tests and an opt-in
   same-key switch test against actual kernel WireGuard; see
   [the test instructions](docs/kernel-timestamp-test.md).
+- JNI: `wireguard_write`, `wireguard_read`, `wireguard_tick` and
+  `wireguard_poll_outgoing_packet` trusted their size arguments. A `dst_size`
+  larger than the direct buffer let native code write past it, and a `src_size`
+  larger than the `byte[]` read past the copy. Sizes are now checked against
+  the buffer's capacity and the array's length. See
+  [Buffers and errors](AMNEZIA.md#buffers-and-errors).
+- JNI: `wireguard_write` and `wireguard_read` called `unwrap()` on the array
+  copy, so a JNI failure panicked across the FFI boundary.
+- JNI: `x25519_key_to_hex` and `x25519_key_to_base64` leaked the native string
+  on every call, and `new_tunnel` and `new_tunnel_amnezia3` never released the
+  UTF chars of their key arguments.
 
 ### Changed
 
@@ -30,8 +41,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   change on the wire.
 - `parking_lot` 0.13, `base64` 0.23, `socket2` 0.6, and for tests
   `mock_instant` 0.6 (its per-thread clock, as 0.3 had without `sync`) and
-  `etherparse` 0.21. `jni` stays at 0.19: 0.22 replaces `JNIEnv` with a
-  closure-based API, and porting every Android export is its own change.
+  `etherparse` 0.21.
+- `jni` 0.22. Every Android export now runs inside `EnvUnowned::with_env`, so a
+  Rust panic is caught and logged instead of unwinding into the JVM, and
+  failures still return 0 or `null`. The exports are `extern "system"`, the
+  JNI calling convention, which matches `extern "C"` on every Android ABI.
 
 ## [0.11.0] - 2026-10-20
 

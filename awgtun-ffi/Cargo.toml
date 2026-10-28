@@ -30,7 +30,7 @@ libc = "0.2"
 parking_lot = "0.13"
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
-jni = { version = "0.19.0", optional = true }
+jni = { version = "0.22", optional = true }
 
 # The whole point of this crate: the C and JNI artefacts live here, so `awgtun`
 # can stay a plain rlib. `crate-type` cannot be feature-gated, so a consumer of

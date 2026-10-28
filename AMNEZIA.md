@@ -839,6 +839,20 @@ Skipping this does not break the tunnel — the handshake still completes — bu
 `AwgTunJNI.tunnel_free(handle)` releases the tunnel. The handle must not be
 used afterwards; passing 0 is a no-op.
 
+### Buffers and errors
+
+`dst` and `op` must be direct `ByteBuffer`s, and each size argument must not
+exceed the buffer it describes (`op` needs one byte). A size larger than the
+buffer's capacity, or a negative one, is refused: the call writes nothing and
+returns 0. `src_size` is capped at the length of the `byte[]` actually passed.
+
+No export throws for its own errors, and none lets a Rust panic reach the JVM.
+A failure is logged through the `log` crate, which this library does not wire
+to logcat, so install a `log` backend such as `android_logger` to see it. The
+call returns 0 or `null`.
+An exception the JVM raised itself, such as a key `byte[]` shorter than 32
+bytes, is left pending for the caller.
+
 > **Note:** every JNI export is bound to a literal class name via
 > `#[export_name]`, so the Kotlin class must be declared at exactly
 > `io.github.ayastrebov.awgtun.AwgTunJNI` or the runtime will not resolve
