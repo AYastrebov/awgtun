@@ -622,7 +622,7 @@ The Noise handshake code (`handshake.rs`, `session.rs`) only gained a `msg_type:
 | File | Purpose |
 |------|---------|
 | `awgtun/src/amnezia.rs` | Every AWG 2.0, 3.0 and 3.1 config type, validation, the CPS parser and generator, junk generation, the ChaCha20 header protection primitive, `parse`/`to_uapi_block`, and the `RandomSource` implementations |
-| `awgtun-ffi/src/jni.rs` | Android bindings: `new_tunnel_amnezia3`, `wireguard_poll_outgoing_packet`, `tunnel_free` |
+| `awgtun-ffi/src/jni.rs` | Android bindings on `jni` 0.22: the key helpers, `new_tunnel`, `new_tunnel_amnezia3`, `wireguard_write`/`_read`/`_tick`, `wireguard_poll_outgoing_packet` and `tunnel_free`. Each runs inside `EnvUnowned::with_env` and drives the `Tunn` directly, so a panic is caught rather than aborting (see [Buffers and errors](#buffers-and-errors)) |
 | `awgtun/benches/crypto_benches/amnezia_benching.rs` | Criterion benchmarks for encapsulate, decapsulate, handshake initiation and `update_timers` |
 
 Line counts used to be a column here. They drifted every time the files were
@@ -634,7 +634,7 @@ wrong; `wc -l` answers the question when it matters.
 | File | Change Summary |
 |------|---------------|
 | `noise/mod.rs` | `Tunn` gains the AWG config fields and the `network_outgoing` queue; `new_with_amnezia`/`new_with_amnezia3` constructors; `PacketClassifier` and `Classified` for peer-independent inbound classification; padding and header protection in `encapsulate`/`decapsulate`; content padding; `format_handshake_initiation` queues I-packets and junk; `constant_time_eq` |
-| `noise/handshake.rs` | `format_handshake_initiation`, `format_handshake_response` and `receive_handshake_initialization` take `msg_type: u32`, written before the MAC |
+| `noise/handshake.rs` | `format_handshake_initiation`, `format_handshake_response` and `receive_handshake_initialization` take `msg_type: u32`, written before the MAC; the TAI64N stamper uses the kernel's and wireguard-go's epoch (Unix + 10), not the +37 BoringTun shipped |
 | `noise/session.rs` | `format_packet_data` takes `msg_type` and `content_padding` |
 | `noise/rate_limiter.rs` | `verify_packet` takes `&HeaderConfig`; `format_cookie_reply` takes `msg_type`; dynamic cookie headers |
 | `noise/timers.rs` | `clear_all` clears `network_outgoing`; the AWG 3.0 `TimingRanges`, `roll_handshake_timings`, and the per-arm range rules in `update_timers` |
@@ -642,7 +642,7 @@ wrong; `wc -l` answers the question when it matters.
 | `device/api.rs` | AmneziaWG keys merged incrementally over the current config on `set=1`, emitted by `to_uapi_block` on `get=1`; per-peer `persistent_keepalive_interval` accepts a range |
 | `device/peer.rs` | `drain_outgoing`, `set_tunnel`, and the configured keepalive range kept for `get=1` |
 | `device/integration_tests/mod.rs` | The `test_awg*` device tests: a two-device handshake, its plain-WireGuard negative control, UAPI round-trip, incremental update, and padding without custom headers |
-| `ffi/mod.rs` | `amnezia_config` and `amnezia3_config` structs, `new_tunnel_amnezia`, `new_tunnel_amnezia3`, `wireguard_poll_outgoing_packet` |
+| `awgtun-ffi/src/lib.rs` (was `ffi/mod.rs`) | `amnezia_config` and `amnezia3_config` structs, `new_tunnel_amnezia`, `new_tunnel_amnezia3`, `wireguard_poll_outgoing_packet`; the SIGSEGV panic hook is installed by the C constructors only, and `new_tunnel_unhooked` serves JNI |
 | `wireguard_ffi.h` | C declarations for both AmneziaWG surfaces |
 | `lib.rs` | `pub mod amnezia;` and `pub mod serialization;`, the latter public so the `awgtun-ffi` crate can parse keys from outside |
 
@@ -1141,6 +1141,7 @@ so a library caller changing parameters must build a new one.
 | I-packets/junk on retry | Every attempt | Every attempt | Exact |
 | Junk size distribution | `min + fastrandn(max - min)`, half-open | Half-open `[Jmin, Jmax)` | Exact |
 | Header byte order | Little-endian u32 | Little-endian u32 | Exact |
+| Handshake timestamp epoch | Unix seconds + `0x400000000000000a` | Same (+37 before 0.12.0) | Exact |
 | Packet classification | `DeterminePacketTypeAndPadding` (a `Device` method) | `PacketClassifier::classify` (peer-independent, as upstream's is) | Equivalent; ours also returns the keystream it derived |
 | CPS tags | b, t, r, rc, rd, d, ds, dz | Same set | Exact |
 | Transport header for keepalive | Same as data (H4) | Same as data (H4) | Exact |

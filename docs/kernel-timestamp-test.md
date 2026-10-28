@@ -14,7 +14,10 @@ The server and its replay state remain alive. The kernel client must complete
 its own handshake within eight seconds (allowing one normal ~5s retry, but not
 allowing the 27s offset to expire). Obfuscation is disabled throughout.
 
-Build on Linux, then run only this ignored test as root:
+CI runs it on every pull request: the `integration-tests` job runs all
+ignored tests as root on `ubuntu-latest`, whose kernel ships the `wireguard`
+module, and installs `wireguard-tools` for `wg`. To run it locally, build on
+Linux, then run only this ignored test as root:
 
 ```sh
 cargo test -p awgtun --test kernel_timestamp --locked --no-run

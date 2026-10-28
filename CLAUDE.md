@@ -101,6 +101,10 @@ cargo test -p awgtun --lib --features device --no-run
 sudo -E ./target/debug/deps/awgtun-* --ignored --test-threads 1 awg
 ```
 
+`awgtun/tests/kernel_timestamp.rs` is also `#[ignore]`d. It needs root, `ip`,
+`wg` and the `wireguard` kernel module, and fails rather than skips when one is
+missing. See `docs/kernel-timestamp-test.md`.
+
 **Never build them with `--all-features`.** That turns on `mock-instant`, which
 freezes the clock, so no timer ever fires, nothing is ever sent, and every
 device integration test fails in a way that looks like a protocol bug. CI's
@@ -115,12 +119,12 @@ Files modified from upstream boringtun (keep these in mind during rebases):
 |------|---------|
 | `amnezia.rs` | New file — all AWG config types, CPS generator, junk generation, ChaCha20 header protection |
 | `noise/mod.rs` | HeaderConfig, PaddingConfig, padding send/receive, multi-datagram output, header protection, content padding |
-| `noise/handshake.rs` | `msg_type` parameter for dynamic headers |
+| `noise/handshake.rs` | `msg_type` parameter for dynamic headers; kernel-compatible TAI64N epoch (+10) |
 | `noise/session.rs` | `msg_type` and `content_padding` parameters for transport packets |
 | `noise/rate_limiter.rs` | HeaderConfig param, dynamic cookie headers |
 | `noise/timers.rs` | Clear network_outgoing queue on reset, AWG 3.0 randomized timings |
 | `awgtun-ffi/src/lib.rs` | Was `ffi/mod.rs`. `amnezia_config`/`amnezia3_config`, `new_tunnel_amnezia`/`new_tunnel_amnezia3` |
-| `awgtun-ffi/src/jni.rs` | Was `jni.rs`. Android exports, bound to a literal class name |
+| `awgtun-ffi/src/jni.rs` | Was `jni.rs`. Android exports on `jni` 0.22, bound to a literal class name. They must not go through the `extern "C"` functions or install the panic hook, or a panic kills the JVM |
 | `awgtun-ffi/wireguard_ffi.h` | AWG 2.0, 3.0 and 3.1 declarations |
 | `device/mod.rs` | Device-scoped AWG config, AWG-aware receive, junk/I-packet drain sites |
 | `device/api.rs` | AWG keys over the UAPI socket (`set=1`/`get=1`) |

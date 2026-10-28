@@ -58,10 +58,11 @@ re-apply our additions on top", not "pick a side".
 | `device/api.rs` | `is_amnezia_interface_key`, `apply_amnezia_block`, AWG block in `api_get`, keepalive range in `api_set_peer`, `splitn(2, '=')` | Re-apply; the `splitn` fix is easy to lose |
 | `device/peer.rs` | `drain_outgoing`, `keepalive_range`, `set_tunnel` | Additive methods; re-add |
 | `device/integration_tests/mod.rs` | The `test_awg*` tests and their helpers | Ours are appended at the end of the module; usually conflict-free |
-| `ffi/mod.rs` | `amnezia_config`/`amnezia3_config`, `new_tunnel_amnezia{,3}`, `wireguard_poll_outgoing_packet` | Accept upstream, re-apply our additions |
+| `awgtun-ffi/src/lib.rs` (upstream `ffi/mod.rs`) | `amnezia_config`/`amnezia3_config`, `new_tunnel_amnezia{,3}`, `wireguard_poll_outgoing_packet`, `new_tunnel_unhooked` (the panic hook is C-only) | Accept upstream, re-apply our additions |
 | `wireguard_ffi.h` | AWG 2.0 and 3.0 declarations | Additive |
-| `jni.rs` | `new_tunnel_amnezia3`, `poll_outgoing_packet`, `tunnel_free` | Additive |
-| `Cargo.toml` | base64, rand_core (already upstream deps) | Accept upstream dependency changes |
+| `awgtun-ffi/src/jni.rs` (upstream `jni.rs`) | Rewritten for `jni` 0.22 (`EnvUnowned::with_env`, buffer checks, direct `Tunn` calls); upstream's is still the 0.19 API | Keep ours; port any new upstream export to the 0.22 shape |
+| `noise/handshake.rs` stamper | `TAI64_BASE` is `(1 << 62) + 10`, matching the kernel and wireguard-go | Keep ours; upstream's +37 reintroduces a 27 s replay window on a same-key switch |
+| `Cargo.toml` | The RustCrypto `digest` 0.11 generation, `x25519-dalek` 3, `getrandom` 0.4 in place of `rand_core`'s `OsRng`, `rust-version = "1.97"` | Keep our versions unless upstream is newer |
 
 ## After resolving each file
 
