@@ -259,6 +259,10 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # `wg` for the kernel WireGuard interop tests, which drive a real kernel
+      # peer and fail rather than skip when the tool is missing. The runner
+      # image ships the kernel module but not wireguard-tools.
+      - run: sudo apt-get update && sudo apt-get install -y wireguard-tools
       # Deliberately not --all-features: that enables `mock-instant`, which
       # freezes the clock so no timer fires, nothing is sent, and every device
       # test fails looking exactly like a protocol bug. `device` arrives here
