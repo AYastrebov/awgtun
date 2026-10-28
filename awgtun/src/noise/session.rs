@@ -129,9 +129,7 @@ impl ReceivingKeyCounterValidator {
             }
         } else {
             let mut i = self.next;
-            // Not `is_multiple_of`: that is stable since 1.87 and the crate
-            // declares 1.85. An earlier `clippy --fix` introduced it silently.
-            while i % WORD_SIZE != 0 && i < counter {
+            while !i.is_multiple_of(WORD_SIZE) && i < counter {
                 // Clear until i aligned to word size
                 self.clear_bit(i);
                 i += 1;

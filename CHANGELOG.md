@@ -15,6 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   same-key switch test against actual kernel WireGuard; see
   [the test instructions](docs/kernel-timestamp-test.md).
 
+### Changed
+
+- Minimum supported Rust version raised from 1.85 to 1.97 for `awgtun` and
+  `awgtun-ffi`, and from 1.88 to 1.97 for `awgtun-cli`, so all three crates
+  declare the same version. CI's MSRV job now checks the FFI crate and the CLI
+  as well as the library.
+
 ## [0.11.0] - 2026-10-20
 
 Configurations that real AmneziaWG servers issue but this fork refused. S1-S4

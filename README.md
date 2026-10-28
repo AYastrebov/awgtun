@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/AYastrebov/awgtun/actions/workflows/on-push.yaml/badge.svg?branch=master)](https://github.com/AYastrebov/awgtun/actions/workflows/on-push.yaml)
 [![License](https://img.shields.io/badge/license-BSD--3--Clause-blue.svg)](LICENSE.md)
-[![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.97%2B-orange.svg)](https://www.rust-lang.org)
 
 AmneziaWG 2.0, 3.0 and 3.1 in Rust, forked from [cloudflare/boringtun](https://github.com/cloudflare/boringtun). WireGuard itself is untouched: leave the AmneziaWG parameters at their defaults and the tunnel is byte-for-byte standard WireGuard.
 

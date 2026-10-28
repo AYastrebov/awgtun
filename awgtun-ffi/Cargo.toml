@@ -14,7 +14,7 @@ documentation = "https://docs.rs/awgtun-ffi"
 keywords = ["wireguard", "amneziawg", "ffi", "jni", "vpn"]
 categories = ["network-programming", "external-ffi-bindings"]
 edition = "2018"
-rust-version = "1.85"
+rust-version = "1.97"
 
 [features]
 default = []
