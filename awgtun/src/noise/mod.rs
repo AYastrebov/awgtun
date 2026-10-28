@@ -1594,7 +1594,7 @@ mod tests {
 
         // Advance time 1 second and "send" 1 packet so that we send a handshake
         // after the timeout
-        mock_instant::MockClock::advance(Duration::from_secs(1));
+        mock_instant::thread_local::MockClock::advance(Duration::from_secs(1));
         assert!(matches!(their_tun.update_timers(&mut []), TunnResult::Done));
         assert!(matches!(
             my_tun.update_timers(&mut my_dst),
@@ -1605,7 +1605,7 @@ mod tests {
         assert!(matches!(data, TunnResult::WriteToNetwork(_)));
 
         //Advance to timeout
-        mock_instant::MockClock::advance(REKEY_AFTER_TIME);
+        mock_instant::thread_local::MockClock::advance(REKEY_AFTER_TIME);
         assert!(matches!(their_tun.update_timers(&mut []), TunnResult::Done));
         update_timer_results_in_handshake(&mut my_tun);
     }
@@ -1620,7 +1620,7 @@ mod tests {
         assert!(matches!(packet, Packet::HandshakeInit(_)));
 
         // The retransmit waits up to 334 ms of jitter past REKEY_TIMEOUT.
-        mock_instant::MockClock::advance(
+        mock_instant::thread_local::MockClock::advance(
             REKEY_TIMEOUT
                 + Duration::from_millis(u64::from(
                     crate::noise::timers::REKEY_TIMEOUT_JITTER_MAX_MS,
@@ -2231,7 +2231,7 @@ mod tests {
         // has to run before the send for the data-sent tick to be stamped at
         // t=1 rather than t=0.
         let mut dst = vec![0u8; 2048];
-        mock_instant::MockClock::advance(Duration::from_secs(1));
+        mock_instant::thread_local::MockClock::advance(Duration::from_secs(1));
         assert!(matches!(my_tun.update_timers(&mut dst), TunnResult::Done));
         assert!(matches!(
             my_tun.encapsulate(&create_ipv4_udp_packet(), &mut dst),
@@ -2239,10 +2239,10 @@ mod tests {
         ));
 
         // Session established at t=0, so the rekey is due at t=10.
-        mock_instant::MockClock::advance(Duration::from_secs(8));
+        mock_instant::thread_local::MockClock::advance(Duration::from_secs(8));
         assert!(matches!(my_tun.update_timers(&mut dst), TunnResult::Done));
 
-        mock_instant::MockClock::advance(Duration::from_secs(2));
+        mock_instant::thread_local::MockClock::advance(Duration::from_secs(2));
         update_timer_results_in_handshake(&mut my_tun);
     }
 
@@ -2257,11 +2257,11 @@ mod tests {
         let _ = create_handshake_init(&mut my_tun);
 
         let mut dst = vec![0u8; 2048];
-        mock_instant::MockClock::advance(Duration::from_secs(1));
+        mock_instant::thread_local::MockClock::advance(Duration::from_secs(1));
         assert!(matches!(my_tun.update_timers(&mut dst), TunnResult::Done));
 
         // Past 2 s and the reference's jitter of up to 334 ms.
-        mock_instant::MockClock::advance(
+        mock_instant::thread_local::MockClock::advance(
             Duration::from_secs(1)
                 + Duration::from_millis(u64::from(
                     crate::noise::timers::REKEY_TIMEOUT_JITTER_MAX_MS,
@@ -2283,7 +2283,7 @@ mod tests {
         // responder's clock first so the receive is stamped at t=1.
         let mut dst = vec![0u8; 2048];
         let mut their_dst = vec![0u8; 2048];
-        mock_instant::MockClock::advance(Duration::from_secs(1));
+        mock_instant::thread_local::MockClock::advance(Duration::from_secs(1));
         assert!(matches!(
             their_tun.update_timers(&mut their_dst),
             TunnResult::Done
@@ -2299,13 +2299,13 @@ mod tests {
         ));
 
         // The responder last sent at t=0, so the keepalive is due at t=3.
-        mock_instant::MockClock::advance(Duration::from_secs(1));
+        mock_instant::thread_local::MockClock::advance(Duration::from_secs(1));
         assert!(matches!(
             their_tun.update_timers(&mut their_dst),
             TunnResult::Done
         ));
 
-        mock_instant::MockClock::advance(Duration::from_secs(1));
+        mock_instant::thread_local::MockClock::advance(Duration::from_secs(1));
         match their_tun.update_timers(&mut their_dst) {
             TunnResult::WriteToNetwork(packet) => assert_eq!(packet.len(), KEEPALIVE_SZ),
             other => panic!("expected a keepalive, got {:?}", other),
@@ -2324,7 +2324,7 @@ mod tests {
         });
 
         let mut dst = vec![0u8; 2048];
-        mock_instant::MockClock::advance(Duration::from_secs(1));
+        mock_instant::thread_local::MockClock::advance(Duration::from_secs(1));
         assert!(matches!(my_tun.update_timers(&mut dst), TunnResult::Done));
         assert!(matches!(
             my_tun.encapsulate(&create_ipv4_udp_packet(), &mut dst),
@@ -2333,10 +2333,10 @@ mod tests {
 
         // Last authenticated receive was the handshake response at t=0, so the
         // new-handshake timer is due at t=8, plus up to 334 ms of jitter.
-        mock_instant::MockClock::advance(Duration::from_secs(6));
+        mock_instant::thread_local::MockClock::advance(Duration::from_secs(6));
         assert!(matches!(my_tun.update_timers(&mut dst), TunnResult::Done));
 
-        mock_instant::MockClock::advance(
+        mock_instant::thread_local::MockClock::advance(
             Duration::from_secs(1)
                 + Duration::from_millis(u64::from(
                     crate::noise::timers::REKEY_TIMEOUT_JITTER_MAX_MS,
@@ -2356,10 +2356,10 @@ mod tests {
         });
 
         let mut dst = vec![0u8; 2048];
-        mock_instant::MockClock::advance(Duration::from_secs(179));
+        mock_instant::thread_local::MockClock::advance(Duration::from_secs(179));
         assert!(matches!(my_tun.update_timers(&mut dst), TunnResult::Done));
 
-        mock_instant::MockClock::advance(Duration::from_secs(1));
+        mock_instant::thread_local::MockClock::advance(Duration::from_secs(1));
         assert!(matches!(
             my_tun.update_timers(&mut dst),
             TunnResult::Err(WireGuardError::ConnectionExpired)

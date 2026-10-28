@@ -28,6 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now come from `StaticSecret::random()`, and other OS randomness comes from
   `getrandom`, the crate x25519-dalek uses for its own key generation. No
   change on the wire.
+- `parking_lot` 0.13, `base64` 0.23, `socket2` 0.6, and for tests
+  `mock_instant` 0.6 (its per-thread clock, as 0.3 had without `sync`) and
+  `etherparse` 0.21. `jni` stays at 0.19: 0.22 replaces `JNIEnv` with a
+  closure-based API, and porting every Android export is its own change.
 
 ## [0.11.0] - 2026-10-20
 
