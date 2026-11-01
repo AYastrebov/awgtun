@@ -2314,6 +2314,114 @@ mod tests {
 
     #[test]
     #[cfg(feature = "mock-instant")]
+    fn new_handshake_waits_for_unanswered_data_after_idle() {
+        let (mut tun, _) = create_two_tuns_and_handshake();
+        let mut dst = vec![0; 2048];
+        mock_instant::thread_local::MockClock::advance(Duration::from_secs(60));
+        assert!(matches!(tun.update_timers(&mut dst), TunnResult::Done));
+        assert!(matches!(
+            tun.encapsulate(&create_ipv4_udp_packet(), &mut dst),
+            TunnResult::WriteToNetwork(_)
+        ));
+        // The preceding idle minute is not time spent waiting for this packet's reply.
+        assert!(matches!(tun.update_timers(&mut dst), TunnResult::Done));
+        mock_instant::thread_local::MockClock::advance(Duration::from_secs(14));
+        assert!(matches!(tun.update_timers(&mut dst), TunnResult::Done));
+        mock_instant::thread_local::MockClock::advance(Duration::from_secs(2));
+        update_timer_results_in_handshake(&mut tun);
+    }
+
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn new_handshake_deadline_is_not_postponed_by_more_data() {
+        let (mut tun, _) = create_two_tuns_and_handshake();
+        let mut dst = vec![0; 2048];
+        mock_instant::thread_local::MockClock::advance(Duration::from_secs(1));
+        assert!(matches!(tun.update_timers(&mut dst), TunnResult::Done));
+        assert!(matches!(
+            tun.encapsulate(&create_ipv4_udp_packet(), &mut dst),
+            TunnResult::WriteToNetwork(_)
+        ));
+        mock_instant::thread_local::MockClock::advance(Duration::from_secs(10));
+        assert!(matches!(tun.update_timers(&mut dst), TunnResult::Done));
+        assert!(matches!(
+            tun.encapsulate(&create_ipv4_udp_packet(), &mut dst),
+            TunnResult::WriteToNetwork(_)
+        ));
+        mock_instant::thread_local::MockClock::advance(
+            Duration::from_secs(5) + Duration::from_millis(334),
+        );
+        update_timer_results_in_handshake(&mut tun);
+    }
+
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn new_handshake_is_cancelled_by_authenticated_keepalive_and_can_rearm() {
+        let (mut tun, mut peer) = create_two_tuns_and_handshake();
+        let mut dst = vec![0; 2048];
+        let mut peer_dst = vec![0; 2048];
+        mock_instant::thread_local::MockClock::advance(Duration::from_secs(1));
+        assert!(matches!(tun.update_timers(&mut dst), TunnResult::Done));
+        assert!(matches!(
+            tun.encapsulate(&create_ipv4_udp_packet(), &mut dst),
+            TunnResult::WriteToNetwork(_)
+        ));
+        mock_instant::thread_local::MockClock::advance(Duration::from_secs(10));
+        assert!(matches!(tun.update_timers(&mut dst), TunnResult::Done));
+        let keepalive = match peer.encapsulate(&[], &mut peer_dst) {
+            TunnResult::WriteToNetwork(packet) => packet.to_vec(),
+            other => panic!("expected authenticated keepalive, got {:?}", other),
+        };
+        assert!(matches!(
+            tun.decapsulate(None, &keepalive, &mut dst),
+            TunnResult::Done
+        ));
+        mock_instant::thread_local::MockClock::advance(Duration::from_secs(6));
+        assert!(matches!(tun.update_timers(&mut dst), TunnResult::Done));
+        assert!(matches!(
+            tun.encapsulate(&create_ipv4_udp_packet(), &mut dst),
+            TunnResult::WriteToNetwork(_)
+        ));
+        mock_instant::thread_local::MockClock::advance(Duration::from_secs(14));
+        assert!(matches!(tun.update_timers(&mut dst), TunnResult::Done));
+        mock_instant::thread_local::MockClock::advance(Duration::from_secs(2));
+        update_timer_results_in_handshake(&mut tun);
+    }
+
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn new_handshake_is_not_armed_by_empty_keepalive() {
+        let (mut tun, _) = create_two_tuns_and_handshake();
+        let mut dst = vec![0; 2048];
+        mock_instant::thread_local::MockClock::advance(Duration::from_secs(60));
+        assert!(matches!(tun.update_timers(&mut dst), TunnResult::Done));
+        assert!(matches!(
+            tun.encapsulate(&[], &mut dst),
+            TunnResult::WriteToNetwork(_)
+        ));
+        assert!(matches!(tun.update_timers(&mut dst), TunnResult::Done));
+        mock_instant::thread_local::MockClock::advance(Duration::from_secs(16));
+        assert!(matches!(tun.update_timers(&mut dst), TunnResult::Done));
+    }
+
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn new_handshake_uses_send_time_without_a_recent_timer_poll() {
+        let (mut tun, _) = create_two_tuns_and_handshake();
+        let mut dst = vec![0; 2048];
+        // TimeCurrent is still zero: no update_timers call preceded this send.
+        mock_instant::thread_local::MockClock::advance(Duration::from_secs(60));
+        assert!(matches!(
+            tun.encapsulate(&create_ipv4_udp_packet(), &mut dst),
+            TunnResult::WriteToNetwork(_)
+        ));
+        assert!(matches!(tun.update_timers(&mut dst), TunnResult::Done));
+        mock_instant::thread_local::MockClock::advance(Duration::from_secs(16));
+        update_timer_results_in_handshake(&mut tun);
+    }
+
+    #[test]
+    #[cfg(feature = "mock-instant")]
     fn awg3_new_handshake_timer_uses_keepalive_hi_plus_rekey() {
         // Hi(keepalive) + pick(rekey) = 6 + 2 = 8 s, against the 10 + 5 = 15 s
         // default. Firing at 8 s can only come from the configured ranges.
@@ -2331,8 +2439,8 @@ mod tests {
             TunnResult::WriteToNetwork(_)
         ));
 
-        // Last authenticated receive was the handshake response at t=0, so the
-        // new-handshake timer is due at t=8, plus up to 334 ms of jitter.
+        // The first unanswered data was sent at t=1, so the new-handshake
+        // timer is due at t=9, plus up to 334 ms of jitter.
         mock_instant::thread_local::MockClock::advance(Duration::from_secs(6));
         assert!(matches!(my_tun.update_timers(&mut dst), TunnResult::Done));
 
@@ -2342,6 +2450,8 @@ mod tests {
                     crate::noise::timers::REKEY_TIMEOUT_JITTER_MAX_MS,
                 )),
         );
+        assert!(matches!(my_tun.update_timers(&mut dst), TunnResult::Done));
+        mock_instant::thread_local::MockClock::advance(Duration::from_secs(1));
         update_timer_results_in_handshake(&mut my_tun);
     }
 

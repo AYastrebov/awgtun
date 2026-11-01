@@ -3,6 +3,16 @@
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Arm the new-handshake timeout from the first unanswered data send, rather
+  than the last authenticated receive. A first packet after idle no longer
+  triggers an immediate redundant handshake. Later sends preserve the pending
+  deadline; authenticated receives cancel it, and empty keepalives do not arm
+  it. AWG timing ranges and jitter are sampled once when the timer is armed.
+
 ## [0.12.0] - 2026-10-28
 
 Switching a peer from awgtun to kernel WireGuard, kernel AmneziaWG or either
