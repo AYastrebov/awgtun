@@ -186,6 +186,21 @@ impl Masking {
             Masking::Media => Some(Duration::from_secs(5)),
         }
     }
+
+    /// The longest WireGuard message this masking can carry, if it has a
+    /// limit of its own. A caller sizing its MTU against it must count the
+    /// whole message: tunnel MTU plus WireGuard's 32 bytes of overhead.
+    ///
+    /// Only STUN has one: its DATA length is 16 bits. Encoding never pushes
+    /// a message over it, because a message gets a random tail only while
+    /// it is under 1024 bytes ([`DUMMY_LIMIT`]), so the encoded payload is
+    /// either under 1024 bytes or exactly the message's length.
+    pub fn max_message_len(self) -> Option<usize> {
+        match self {
+            Masking::Stun => Some(usize::from(u16::MAX)),
+            Masking::None | Masking::Media => None,
+        }
+    }
 }
 
 /// RTP stream parameters for [`Masking::Media`]. Zero means "pick at random".
@@ -795,10 +810,11 @@ impl<R: RandomSource> PhobosCodec<R> {
         }
         let masking = self.config.masking;
         let header = masking.overhead();
-        // The STUN DATA length is 16 bits, and encoding can add up to 511
-        // bytes. Checked before doing any work.
-        if masking == Masking::Stun
-            && datagram.len() + usize::from(HANDSHAKE_DUMMY_LIMIT) > usize::from(u16::MAX)
+        // Checked before doing any work. See `max_message_len` for why the
+        // input's own length is the bound, tail included.
+        if masking
+            .max_message_len()
+            .is_some_and(|max| datagram.len() > max)
         {
             return Err(WrapError::TooLong);
         }

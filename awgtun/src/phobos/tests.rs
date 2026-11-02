@@ -428,9 +428,30 @@ fn wrap_rejects_what_cannot_be_framed() {
     let mut out = Vec::new();
     assert_eq!(c.wrap(&[1, 0, 0], &mut out), Err(WrapError::TooShort));
     assert_eq!(
-        c.wrap(&vec![4u8; 65_100], &mut out),
+        c.wrap(&wg_message(4, 65_536), &mut out),
         Err(WrapError::TooLong)
     );
+}
+
+/// The largest transport message STUN can carry is 65535 bytes: past 1024
+/// it gets no tail, so its DATA length is its own length. The check used to
+/// reserve 511 bytes of tail for every message and refused this one.
+#[test]
+fn stun_carries_a_transport_message_up_to_its_16_bit_length() {
+    let mut tx = codec(config(Masking::Stun), 1);
+    let mut rx = codec(config(Masking::Stun), 2);
+    for len in [65_104, 65_535] {
+        let msg = wg_message(4, len);
+        let mut out = Vec::new();
+        tx.wrap(&msg, &mut out).unwrap();
+        assert_eq!(out.len(), STUN_DATA_HEADER_LEN + len);
+        match rx.unwrap(&mut out, server()) {
+            Unwrapped::WireGuard(got) => assert_eq!(got, &msg[..], "length {len}"),
+            other => panic!("length {}: {:?}", len, other),
+        }
+    }
+    assert_eq!(Masking::Stun.max_message_len(), Some(65_535));
+    assert_eq!(Masking::Media.max_message_len(), None);
 }
 
 // --- Configuration -----------------------------------------------------------
