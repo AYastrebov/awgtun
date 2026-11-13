@@ -13,6 +13,7 @@ pub mod device;
 
 pub mod amnezia;
 pub mod noise;
+pub mod phobos;
 
 #[cfg(not(feature = "mock-instant"))]
 pub(crate) mod sleepyinstant;

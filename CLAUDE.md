@@ -17,6 +17,9 @@ awgtun/                 # Main library crate
       session.rs        # ChaCha20-Poly1305 session encryption
       rate_limiter.rs   # MAC verification, cookie replies
       timers.rs         # Rekey, keepalive, handshake retry timers
+    phobos/             # Phobos UDP obfuscation codec (client side, sans-IO).
+                        # Spec: docs/phobos.md. Written from the spec only —
+                        # the Phobos tree is (A)GPL, don't port its code
     device/             # Optional TUN device integration (feature-gated)
     serialization.rs    # KeyBytes: hex/base64 key parsing (public)
     lib.rs
@@ -34,6 +37,11 @@ parameters are what stop the server's traffic from looking like WireGuard, so
 publishing them hands a censor an exact signature for that deployment: match the
 type field against `H1`-`H4`, then look for a `148 + S1` byte initiation. Treat a
 `.conf` the way you would treat its private key.
+
+The same goes for a Phobos deployment's `key` and its obfuscator port: the key
+is the whole of what separates its traffic from anyone else's. The keys in
+`awgtun/src/phobos/test_vectors.rs` are the reference's own published test
+keys, not a deployment's.
 
 Regression tests should reproduce the *shape* of a real configuration — every key
 populated, `S2` above 64, single-value timing ranges — with synthetic numbers.

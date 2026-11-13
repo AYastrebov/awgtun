@@ -5,6 +5,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `awgtun::phobos`: a client-side codec for the
+  [Phobos](https://github.com/Ground-Zerro/Phobos) UDP obfuscation, with
+  `none`, `stun` and `media` (RTP) masking. It does no I/O and is independent
+  of `Tunn`. Wrap every outgoing datagram and unwrap every incoming one. Use
+  it with plain WireGuard (`Tunn::new`) only, since a Phobos server forwards
+  to standard WireGuard. The wire format is specified in
+  [`docs/phobos.md`](docs/phobos.md), and the codec passes the reference's
+  published conformance vectors.
+
 ### Fixed
 
 - Arm the new-handshake timeout from the first unanswered data send, rather
