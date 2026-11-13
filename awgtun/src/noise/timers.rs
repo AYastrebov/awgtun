@@ -74,8 +74,8 @@ pub struct Timers {
     pub(super) session_timers: [Duration; super::N_SESSIONS],
     /// Did we receive data without sending anything back?
     want_keepalive: bool,
-    /// Did we send data without hearing back?
-    want_handshake: bool,
+    /// Deadline armed by the first unanswered data send; authenticated receive cancels it.
+    new_handshake_deadline: Option<Duration>,
     persistent_keepalive: usize,
     /// AWG 3.0 randomized timing ranges. An all-zero range falls back to the
     /// classic WireGuard constant, so a default `TimingRanges` preserves stock
@@ -103,7 +103,7 @@ impl Timers {
             timers: Default::default(),
             session_timers: Default::default(),
             want_keepalive: Default::default(),
-            want_handshake: Default::default(),
+            new_handshake_deadline: None,
             persistent_keepalive: usize::from(persistent_keepalive.unwrap_or(0)),
             timing_ranges,
             rekey_timeout_current: REKEY_TIMEOUT,
@@ -166,6 +166,26 @@ impl Timers {
         self.is_initiator
     }
 
+    /// Match timersDataSent in amneziawg-go: arm once, not on every packet
+    /// or timer poll. In particular, an idle period before the send is not a
+    /// period spent waiting for a reply. Pick the AWG range and jitter once.
+    fn arm_new_handshake(&mut self, now: Duration, rng: &mut impl RandomSource) {
+        if self.new_handshake_deadline.is_none() {
+            let seconds = u64::from(
+                self.timing_ranges
+                    .keepalive_timeout
+                    .hi_or(KEEPALIVE_TIMEOUT_SECS),
+            ) + u64::from(
+                self.timing_ranges
+                    .rekey_timeout
+                    .pick_or(rng, REKEY_TIMEOUT_SECS),
+            );
+            let jitter = rng.gen_range_u32(0, REKEY_TIMEOUT_JITTER_MAX_MS - 1);
+            self.new_handshake_deadline =
+                Some(now + Duration::from_secs(seconds) + Duration::from_millis(u64::from(jitter)));
+        }
+    }
+
     // We don't really clear the timers, but we set them to the current time to
     // so the reference time frame is the same
     pub(super) fn clear(&mut self) {
@@ -173,7 +193,7 @@ impl Timers {
         for t in &mut self.timers[..] {
             *t = now;
         }
-        self.want_handshake = false;
+        self.new_handshake_deadline = None;
         self.want_keepalive = false;
     }
 }
@@ -196,11 +216,16 @@ impl Tunn {
         match timer_name {
             TimeLastPacketReceived => {
                 self.timers.want_keepalive = true;
-                self.timers.want_handshake = false;
+                self.timers.new_handshake_deadline = None;
             }
             TimeLastPacketSent => {
-                self.timers.want_handshake = true;
                 self.timers.want_keepalive = false;
+            }
+            TimeLastDataPacketSent if self.timers.new_handshake_deadline.is_none() => {
+                // The caller may send between update_timers polls. Use the send's
+                // actual time rather than the cached TimeCurrent from the last poll.
+                let now = Instant::now().duration_since(self.timers.time_started);
+                self.timers.arm_new_handshake(now, &mut FastRandom);
             }
             _ => {}
         }
@@ -281,7 +306,6 @@ impl Tunn {
         // Load timers only once:
         let session_established = self.timers[TimeSessionEstablished];
         let handshake_started = self.timers[TimeLastHandshakeStarted];
-        let aut_packet_received = self.timers[TimeLastPacketReceived];
         let aut_packet_sent = self.timers[TimeLastPacketSent];
         let data_packet_received = self.timers[TimeLastDataPacketReceived];
         let data_packet_sent = self.timers[TimeLastDataPacketSent];
@@ -379,27 +403,14 @@ impl Tunn {
                     }
                 }
 
-                // If we have sent a packet to a given peer but have not received a
-                // packet after from that peer for (KEEPALIVE + REKEY_TIMEOUT) ms,
-                // we initiate a new handshake.
-                // AWG 3.0: `newHandshakeTimeout` — `Hi` of the keepalive range
-                // plus a fresh pick of the rekey range, plus the same jitter
-                // as the retransmit (`timersDataSent`)
-                let new_handshake_after = {
-                    let ranges = &self.timers.timing_ranges;
-                    Duration::from_secs(u64::from(
-                        ranges.keepalive_timeout.hi_or(KEEPALIVE_TIMEOUT_SECS)
-                            + ranges
-                                .rekey_timeout
-                                .pick_or(&mut FastRandom, REKEY_TIMEOUT_SECS),
-                    )) + Duration::from_millis(u64::from(
-                        FastRandom.gen_range_u32(0, REKEY_TIMEOUT_JITTER_MAX_MS - 1),
-                    ))
-                };
-                if data_packet_sent > aut_packet_received
-                    && now - aut_packet_received >= new_handshake_after
-                    && mem::replace(&mut self.timers.want_handshake, false)
+                // Only unanswered data arms this deadline; keepalives do not.
+                // Authenticated receives cancel it, and later sends cannot postpone it.
+                if self
+                    .timers
+                    .new_handshake_deadline
+                    .is_some_and(|deadline| now >= deadline)
                 {
+                    self.timers.new_handshake_deadline = None;
                     tracing::warn!("HANDSHAKE(KEEPALIVE + REKEY_TIMEOUT)");
                     handshake_initiation_required = true;
                 }
@@ -547,6 +558,32 @@ mod tests {
             jitters.insert(timers.rekey_timeout_current - REKEY_TIMEOUT);
         }
         assert!(jitters.len() > 1, "the jitter never varied");
+    }
+
+    #[test]
+    fn new_handshake_deadline_samples_ranges_and_jitter_only_when_armed() {
+        let mut timers = Timers::new(
+            None,
+            false,
+            TimingRanges {
+                keepalive_timeout: U32Range::new(4, 6).expect("valid range"),
+                rekey_timeout: U32Range::new(3, 9).expect("valid range"),
+                ..Default::default()
+            },
+        );
+        let now = Duration::from_secs(60);
+        let mut rng = SeqRng::new(3);
+        timers.arm_new_handshake(now, &mut rng);
+        let deadline = timers.new_handshake_deadline.expect("armed");
+        assert!(deadline >= now + Duration::from_secs(9));
+        assert!(deadline < now + Duration::from_secs(15) + Duration::from_millis(334));
+        let consumed = rng.counter;
+        timers.arm_new_handshake(now + Duration::from_secs(5), &mut rng);
+        assert_eq!(timers.new_handshake_deadline, Some(deadline));
+        assert_eq!(
+            rng.counter, consumed,
+            "pending timer must not draw new randomness"
+        );
     }
 
     #[test]
