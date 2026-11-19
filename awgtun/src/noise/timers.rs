@@ -41,7 +41,7 @@ const COOKIE_EXPIRATION_TIME: Duration = Duration::from_secs(120);
 
 #[derive(Debug)]
 pub enum TimerName {
-    /// Current time, updated each call to `update_timers`
+    /// Current time, refreshed on packet/session events and timer polls
     TimeCurrent,
     /// Time when last handshake was completed
     TimeSessionEstablished,
@@ -193,6 +193,11 @@ impl IndexMut<TimerName> for Timers {
 
 impl Tunn {
     pub(super) fn timer_tick(&mut self, timer_name: TimerName) {
+        // A responder without an endpoint may not be polled for minutes. Stamp
+        // events with their actual time so the next poll cannot expire a newly
+        // established session using a stale TimeCurrent.
+        let now = Instant::now().duration_since(self.timers.time_started);
+        self.timers[TimeCurrent] = now;
         match timer_name {
             TimeLastPacketReceived => {
                 self.timers.want_keepalive = true;
@@ -205,8 +210,7 @@ impl Tunn {
             _ => {}
         }
 
-        let time = self.timers[TimeCurrent];
-        self.timers[timer_name] = time;
+        self.timers[timer_name] = now;
     }
 
     pub(super) fn timer_tick_session_established(

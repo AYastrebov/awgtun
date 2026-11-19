@@ -2217,6 +2217,65 @@ mod tests {
         (my_tun, their_tun)
     }
 
+    #[cfg(feature = "mock-instant")]
+    fn first_handshake_after_idle_preserves_transport(ranges: crate::amnezia::TimingRanges) {
+        let (mut initiator, mut responder) = create_two_tuns_with_timings(ranges);
+        // The device skips timer polling while a responder has no endpoint.
+        // Both peers can therefore have a stale TimeCurrent at their first handshake.
+        mock_instant::thread_local::MockClock::advance(Duration::from_secs(200));
+        let init = create_handshake_init(&mut initiator);
+        let response = create_handshake_response(&mut responder, &init);
+        let keepalive = parse_handshake_resp(&mut initiator, &response);
+        let mut dst = [0u8; 2048];
+        mock_instant::thread_local::MockClock::advance(Duration::from_millis(100));
+        for tunnel in [&mut responder, &mut initiator] {
+            assert!(matches!(tunnel.update_timers(&mut dst), TunnResult::Done));
+        }
+        assert!(
+            matches!(
+                responder.decapsulate(None, &keepalive, &mut dst),
+                TunnResult::Done
+            ),
+            "first timer poll must preserve the new responder session"
+        );
+        // Check real transport in both directions, not just the handshake timestamp.
+        let payload = create_ipv4_udp_packet();
+        for reverse in [false, true] {
+            let (sender, receiver) = if reverse {
+                (&mut responder, &mut initiator)
+            } else {
+                (&mut initiator, &mut responder)
+            };
+            let packet = match sender.encapsulate(&payload, &mut dst) {
+                TunnResult::WriteToNetwork(packet) => packet.to_vec(),
+                other => panic!("expected transport, got {:?}", other),
+            };
+            match receiver.decapsulate(None, &packet, &mut dst) {
+                TunnResult::WriteToTunnelV4(received, _) => assert_eq!(received, payload),
+                other => panic!("expected preserved transport session, got {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn first_handshake_after_idle_preserves_default_transport() {
+        first_handshake_after_idle_preserves_transport(Default::default());
+    }
+
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn first_handshake_after_idle_preserves_awg3_transport() {
+        first_handshake_after_idle_preserves_transport(crate::amnezia::TimingRanges {
+            rekey_after_time: U32Range::new(105, 135).expect("valid range"),
+            rekey_timeout: U32Range::new(4, 8).expect("valid range"),
+            reject_after_time: U32Range::new(155, 185).expect("valid range"),
+            keepalive_timeout: U32Range::new(7, 17).expect("valid range"),
+            max_handshake_attempts: U32Range::new(16, 23).expect("valid range"),
+            ..Default::default()
+        });
+    }
+
     #[test]
     #[cfg(feature = "mock-instant")]
     fn awg3_rekey_after_time_range_drives_initiator_rekey() {
@@ -3217,10 +3276,9 @@ mod tests {
         // alone misses it and the sender's keepalives read as data. Both
         // upstreams check the first byte for this reason.
         let mut dec_buf = vec![0u8; 2048];
-        // Pin the reference time so "stayed at zero" is a real assertion under
-        // the frozen `mock-instant` clock too.
-        let now = Duration::from_secs(42);
-        their_tun.timers[TimerName::TimeCurrent] = now;
+        // Move the real test clock instead of assigning the cached TimeCurrent.
+        #[cfg(feature = "mock-instant")]
+        mock_instant::thread_local::MockClock::advance(Duration::from_secs(42));
         their_tun.timers[TimerName::TimeLastDataPacketReceived] = Duration::ZERO;
         let result = their_tun.decapsulate(None, &enc_buf[..wire_len], &mut dec_buf);
         assert!(matches!(result, TunnResult::Done));
@@ -3246,15 +3304,19 @@ mod tests {
             other => panic!("expected WriteToNetwork, got {:?}", other),
         };
 
-        let now = Duration::from_secs(42);
-        their_tun.timers[TimerName::TimeCurrent] = now;
+        #[cfg(feature = "mock-instant")]
+        mock_instant::thread_local::MockClock::advance(Duration::from_secs(42));
         their_tun.timers[TimerName::TimeLastDataPacketReceived] = Duration::ZERO;
         let mut dec_buf = vec![0u8; 2048];
         assert!(matches!(
             their_tun.decapsulate(None, &enc_buf[..wire_len], &mut dec_buf),
             TunnResult::Done
         ));
-        assert_eq!(their_tun.timers[TimerName::TimeLastDataPacketReceived], now);
+        assert_eq!(
+            their_tun.timers[TimerName::TimeLastDataPacketReceived],
+            their_tun.timers[TimerName::TimeCurrent]
+        );
+        assert!(their_tun.timers[TimerName::TimeLastDataPacketReceived] > Duration::ZERO);
     }
 
     #[test]
@@ -3270,11 +3332,9 @@ mod tests {
         let resp = create_handshake_response(&mut their_tun, &init);
         let _ = parse_handshake_resp(&mut my_tun, &resp);
 
-        // Pin the reference time rather than reading the clock: under the
-        // `mock-instant` feature it is frozen at zero, which would make the
-        // assertion below vacuous.
-        let now = Duration::from_secs(42);
-        my_tun.timers[TimerName::TimeCurrent] = now;
+        // Advance the frozen clock so a zero data timestamp is meaningful.
+        #[cfg(feature = "mock-instant")]
+        mock_instant::thread_local::MockClock::advance(Duration::from_secs(42));
         my_tun.timers[TimerName::TimeLastDataPacketSent] = Duration::ZERO;
 
         let mut buf = vec![0u8; 2048];
@@ -3288,7 +3348,11 @@ mod tests {
             "a padded keepalive is a keepalive, not data"
         );
         // It is still an authenticated packet, so the generic timer moves.
-        assert_eq!(my_tun.timers[TimerName::TimeLastPacketSent], now);
+        assert_eq!(
+            my_tun.timers[TimerName::TimeLastPacketSent],
+            my_tun.timers[TimerName::TimeCurrent]
+        );
+        assert!(my_tun.timers[TimerName::TimeLastPacketSent] > Duration::ZERO);
     }
 
     #[test]
